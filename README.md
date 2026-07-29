@@ -16,8 +16,8 @@
 [GitHub Releases](https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/latest)
 下载：
 
-- `猫猫的剪辑小助手_1.6.0_x64-setup.exe`：推荐，双击后按提示安装；
-- `猫猫的剪辑小助手_1.6.0_便携版.exe`：无需安装，下载后直接运行。
+- `luckcaty-cut-dota2_1.6.0_x64-setup.exe`：推荐，双击后按提示安装；
+- `luckcaty-cut-dota2_1.6.0_portable.exe`：无需安装，下载后直接运行。
 
 当前安装包和便携版未包含 FFmpeg/FFprobe。首次导出前请按下方“环境要求”
 配置 FFmpeg。发布附件由本仓库对应版本源码构建，SHA-256 会列在 Release
