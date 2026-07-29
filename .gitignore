@@ -1,0 +1,48 @@
+# Rust
+target/
+*.pdb
+
+# Node / frontend
+**/node_modules/
+**/dist/
+
+# Tauri generated schemas
+apps/d2-highlights-desktop/src-tauri/gen/
+
+# Runtime jobs and user media
+jobs/
+*.dem
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.wav
+*.flac
+*.aac
+*.jpg
+*.jpeg
+
+# Local FFmpeg binaries
+tools/ffmpeg/bin/
+
+# Local releases and binary artifacts
+release/
+*.exe
+*.msi
+*.msix
+*.zip
+*.7z
+*.sha256
+
+# Local configuration and secrets
+.env
+.env.*
+config.local.*
+
+# Logs, editors, and OS files
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini

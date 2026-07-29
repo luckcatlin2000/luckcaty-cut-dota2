@@ -1,0 +1,13 @@
+[package]
+name = "d2-highlights-replay-control"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license-file.workspace = true
+
+[dependencies]
+d2-highlights-core = { path = "../d2-highlights-core" }
+serde.workspace = true
+thiserror.workspace = true

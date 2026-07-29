@@ -1,0 +1,19 @@
+[package]
+name = "d2-highlights-renderer"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license-file.workspace = true
+
+[dependencies]
+d2-highlights-core = { path = "../d2-highlights-core" }
+d2-highlights-replay-control = { path = "../d2-highlights-replay-control" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

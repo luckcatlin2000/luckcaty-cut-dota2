@@ -1,0 +1,13 @@
+[package]
+name = "d2-highlights-parser-source2"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license-file.workspace = true
+
+[dependencies]
+d2-highlights-core = { path = "../d2-highlights-core" }
+source2-demo.workspace = true
+thiserror.workspace = true

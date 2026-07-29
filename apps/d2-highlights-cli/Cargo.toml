@@ -1,0 +1,23 @@
+[package]
+name = "d2-highlights-cli"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license-file.workspace = true
+
+[[bin]]
+name = "d2-highlights"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+d2-highlights-core = { path = "../../crates/d2-highlights-core" }
+d2-highlights-detector = { path = "../../crates/d2-highlights-detector" }
+d2-highlights-director = { path = "../../crates/d2-highlights-director" }
+d2-highlights-parser-source2 = { path = "../../crates/d2-highlights-parser-source2" }
+d2-highlights-pipeline = { path = "../../crates/d2-highlights-pipeline" }
+d2-highlights-replay-control = { path = "../../crates/d2-highlights-replay-control" }
+serde.workspace = true
+serde_json.workspace = true

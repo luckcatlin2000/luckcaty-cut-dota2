@@ -1,0 +1,13 @@
+Reference component: FFmpeg full static Windows build
+Build identifier: 2025-01-08-git-251de1791e-full_build-www.gyan.dev
+License: GNU GPL version 3 (see LICENSE.txt)
+Build provider: https://www.gyan.dev/ffmpeg/builds/
+Upstream source: https://git.ffmpeg.org/ffmpeg.git
+Upstream commit: 251de1791e
+
+The source repository does not distribute this binary. This record describes
+the reference build previously used by the maintainers. FFmpeg and FFprobe are
+separate command-line programs used for local encoding and quality checks.
+
+Any release that bundles FFmpeg must provide compliance materials for the
+exact binary distributed with that release.

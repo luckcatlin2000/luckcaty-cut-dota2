@@ -1,0 +1,157 @@
+CAT CUT ASSISTANT SOURCE-AVAILABLE LICENSE
+Version 1.0 — 2026-07-28
+
+Copyright (c) 2026 luckcatlin2000.
+Official repository: https://github.com/luckcatlin2000/luckcaty-cut-dota2
+All rights reserved except for the limited permissions expressly granted below.
+
+1. Acceptance
+
+By copying, downloading, compiling, executing, modifying, or otherwise using
+the Software, you accept this License. If you do not accept it, you may only
+view the Software through functionality provided by the hosting platform and
+exercise rights that applicable law gives you without a license.
+
+2. Definitions
+
+"Software" means Cat Cut Assistant, including its first-party source code,
+documentation, user interface, artwork, icons, branding, and first-party
+assets distributed with this License. It does not include Third-Party
+Components identified in the repository.
+
+"Licensor" means luckcatlin2000, the copyright holder who publishes and
+controls the original official repository for the Software.
+
+"Output" means a video, audio file, image sequence, timeline, or other media
+created by processing a user's own input with the Software. Output does not
+include the Software, its source code, binaries, user interface, branding, or
+first-party assets.
+
+"Commercialize" means to sell, resell, rent, lease, sublicense, charge for,
+monetize access to, or receive direct or indirect compensation for a copy,
+download, installation, license, maintenance, support, hosted instance, or
+distribution of the Software.
+
+"Rebranded Product" means any copy, modified version, derivative work, bundle,
+installer, hosted service, or other product based in whole or in substantial
+part on the Software that is renamed, reskinned, repackaged, relabeled,
+presented under different authorship or branding, or made to appear to be a
+different product.
+
+3. Limited Permission
+
+Subject to every condition in this License, the Licensor grants you a
+non-exclusive, worldwide, royalty-free, non-transferable, and
+non-sublicensable permission to:
+
+a. view and study the source code;
+
+b. download, compile, and run the Software for personal or internal use;
+
+c. use the Software to create Outputs, including Outputs that you publish or
+   monetize;
+
+d. make private modifications for your own personal or internal use; and
+
+e. use GitHub's public-fork functionality and make changes solely to prepare
+   an issue, patch, or pull request for contribution back to the Licensor's
+   original official repository, provided that you do not publish a Release,
+   distribute a binary, present the fork as an independent product, or
+   Commercialize it.
+
+You may redistribute a verbatim, unmodified source-code copy without charge
+only if you include this entire License, all notices, and a prominent link to
+the Licensor's original official repository. This permission does not cover
+binaries, installers, modified copies, or Rebranded Products.
+
+4. Prohibited Acts
+
+Unless the Licensor gives you prior express written authorization that
+specifically identifies the authorized person or entity and the authorized
+activity, you must not:
+
+a. Commercialize the Software;
+
+b. sell, offer for sale, rent, sublicense, or charge for any copy, installer,
+   download, activation, update, support plan, or access to the Software;
+
+c. distribute or publish compiled binaries, installers, modified copies,
+   derivative products, mobile or desktop store packages, or Releases of the
+   Software;
+
+d. create, publish, distribute, advertise, or operate a Rebranded Product,
+   white-label version, reskinned version, renamed fork, or look-alike product
+   based on the Software;
+
+e. incorporate the Software or a substantial part of it into another product,
+   application, paid bundle, commercial service, or hosted or managed service;
+
+f. remove, hide, alter, or misrepresent any copyright, license, attribution,
+   origin, authorship, or official-repository notice;
+
+g. use the Software's name, logo, mascot, icons, screenshots, visual identity,
+   or other branding to market or identify another product or service; or
+
+h. imply that the Licensor sponsors, endorses, authorizes, or is affiliated
+   with an unauthorized copy, fork, product, service, or seller.
+
+Charging for video-editing work or monetizing an Output is not, by itself,
+Commercializing the Software, provided that the customer receives only the
+Output and not a copy of, access to, or a hosted instance of the Software.
+
+5. Commercial and Distribution Licenses
+
+The Licensor may offer separate written licenses for commercial distribution,
+OEM use, bundling, hosted services, or other activities prohibited above.
+Silence, a repository fork, an issue, a pull request, a download, or an
+informal message is not authorization. Authorization is valid only when it is
+expressly granted in writing by the Licensor.
+
+6. Contributions
+
+No permission in this License transfers ownership of the Software. Any code
+contribution is accepted only under the repository's separate Contributor
+License Agreement. The Licensor may reject or remove a contribution that does
+not satisfy that agreement.
+
+7. Third-Party Components
+
+Third-Party Components remain governed by their own license terms. This
+License applies only to rights that the Licensor owns or is authorized to
+license. Nothing in this License restricts rights independently granted by a
+Third-Party Component's license.
+
+8. No Trademark License
+
+This License grants no trademark, trade-name, logo, or other branding license
+except the limited factual attribution required for an unmodified source copy.
+
+9. Termination
+
+Your permissions under this License terminate automatically when you violate
+any condition. After termination, you must stop using and distributing the
+Software and delete every unauthorized copy under your control. Termination
+does not limit the Licensor's remedies for the violation. The Licensor may
+reinstate permission only in writing.
+
+10. Disclaimer of Warranty
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE SOFTWARE IS PROVIDED "AS IS" AND
+WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND
+NON-INFRINGEMENT.
+
+11. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE LICENSOR WILL NOT BE LIABLE FOR
+ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE
+DAMAGES, OR FOR LOSS OF DATA, PROFITS, REVENUE, BUSINESS, OR GOODWILL, ARISING
+FROM OR RELATED TO THE SOFTWARE OR THIS LICENSE.
+
+12. Severability and Reservation of Rights
+
+If a provision is unenforceable, it will be limited only as much as necessary
+and the remaining provisions will continue in effect. The Licensor reserves
+every right not expressly granted by this License.
+
+This is a source-available license, not an OSI-approved open-source license.

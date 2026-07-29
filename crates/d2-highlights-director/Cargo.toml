@@ -1,0 +1,11 @@
+[package]
+name = "d2-highlights-director"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license-file.workspace = true
+
+[dependencies]
+d2-highlights-core = { path = "../d2-highlights-core" }
