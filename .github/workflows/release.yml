@@ -1,0 +1,63 @@
+name: Release signed Windows installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/d2-highlights-desktop/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: apps/d2-highlights-desktop
+        run: npm ci
+
+      - name: Verify source
+        shell: powershell
+        run: .\scripts\verify.ps1
+
+      - name: Build and publish signed release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/d2-highlights-desktop
+          tagName: v__VERSION__
+          releaseName: 猫猫的剪辑小助手 v__VERSION__
+          releaseBody: |
+            - 新增击杀、技巧互动、团战和地图目标四轨事件时间轴。
+            - 点击事件可定位已有片段，或新增默认玩家视角片段。
+            - 新增签名校验的可选应用内更新，只提示，不自动下载或强制安装。
+            - 软件设置中显示“作者：猫猫只用虎”。
+          releaseDraft: false
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          uploadUpdaterSignatures: true
+          releaseAssetNamePattern: luckcaty-cut-dota2_[version]_x64[setup].[ext]

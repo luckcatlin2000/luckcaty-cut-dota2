@@ -7,6 +7,11 @@ $desktopRoot = Join-Path $projectRoot 'apps\d2-highlights-desktop'
 Push-Location -LiteralPath $projectRoot
 
 try {
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (
+        Join-Path $PSScriptRoot "verify-updater.ps1"
+    )
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     & cargo fmt --all -- --check
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -18,7 +23,7 @@ try {
 
     Push-Location -LiteralPath $desktopRoot
     try {
-        & npm run test:highlight-rules
+        & npm test
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
         & npm run build

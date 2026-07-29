@@ -23,6 +23,10 @@
 ## 构建
 
 源码版要求 FFmpeg/FFprobe 位于 PATH、环境变量指定位置或 `tools/ffmpeg/bin/`。
+正式安装包还要求以下环境变量，由 Tauri 用于生成强制验签的更新附件：
+
+- `TAURI_SIGNING_PRIVATE_KEY`
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
 
 ```powershell
 .\scripts\desktop-release.ps1
@@ -31,6 +35,19 @@
 构建结果进入被忽略的 `release/`，不要把二进制提交到 Git 历史。
 
 ## GitHub Release
+
+仓库 Actions Secrets 必须配置同名的
+`TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。推送
+`v<版本号>` 标签后，`.github/workflows/release.yml` 会运行完整验证、构建
+NSIS 安装包，并上传安装包、签名和 `latest.json`。
+
+客户端更新策略固定为：
+
+- 启动后只检查是否有新版本；
+- 不自动下载；
+- 不强制安装；
+- 只有用户点击“下载安装”后才下载、验签、安装并重启；
+- 分析或导出任务进行中时禁止安装。
 
 每个发布版本建议附带：
 

@@ -1,3 +1,4 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -14,6 +15,7 @@ import {
   Clapperboard,
   Clock3,
   Copy,
+  Download,
   Eye,
   FileUp,
   FileVideo2,
@@ -50,7 +52,20 @@ import {
   useRef,
   useState,
 } from "react";
+import {
+  UPDATE_POLICY,
+  appUpdateCopy,
+  type AppUpdateEvent,
+  type AppUpdateState,
+} from "./appUpdater";
 import mascot from "./assets/cat-editor-mascot.png";
+import {
+  TIMELINE_LANES,
+  buildTimelineEvents,
+  timelinePercent,
+  timelineTicks,
+} from "./eventTimeline";
+import type { TimelineScope } from "./eventTimeline";
 import { heroLabel } from "./heroes";
 import {
   DEFAULT_HIGHLIGHT_RULE_IDS,
@@ -106,6 +121,7 @@ type ClipEdits = ClipEditState[];
 const isTauriRuntime = "__TAURI_INTERNALS__" in window;
 const appWindow = isTauriRuntime ? getCurrentWindow() : null;
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
+const fallbackAppVersion = "1.7.0";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,
@@ -152,6 +168,10 @@ function App() {
   const [error, setError] = useState("");
   const [dragActive, setDragActive] = useState(false);
   const [notice, setNotice] = useState<AppNotice | null>(null);
+  const [appVersion, setAppVersion] = useState(fallbackAppVersion);
+  const [appUpdate, setAppUpdate] = useState<AppUpdateState>(
+    isTauriRuntime ? { phase: "checking" } : { phase: "unavailable" },
+  );
   const [clipEdits, setClipEdits] = useState<ClipEdits>([]);
   const [highlightHero, setHighlightHero] = useState("");
   const [highlightRuleIds, setHighlightRuleIds] = useState<HighlightRuleId[]>(
@@ -187,10 +207,12 @@ function App() {
     void Promise.all([
       invoke<Capabilities>("get_capabilities"),
       invoke<RecentJob[]>("get_recent_jobs"),
+      getVersion(),
     ])
-      .then(([capabilityResult, jobs]) => {
+      .then(([capabilityResult, jobs, version]) => {
         setCapabilities(capabilityResult);
         setRecentJobs(jobs);
+        setAppVersion(version);
         setReplayDirectory(
           (current) =>
             current.trim() ||
@@ -199,6 +221,16 @@ function App() {
         );
       })
       .catch((reason: unknown) => setError(toErrorMessage(reason)));
+  }, []);
+
+  useEffect(() => {
+    if (!isTauriRuntime || !UPDATE_POLICY.checkOnStartup) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void checkForAppUpdate(false);
+    }, 1_200);
+    return () => window.clearTimeout(timer);
   }, []);
 
   useEffect(() => {
@@ -628,6 +660,72 @@ function App() {
     setPlanFeedback("");
   }
 
+  function activateTimelineCandidate(candidateId: string) {
+    if (!result) {
+      return;
+    }
+    const existing = clipEdits.find(
+      (clip) => clip.candidateId === candidateId,
+    );
+    if (existing) {
+      setSelectedClipId(existing.clipId);
+      setPlanFeedback("已定位到片段清单中的对应事件。");
+      return;
+    }
+
+    const candidate = result.highlights.candidates.find(
+      (item) => item.id === candidateId,
+    );
+    if (!candidate) {
+      return;
+    }
+
+    const replayDuration = result.replay.playback_time_seconds;
+    const startSeconds = roundFrame(
+      clamp(
+        candidate.start_seconds,
+        0,
+        Math.max(0, replayDuration - 1),
+      ),
+    );
+    const endSeconds = roundFrame(
+      Math.min(
+        replayDuration,
+        Math.max(
+          startSeconds + 1,
+          Math.min(candidate.end_seconds, startSeconds + 90),
+        ),
+      ),
+    );
+    const clip: ClipEditState = {
+      clipId: createClipId(),
+      candidateId: candidate.id,
+      viewHero:
+        highlightHero ||
+        candidate.kill_sequence?.hero ||
+        candidate.primary_hero ||
+        candidate.participants[0] ||
+        result.replay.players[0]?.hero_name ||
+        "",
+      cameraMode: "player_perspective",
+      startSeconds,
+      endSeconds,
+    };
+    setClipEdits((current) =>
+      [...current, clip].sort(
+        (left, right) =>
+          left.startSeconds - right.startSeconds ||
+          left.endSeconds - right.endSeconds,
+      ),
+    );
+    setSelectedClipId(clip.clipId);
+    setRenderResult(null);
+    setRenderError("");
+    setPlanFeedback(
+      `已从事件时间轴新增“${candidateTitle(candidate)}”，可继续精调时间与镜头。`,
+    );
+  }
+
   function duplicateClip(clipId: string) {
     const index = clipEdits.findIndex((clip) => clip.clipId === clipId);
     const source = clipEdits[index];
@@ -813,12 +911,122 @@ function App() {
     }
   }
 
+  async function checkForAppUpdate(showResultNotice = true) {
+    if (!isTauriRuntime) {
+      setAppUpdate({ phase: "unavailable" });
+      return;
+    }
+
+    setAppUpdate({ phase: "checking" });
+    try {
+      const metadata =
+        await invoke<Extract<AppUpdateState, { phase: "available" }>["metadata"] | null>(
+          "check_for_app_update",
+        );
+      if (metadata) {
+        setAppUpdate({ phase: "available", metadata });
+        setNotice({
+          kind: "success",
+          title: `发现新版本 ${metadata.version}`,
+          message: "可在设置中查看简介并下载安装。",
+        });
+      } else {
+        setAppUpdate({ phase: "current" });
+        if (showResultNotice) {
+          setNotice({
+            kind: "success",
+            title: "已经是最新版本",
+            message: `当前版本 ${appVersion} 无需更新。`,
+          });
+        }
+      }
+    } catch (reason: unknown) {
+      const message = toErrorMessage(reason);
+      setAppUpdate({ phase: "error", message });
+      if (showResultNotice) {
+        setNotice({
+          kind: "error",
+          title: "暂时无法检查更新",
+          message,
+        });
+      }
+    }
+  }
+
+  async function installAppUpdate() {
+    if (appUpdate.phase !== "available") {
+      return;
+    }
+    if (busy || rendering) {
+      setNotice({
+        kind: "error",
+        title: "当前任务尚未完成",
+        message: "请等待分析或视频导出结束后再安装更新。",
+      });
+      return;
+    }
+
+    const metadata = appUpdate.metadata;
+    let downloadedBytes = 0;
+    let totalBytes: number | null = null;
+    let downloadFinished = false;
+    const channel = new Channel<AppUpdateEvent>();
+    channel.onmessage = (event) => {
+      if (event.event === "started") {
+        totalBytes = event.data.contentLength;
+        setAppUpdate({
+          phase: "downloading",
+          metadata,
+          downloadedBytes,
+          totalBytes,
+        });
+      } else if (event.event === "progress") {
+        downloadedBytes += event.data.chunkLength;
+        setAppUpdate({
+          phase: "downloading",
+          metadata,
+          downloadedBytes,
+          totalBytes,
+        });
+      } else {
+        downloadFinished = true;
+        setAppUpdate({ phase: "installing", metadata });
+      }
+    };
+    setAppUpdate({
+      phase: "downloading",
+      metadata,
+      downloadedBytes,
+      totalBytes,
+    });
+
+    try {
+      await invoke("install_app_update", { onEvent: channel });
+    } catch (reason: unknown) {
+      if (downloadFinished) {
+        return;
+      }
+      const message = toErrorMessage(reason);
+      setAppUpdate({ phase: "error", message });
+      setNotice({
+        kind: "error",
+        title: "更新没有完成",
+        message,
+      });
+    }
+  }
+
   return (
     <div className={`app-shell ${dragActive ? "drag-active" : ""}`}>
       <Titlebar
         notice={notice}
         completionNoticeEnabled={completionNoticeEnabled}
+        appVersion={appVersion}
+        appUpdate={appUpdate}
+        updateInstallationBlocked={busy || rendering}
         onCompletionNoticeChange={setCompletionNoticeEnabled}
+        onCheckForUpdate={() => void checkForAppUpdate()}
+        onInstallUpdate={() => void installAppUpdate()}
         onClearNotice={() => setNotice(null)}
       />
       <Sidebar
@@ -871,6 +1079,7 @@ function App() {
             onUpdateHighlightRules={updateHighlightRules}
             onUpdateRenderSettings={updateRenderSettings}
             onAddClip={addClip}
+            onActivateTimelineCandidate={activateTimelineCandidate}
             onDuplicateClip={duplicateClip}
             onDeleteClip={deleteClip}
             onMoveClip={moveClip}
@@ -952,18 +1161,32 @@ function App() {
 interface TitlebarProps {
   notice: AppNotice | null;
   completionNoticeEnabled: boolean;
+  appVersion: string;
+  appUpdate: AppUpdateState;
+  updateInstallationBlocked: boolean;
   onCompletionNoticeChange: (enabled: boolean) => void;
+  onCheckForUpdate: () => void;
+  onInstallUpdate: () => void;
   onClearNotice: () => void;
 }
 
 function Titlebar({
   notice,
   completionNoticeEnabled,
+  appVersion,
+  appUpdate,
+  updateInstallationBlocked,
   onCompletionNoticeChange,
+  onCheckForUpdate,
+  onInstallUpdate,
   onClearNotice,
 }: TitlebarProps) {
   const [panel, setPanel] = useState<TitlebarPanel>(null);
   const actionsRef = useRef<HTMLDivElement>(null);
+  const updateCopy = appUpdateCopy(
+    appUpdate,
+    updateInstallationBlocked,
+  );
 
   useEffect(() => {
     if (!panel) {
@@ -1106,7 +1329,50 @@ function Titlebar({
               <span>处理方式</span>
               <strong>仅限本机</strong>
             </div>
-            <div className="settings-version">版本 1.6.0</div>
+            <div className={`settings-update ${appUpdate.phase}`}>
+              <div className="settings-update-copy">
+                <span className="settings-update-heading">
+                  <ShieldCheck />
+                  <strong>软件更新</strong>
+                </span>
+                <strong className="settings-update-title">
+                  {updateCopy.title}
+                </strong>
+                <small>{updateCopy.detail}</small>
+              </div>
+              {updateCopy.action && (
+                <button
+                  className="settings-update-button"
+                  type="button"
+                  onClick={
+                    updateCopy.action === "install"
+                      ? onInstallUpdate
+                      : onCheckForUpdate
+                  }
+                >
+                  {updateCopy.action === "install" ? (
+                    <Download />
+                  ) : (
+                    <RefreshCw />
+                  )}
+                  <span>
+                    {updateCopy.action === "install" ? "下载安装" : "重新检查"}
+                  </span>
+                </button>
+              )}
+              {appUpdate.phase === "downloading" &&
+                appUpdate.totalBytes !== null && (
+                  <progress
+                    max={appUpdate.totalBytes}
+                    value={appUpdate.downloadedBytes}
+                    aria-label="更新下载进度"
+                  />
+                )}
+            </div>
+            <div className="settings-version">
+              <span>版本 {appVersion}</span>
+              <span>作者：猫猫只用虎</span>
+            </div>
           </section>
         )}
         <span className="window-divider" />
@@ -1541,7 +1807,7 @@ function ReplayImportDialog({
                     event.target.value.replace(/\D/g, "").slice(0, 20),
                   )
                 }
-                placeholder="输入纯数字录像编号"
+                placeholder="例如 1234567890"
                 inputMode="numeric"
                 autoComplete="off"
                 autoFocus
@@ -1660,6 +1926,7 @@ interface ResultsViewProps {
   onUpdateHighlightRules: (ruleIds: HighlightRuleId[]) => void;
   onUpdateRenderSettings: (patch: Partial<RenderSettings>) => void;
   onAddClip: () => void;
+  onActivateTimelineCandidate: (candidateId: string) => void;
   onDuplicateClip: (clipId: string) => void;
   onDeleteClip: (clipId: string) => void;
   onMoveClip: (clipId: string, direction: -1 | 1) => void;
@@ -1679,6 +1946,7 @@ function ResultsView({
   onUpdateHighlightRules,
   onUpdateRenderSettings,
   onAddClip,
+  onActivateTimelineCandidate,
   onDuplicateClip,
   onDeleteClip,
   onMoveClip,
@@ -1705,11 +1973,20 @@ function ResultsView({
         clipEdits.length,
       )
     : null;
-  const anchorCandidates = highlightHero
+  const filteredAnchorCandidates = highlightHero
     ? heroHighlightCandidates(result, highlightHero, highlightRuleIds)
     : result.highlights.candidates.filter(
         (candidate) => candidate.kind !== "hero_kill_sequence",
       );
+  const anchorCandidates =
+    selectedCandidate &&
+    !filteredAnchorCandidates.some(
+      (candidate) => candidate.id === selectedCandidate.id,
+    )
+      ? [selectedCandidate, ...filteredAnchorCandidates].sort(
+          (left, right) => left.peak_seconds - right.peak_seconds,
+        )
+      : filteredAnchorCandidates;
 
   useEffect(() => {
     setHighlightQuery("");
@@ -1818,6 +2095,15 @@ function ResultsView({
             tone="mint"
           />
         </div>
+
+        <ReplayEventTimeline
+          result={result}
+          clipEdits={clipEdits}
+          selectedClip={selectedClip}
+          highlightHero={highlightHero}
+          onSelectClip={onSelectClip}
+          onActivateCandidate={onActivateTimelineCandidate}
+        />
 
         <div className="candidate-table-header">
           <div>
@@ -2338,6 +2624,184 @@ function ResultsView({
         )}
       </aside>
     </div>
+  );
+}
+
+interface ReplayEventTimelineProps {
+  result: AnalysisSummary;
+  clipEdits: ClipEdits;
+  selectedClip: ClipEditState | null;
+  highlightHero: string;
+  onSelectClip: (clipId: string) => void;
+  onActivateCandidate: (candidateId: string) => void;
+}
+
+function ReplayEventTimeline({
+  result,
+  clipEdits,
+  selectedClip,
+  highlightHero,
+  onSelectClip,
+  onActivateCandidate,
+}: ReplayEventTimelineProps) {
+  const [scope, setScope] = useState<TimelineScope>(
+    highlightHero ? "hero" : "all",
+  );
+  const duration = result.replay.playback_time_seconds;
+  const events = useMemo(
+    () =>
+      buildTimelineEvents(
+        result.highlights.candidates,
+        highlightHero,
+        scope,
+      ),
+    [highlightHero, result.highlights.candidates, scope],
+  );
+  const ticks = useMemo(() => timelineTicks(duration, 4), [duration]);
+  const candidateById = useMemo(
+    () =>
+      new Map(
+        result.highlights.candidates.map((candidate) => [
+          candidate.id,
+          candidate,
+        ]),
+      ),
+    [result.highlights.candidates],
+  );
+  const includedCandidateIds = useMemo(
+    () => new Set(clipEdits.map((clip) => clip.candidateId)),
+    [clipEdits],
+  );
+
+  useEffect(() => {
+    setScope(highlightHero ? "hero" : "all");
+  }, [highlightHero, result.job_id]);
+
+  return (
+    <section className="event-timeline" aria-label="整局事件时间轴">
+      <header className="event-timeline-header">
+        <span>
+          <small>整局事件轴</small>
+          <strong>
+            {scope === "hero" && highlightHero
+              ? `${heroLabel(highlightHero)}相关`
+              : "全部英雄"}{" "}
+            · {events.length} 个候选
+          </strong>
+        </span>
+        <div className="timeline-scope-control" aria-label="时间轴显示范围">
+          <button
+            className={scope === "all" ? "active" : ""}
+            type="button"
+            aria-pressed={scope === "all"}
+            onClick={() => setScope("all")}
+          >
+            整局
+          </button>
+          <button
+            className={scope === "hero" ? "active" : ""}
+            type="button"
+            aria-pressed={scope === "hero"}
+            disabled={!highlightHero}
+            onClick={() => setScope("hero")}
+          >
+            相关
+          </button>
+        </div>
+      </header>
+
+      <div className="timeline-chart">
+        <div className="timeline-row clip-track-row">
+          <span className="timeline-row-label">片段</span>
+          <div className="timeline-rail">
+            {clipEdits.map((clip, index) => {
+              const style = timelineRangeStyle(
+                clip.startSeconds,
+                clip.endSeconds,
+                duration,
+              );
+              return (
+                <button
+                  className={`timeline-clip-range ${
+                    selectedClip?.clipId === clip.clipId ? "active" : ""
+                  }`}
+                  key={clip.clipId}
+                  type="button"
+                  style={style}
+                  title={`片段 ${index + 1} · ${formatTimecode(
+                    clip.startSeconds,
+                  )} - ${formatTimecode(clip.endSeconds)}`}
+                  aria-label={`选择片段 ${index + 1}`}
+                  onClick={() => onSelectClip(clip.clipId)}
+                />
+              );
+            })}
+          </div>
+        </div>
+
+        {TIMELINE_LANES.map((lane) => {
+          const laneEvents = events.filter((event) => event.lane === lane.id);
+          return (
+            <div className="timeline-row" key={lane.id}>
+              <span className="timeline-row-label">{lane.label}</span>
+              <div className={`timeline-rail ${lane.id}`}>
+                {laneEvents.map((event) => {
+                  const candidate = candidateById.get(event.candidateId);
+                  if (!candidate) {
+                    return null;
+                  }
+                  const included = includedCandidateIds.has(candidate.id);
+                  const active =
+                    selectedClip?.candidateId === candidate.id;
+                  return (
+                    <button
+                      className={`timeline-event-marker ${
+                        included ? "included" : ""
+                      } ${active ? "active" : ""}`}
+                      key={candidate.id}
+                      type="button"
+                      style={timelineRangeStyle(
+                        event.startSeconds,
+                        event.endSeconds,
+                        duration,
+                      )}
+                      title={`${formatTimecode(event.timeSeconds)} · ${candidateTitle(
+                        candidate,
+                      )}${included ? " · 已在片段清单" : " · 点击添加片段"}`}
+                      aria-label={`${formatTimecode(
+                        event.timeSeconds,
+                      )}，${candidateTitle(candidate)}`}
+                      onClick={() => onActivateCandidate(candidate.id)}
+                    />
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+
+        <div className="timeline-row timeline-ticks">
+          <span className="timeline-row-label" />
+          <div className="timeline-rail">
+            {ticks.map((tick, index) => (
+              <span
+                className={`timeline-tick ${
+                  index === 0
+                    ? "first"
+                    : index === ticks.length - 1
+                      ? "last"
+                      : ""
+                }`}
+                key={`${tick}-${index}`}
+                style={{ left: `${timelinePercent(tick, duration)}%` }}
+              >
+                {formatTimelineTick(tick)}
+              </span>
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -3317,6 +3781,30 @@ function formatDuration(seconds: number) {
   const minutes = Math.floor(seconds / 60);
   const rest = Math.floor(seconds % 60);
   return `${minutes}:${rest.toString().padStart(2, "0")}`;
+}
+
+function formatTimelineTick(seconds: number) {
+  const safe = Math.max(0, Number.isFinite(seconds) ? seconds : 0);
+  const minutes = Math.floor(safe / 60);
+  const rest = Math.floor(safe % 60);
+  return `${minutes}:${rest.toString().padStart(2, "0")}`;
+}
+
+function timelineRangeStyle(
+  startSeconds: number,
+  endSeconds: number,
+  durationSeconds: number,
+) {
+  const left = timelinePercent(startSeconds, durationSeconds);
+  const right = timelinePercent(
+    Math.max(startSeconds, endSeconds),
+    durationSeconds,
+  );
+  const width = Math.min(100 - left, Math.max(0.8, right - left));
+  return {
+    left: `${left}%`,
+    width: `${width}%`,
+  };
 }
 
 function formatTimecode(seconds: number) {

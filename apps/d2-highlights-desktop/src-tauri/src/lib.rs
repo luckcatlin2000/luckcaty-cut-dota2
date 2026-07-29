@@ -12,9 +12,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
+use tauri_plugin_updater::{Update, UpdaterExt};
 
 const EDIT_PLAN_SCHEMA_VERSION: &str = "d2h.edit-plan/1.3";
 
@@ -31,6 +32,37 @@ struct AppState {
 struct RenderRuntime {
     active: bool,
     cancellation: Option<CancellationToken>,
+}
+
+#[derive(Default)]
+struct PendingUpdate(Mutex<UpdateRuntime>);
+
+#[derive(Default)]
+struct UpdateRuntime {
+    pending: Option<Update>,
+    installing: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppUpdateMetadata {
+    version: String,
+    current_version: String,
+    notes: String,
+    published_at: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(
+    tag = "event",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+enum AppUpdateEvent {
+    Started { content_length: Option<u64> },
+    Progress { chunk_length: usize },
+    Finished,
 }
 
 #[derive(Serialize)]
@@ -613,6 +645,110 @@ fn open_local_path(path: String, state: State<'_, AppState>) -> Result<(), Strin
         .map_err(|error| format!("无法打开输出：{error}"))
 }
 
+#[tauri::command]
+async fn check_for_app_update(
+    app: AppHandle,
+    pending_update: State<'_, PendingUpdate>,
+) -> Result<Option<AppUpdateMetadata>, String> {
+    {
+        let runtime = pending_update
+            .0
+            .lock()
+            .map_err(|_| "更新状态不可用，请重启应用。".to_string())?;
+        if runtime.installing {
+            return Err("更新正在安装，请稍候。".to_string());
+        }
+    }
+
+    let updater = app
+        .updater_builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("无法初始化更新检查：{error}"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|error| format!("无法连接官方更新地址：{error}"))?;
+    let metadata = update.as_ref().map(|update| AppUpdateMetadata {
+        version: update.version.clone(),
+        current_version: update.current_version.clone(),
+        notes: sanitize_update_notes(update.body.as_deref()),
+        published_at: update.date.map(|date| date.to_string()),
+    });
+
+    let mut runtime = pending_update
+        .0
+        .lock()
+        .map_err(|_| "更新状态不可用，请重启应用。".to_string())?;
+    if runtime.installing {
+        return Err("更新正在安装，请稍候。".to_string());
+    }
+    runtime.pending = update;
+    Ok(metadata)
+}
+
+#[tauri::command]
+async fn install_app_update(
+    app: AppHandle,
+    pending_update: State<'_, PendingUpdate>,
+    on_event: Channel<AppUpdateEvent>,
+) -> Result<(), String> {
+    let update = {
+        let mut runtime = pending_update
+            .0
+            .lock()
+            .map_err(|_| "更新状态不可用，请重启应用。".to_string())?;
+        if runtime.installing {
+            return Err("更新正在安装，请不要重复操作。".to_string());
+        }
+        let update = runtime
+            .pending
+            .take()
+            .ok_or_else(|| "没有可安装的更新，请先检查更新。".to_string())?;
+        runtime.installing = true;
+        update
+    };
+
+    let mut started = false;
+    let download_result = update
+        .download_and_install(
+            |chunk_length, content_length| {
+                if !started {
+                    started = true;
+                    let _ = on_event.send(AppUpdateEvent::Started { content_length });
+                }
+                let _ = on_event.send(AppUpdateEvent::Progress { chunk_length });
+            },
+            || {
+                let _ = on_event.send(AppUpdateEvent::Finished);
+            },
+        )
+        .await;
+
+    if let Err(error) = download_result {
+        let mut runtime = pending_update
+            .0
+            .lock()
+            .map_err(|_| "更新失败且状态无法恢复，请重启应用。".to_string())?;
+        runtime.installing = false;
+        runtime.pending = Some(update);
+        return Err(format!("更新包下载或签名验证失败：{error}"));
+    }
+
+    app.restart()
+}
+
+fn sanitize_update_notes(notes: Option<&str>) -> String {
+    const MAX_CHARS: usize = 2_000;
+    let notes = notes.unwrap_or_default().trim();
+    if notes.chars().count() <= MAX_CHARS {
+        return notes.to_string();
+    }
+    let mut truncated = notes.chars().take(MAX_CHARS).collect::<String>();
+    truncated.push('…');
+    truncated
+}
+
 fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest, String> {
     let job_dir = state.jobs_root.join(job_id);
     let manifest = read_json::<JobManifest>(&job_dir.join("manifest.json"))
@@ -845,6 +981,8 @@ fn project_root() -> PathBuf {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(PendingUpdate::default())
         .setup(|app| {
             let root = project_root();
             let executable_dir = env::current_exe()
@@ -900,7 +1038,9 @@ pub fn run() {
             get_latest_render,
             start_render,
             cancel_render,
-            open_local_path
+            open_local_path,
+            check_for_app_update,
+            install_app_update
         ])
         .run(tauri::generate_context!())
         .expect("unable to start Cat Cut Assistant");
@@ -910,8 +1050,8 @@ pub fn run() {
 mod tests {
     use super::{
         EditPlanDocument, load_edit_plan, manual_render_settings, normalize_user_camera_mode,
-        replay_directory_from_dota2, resolve_replay_by_id, valid_clip_id, valid_job_id,
-        valid_replay_id,
+        replay_directory_from_dota2, resolve_replay_by_id, sanitize_update_notes, valid_clip_id,
+        valid_job_id, valid_replay_id,
     };
     use d2_highlights_renderer::{BgmMode, CameraStyle, ClipCameraMode, RenderSettings};
     use std::fs;
@@ -1013,6 +1153,15 @@ mod tests {
         assert!(!settings.replay_emphasis);
         assert!(!settings.impact_sfx);
         assert!(!settings.system_narration);
+    }
+
+    #[test]
+    fn update_notes_are_trimmed_and_bounded() {
+        assert_eq!(sanitize_update_notes(Some("  修复更新  ")), "修复更新");
+        let long = "猫".repeat(2_100);
+        let sanitized = sanitize_update_notes(Some(&long));
+        assert_eq!(sanitized.chars().count(), 2_001);
+        assert!(sanitized.ends_with('…'));
     }
 
     #[test]

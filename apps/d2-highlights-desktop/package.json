@@ -1,7 +1,7 @@
 {
   "name": "d2-highlights-desktop",
   "private": true,
-  "version": "1.6.0",
+  "version": "1.7.0",
   "author": "luckcatlin2000",
   "repository": {
     "type": "git",
@@ -10,6 +10,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "node --experimental-strip-types --test src/*.test.ts",
     "test:highlight-rules": "node --experimental-strip-types --test src/highlightRules.test.ts",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
