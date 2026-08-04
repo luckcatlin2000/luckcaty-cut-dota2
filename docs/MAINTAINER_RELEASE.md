@@ -6,57 +6,43 @@
 .\scripts\verify.ps1
 ```
 
-确认 Git 中不存在：
+确认 Git 中不存在 DEM、媒体、任务缓存、二进制、真实比赛编号、玩家标识、本机绝对路径、密钥或内部规划记录。公开仓库必须继续保留根目录许可证、品牌规则和第三方声明。
 
-- `.dem`、成片、WAV 或任务缓存；
-- EXE、安装包、FFmpeg 二进制；
-- 真实 SteamID、玩家姓名、比赛编号；
-- 开发机绝对路径、密钥或本地配置。
+## 签名候选
 
-同时确认：
-
-- 仓库、About、Topics、Issues、Releases、Wiki 和附件只包含“猫猫的剪辑小助手”信息；
-- 没有无关软件或其他产品的名称、宣传、链接或发布物；
-- 根目录 `LICENSE`、`LICENSE.zh-CN.md`、README 和商业使用文档一致；
-- 没有重新出现 MIT 等允许未经授权销售或再分发本项目自有代码的声明。
-
-## 构建
-
-源码版要求 FFmpeg/FFprobe 位于 PATH、环境变量指定位置或 `tools/ffmpeg/bin/`。
-正式安装包还要求以下环境变量，由 Tauri 用于生成强制验签的更新附件：
-
-- `TAURI_SIGNING_PRIVATE_KEY`
-- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+正式安装包使用被 Git 忽略的 `tools\ffmpeg\bin\` 和 `.release-secrets\`。签名目录包含私钥、公钥与当前 Windows 用户可解密的密码文件，不得复制到候选目录或 Git。
 
 ```powershell
 .\scripts\desktop-release.ps1
 ```
 
-构建结果进入被忽略的 `release/`，不要把二进制提交到 Git 历史。
+隔离工作树可以显式引用维护者主工作树的签名目录：
+
+```powershell
+.\scripts\desktop-release.ps1 -SigningRootOverride "[PROJECT_ROOT]\.release-secrets"
+```
+
+脚本先执行完整验证，再生成 `release\candidate\<版本>\`，其中包括便携版、安装包、更新安装包、签名、`latest.json` 和绑定源码提交的候选清单。候选不会自动覆盖根目录正式版。
+
+## 正式提升
+
+候选完成冷启动和适用的真实录像回归后，确认 `main`、`v<版本>` 标签和候选清单指向同一提交，再执行：
+
+```powershell
+.\scripts\promote-release.ps1 -Version <版本> -ConfirmPromotion
+```
+
+提升脚本会再次验证哈希与源码，把上一版 EXE 保存到 `release\history\`，再原子替换根目录启动文件和正式安装包。
 
 ## GitHub Release
 
-仓库 Actions Secrets 必须配置同名的
-`TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。推送
-`v<版本号>` 标签后，`.github/workflows/release.yml` 会运行完整验证、构建
-NSIS 安装包，并上传安装包、签名和 `latest.json`。
+GitHub Actions 只验证源码，不持有更新签名私钥，也不重建已经验收的安装包。维护者在推送前必须再次确认官方仓库、`main`、标签和以下附件：
 
-客户端更新策略固定为：
+- `latest.json`
+- `luckcaty-cut-dota2_<版本>_x64-setup.exe`
+- `luckcaty-cut-dota2_<版本>_x64-setup.exe.sig`
+- 可选的便携版与面向用户的安装包
 
-- 启动后只检查是否有新版本；
-- 不自动下载；
-- 不强制安装；
-- 只有用户点击“下载安装”后才下载、验签、安装并重启；
-- 分析或导出任务进行中时禁止安装。
+Release 说明包含功能变化、SHA-256、FFmpeg 许可证与来源链接，不把静态作者信息写成更新项。
 
-每个发布版本建议附带：
-
-- 最新安装包或便携包；
-- SHA-256；
-- 版本说明；
-- 第三方 notices；
-- 如果捆绑 FFmpeg，附带该构建对应的许可证、源码和构建信息。
-
-只有著作权人或持有明确书面授权的发布者可以对外发布安装包。不得授权第三方改名换皮、套壳销售或删除项目来源信息，除非书面授权文件明确允许这些行为。
-
-发布到 GitHub 是外部操作，必须在复核仓库、目标账号、仓库名称、标签和附件后单独执行。
+客户端更新策略固定为只检查和提示；用户点击后才下载、验签与安装，分析或导出期间禁止安装。只有著作权人或持有明确书面授权的发布者可以对外发布安装包。

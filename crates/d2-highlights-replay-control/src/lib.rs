@@ -12,6 +12,8 @@ const VCONSOLE_COMMAND_VERSION: u32 = 0x00D4_0000;
 
 const ALLOWED_COMMANDS: &[&str] = &[
     "echo",
+    "find",
+    "cvarlist",
     "help",
     "playdemo",
     "sv_cheats",
@@ -42,7 +44,11 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "dota_camera_center_on_entity",
     "dota_camera_center_on_hero",
     "dota_camera_focus_player",
+    "dota_camera_allow_freecam",
     "dota_camera_distance",
+    "dota_camera_get_lookatpos",
+    "dota_camera_get_pos",
+    "dota_camera_lerp_position",
     "dota_camera_set_lookatpos",
 ];
 
@@ -576,6 +582,12 @@ mod tests {
         assert!(build_cmnd_packet("endmovie").is_ok());
         assert!(build_cmnd_packet("dota_spectator_hero_index 9").is_ok());
         assert!(build_cmnd_packet("dota_camera_focus_player 4").is_ok());
+        assert!(build_cmnd_packet("dota_camera_allow_freecam 1").is_ok());
+        assert!(build_cmnd_packet("dota_camera_get_pos").is_ok());
+        assert!(build_cmnd_packet("dota_camera_get_lookatpos").is_ok());
+        assert!(build_cmnd_packet("dota_camera_lerp_position 100 200 2").is_ok());
+        assert!(build_cmnd_packet("find dota_camera").is_ok());
+        assert!(build_cmnd_packet("cvarlist dota_camera").is_ok());
         for command in [
             "sv_cheats 1",
             "dota_spectator_hudhide",

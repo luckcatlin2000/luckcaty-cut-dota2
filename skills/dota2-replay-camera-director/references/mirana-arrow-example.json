@@ -1,0 +1,103 @@
+{
+  "schemaVersion": "d2h.camera-skill-plan/1.0",
+  "replayRef": "local-example",
+  "protagonist": {
+    "hero": "npc_dota_hero_mirana",
+    "slot": 9
+  },
+  "scenes": [
+    {
+      "sceneId": "S001",
+      "candidateId": "example-mirana-arrow-kill",
+      "storyPurpose": "从施法准备到神箭命中与击杀反馈",
+      "evidenceIds": [
+        "E001-arrow-cast",
+        "E002-arrow-hit",
+        "E003-hero-kill"
+      ],
+      "source": {
+        "startSeconds": 110.5,
+        "endSeconds": 117.5,
+        "startTick": 3250,
+        "endTick": 3460
+      },
+      "takes": [
+        {
+          "takeId": "S001-A",
+          "cameraType": "player-view",
+          "primary": true,
+          "targetSlot": 9,
+          "distance": 1200
+        },
+        {
+          "takeId": "S001-B",
+          "cameraType": "hero-chase-close",
+          "primary": false,
+          "targetSlot": 9,
+          "distance": 520
+        },
+        {
+          "takeId": "S001-C",
+          "cameraType": "high-aerial",
+          "primary": false,
+          "distance": 2400,
+          "lookAt": {
+            "x": 1600,
+            "y": -80
+          }
+        },
+        {
+          "takeId": "S001-D",
+          "cameraType": "push-track",
+          "primary": false,
+          "distance": 1700,
+          "lookAt": {
+            "x": 1500,
+            "y": -120
+          },
+          "cues": [
+            {
+              "atSeconds": 2.5,
+              "distance": 1450,
+              "lookAt": {
+                "x": 1720,
+                "y": -60
+              }
+            },
+            {
+              "atSeconds": 4.0,
+              "distance": 1150,
+              "lookAt": {
+                "x": 1880,
+                "y": 80
+              }
+            },
+            {
+              "atSeconds": 5.5,
+              "distance": 900,
+              "lookAt": {
+                "x": 1740,
+                "y": -20
+              }
+            }
+          ]
+        }
+      ],
+      "suggestedSwitchWindows": [
+        {
+          "takeId": "S001-B",
+          "startOffsetSeconds": 2.8,
+          "endOffsetSeconds": 4.8,
+          "reason": "神箭命中与击杀反馈"
+        },
+        {
+          "takeId": "S001-D",
+          "startOffsetSeconds": 0.8,
+          "endOffsetSeconds": 5.5,
+          "reason": "沿技能方向从战场关系推进到动作主体"
+        }
+      ],
+      "fallbackTakeId": "S001-A"
+    }
+  ]
+}

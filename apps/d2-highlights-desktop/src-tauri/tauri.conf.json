@@ -45,7 +45,13 @@
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "../../../tools/ffmpeg/bin/ffmpeg.exe": "tools/ffmpeg/bin/ffmpeg.exe",
+      "../../../tools/ffmpeg/bin/ffprobe.exe": "tools/ffmpeg/bin/ffprobe.exe",
+      "../../../tools/ffmpeg/LICENSE.txt": "tools/ffmpeg/LICENSE.txt",
+      "../../../tools/ffmpeg/SOURCE.txt": "tools/ffmpeg/SOURCE.txt"
+    }
   },
   "plugins": {
     "updater": {
