@@ -1,12 +1,35 @@
 ---
 name: dota2-replay-camera-director
-description: Plan and validate evidence-driven, synchronized camera takes for local Dota 2 DEM replay highlights. Use when Codex needs to turn a replay story or verified event into numbered Player View, Hero Chase close, high-aerial, or push-track source takes; define S001-A/B/C timing and switch windows; prepare a controlled VConsole render; or review camera coverage without adding copy, BGM, narration, or online-game automation.
+description: Plan and validate evidence-driven Dota 2 replay stories, WTF DirectorProfile decisions, joke-point markers, rough cuts, and synchronized Player View, Hero Chase close, high-aerial, or push-track takes. Use when Codex needs to preserve Precision Edit behavior, compile a validated WTF profile into a local DEM director plan, define S001-A/B/C timing and switch windows, prepare controlled VConsole rendering, or review camera coverage without online-game automation.
 ---
 
 # Dota 2 Replay Camera Director
 
-将可验证的录像事件转换为同时间码、多机位、可后期选择的源素材计划。保持玩家
-视角为叙事主线，只在动作、空间关系或反应确实需要时增加备用镜头。
+将可验证的录像事件转换为剧情节拍、梗点、粗剪顺序和同时间码多机位素材计划。
+保持玩家视角为叙事主线，只在动作、空间关系或反应确实需要时增加备用镜头。
+
+## 选择产品模式
+
+- `precision`（精准剪辑）是默认模式，沿用现有英雄、规则、时间和镜头方案。
+- `wtf_director` 只能读取通过验证的 `DirectorProfile`，生成独立 WTF 方案；不得覆盖
+  精准剪辑方案。
+- `candidate` Profile 或 `pilot_only` 故事原型只用于研究，不能进入普通用户运行时。
+- 两种模式的行为和文件隔离见 `references/wtf-director-contract.md`。
+
+## 建立 WTF 导演方案
+
+1. 读取 Timeline、Highlight、Story 证据和用户选择的主角。
+2. 运行 `validate-wtf-director.ps1 -ProfilePath <profile>`；只有
+   `runtimeEligible=true` 才继续。
+3. 用 Profile 的 `signal` 匹配证据，并按 `beatProgram` 选择剧情节拍。
+4. 把可自动完成的干净剪辑写为 `automatic_clean_edit`；需要外部素材的梗点只写
+   `marker_only` 语义槽位。
+5. 按 `coverageProgram` 生成最少同步机位，并沿用 `S001-A/B/C` 编号。
+6. 生成独立 `WtfDirectorPlan`、相机计划和粗剪顺序，不改写精准方案。
+7. 同时运行 WTF 方案验证器和现有相机计划验证器。
+
+证据不足、Profile 未验证、模式引用错误或镜头不可见时保持 HOLD，并回到精准剪辑，
+不得用随机候选或模型猜测补齐。
 
 ## 建立计划
 
@@ -96,4 +119,8 @@ Hero Chase 称作角色正面的低机位特写；当前它只是跟随英雄的
 - `references/camera-recipes.md`：当前客户端实测镜头参数和适用边界。
 - `references/plan-contract.md`：类型化镜头计划合同。
 - `references/mirana-arrow-example.json`：不含真实比赛编号的米拉娜示例。
+- `references/wtf-director-contract.md`：WTF Profile、运行时方案和模式隔离合同。
+- `references/wtf-director-profile-example.json`：合成的已验证 Profile 结构示例。
+- `references/wtf-director-plan-example.json`：合成的运行时方案示例。
 - `scripts/validate-camera-plan.ps1`：计划验证与自检。
+- `scripts/validate-wtf-director.ps1`：Profile、WTF 方案和运行门禁验证。

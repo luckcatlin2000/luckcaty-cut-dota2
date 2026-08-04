@@ -30,6 +30,13 @@ try {
     ) -SelfTest
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+    $wtfValidator = Join-Path $projectRoot `
+        'skills\dota2-replay-camera-director\scripts\validate-wtf-director.ps1'
+    if (Test-Path -LiteralPath $wtfValidator -PathType Leaf) {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $wtfValidator -SelfTest
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (
         Join-Path $PSScriptRoot "verify-updater.ps1"
     )

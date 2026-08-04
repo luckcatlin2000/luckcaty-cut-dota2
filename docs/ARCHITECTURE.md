@@ -11,6 +11,8 @@ Tauri Desktop UI
   -> Timeline（完整 10 人阵容、统一事件、实体、位置和状态 JSON）
   -> Highlight Engine（可解释事件与时间/tick 锚点）
   -> Story Director（证据、置信度、节拍、场次、机位与切换窗）
+  -> Mode Router（默认 Precision / 显式 WTF Director）
+  -> WTF Profile Engine（可选：故事原型、梗点与粗剪顺序）
   -> Local Highlight Rules（高光主角、击杀/砍树内容筛选）
   -> Candidate Event Timeline（事件轨道、英雄范围、片段覆盖关系）
   -> Edit Plan（场次顺序、同步机位、入点、出点、英雄、镜头）
@@ -38,6 +40,8 @@ Tauri Desktop UI
 ### 4. Story Director
 
 `d2h.story/1.2` 把候选组织为带类别、参与者、证据、置信度、剧情节拍、机位目的、后备镜头和建议切换时间窗的故事。当前确定性模板覆盖英雄连续击杀、重复补刀斧砍临时树和保守的买活再死；不从孤立施法猜测玩家意图。普通场次可只有玩家视角，关键技术动作、反转或明确落点才增加同步近景。
+
+开发中的模式合同见 `WTF_DIRECTOR_MODE.md`。默认 `precision` 继续使用现有本地高光规则和编辑方案；显式 `wtf_director` 在同一批结构化证据上加载通过验证的 `d2h.wtf-director-profile/1.0`，生成独立 `d2h.wtf-director-plan/1.0`。Profile 负责故事原型、节拍选择、梗点语义和镜头预算，Plan 负责某份 DEM 的实际故事、梗点、场次引用和粗剪顺序。`candidate/pilot_only` 规则不得进入运行时。
 
 ### 5. Edit Plan
 

@@ -1,0 +1,138 @@
+{
+  "schemaVersion": "d2h.wtf-director-profile/1.0",
+  "profileId": "synthetic-repeat-gag",
+  "profileVersion": "1.0.0",
+  "status": "validated",
+  "mode": "wtf_director",
+  "displayName": "合成重复梗示例",
+  "sourceRefs": [
+    {
+      "sourceId": "synthetic-case-a",
+      "evidenceRef": "case-a@00:10-00:45"
+    },
+    {
+      "sourceId": "synthetic-case-b",
+      "evidenceRef": "case-b@00:20-00:58"
+    }
+  ],
+  "runtimePolicy": {
+    "defaultMode": "precision",
+    "fallbackMode": "precision",
+    "requiresCloudAi": false,
+    "analysisStartsDota2": false,
+    "preservePrecisionPlan": true,
+    "allowUnverifiedPatterns": false,
+    "externalAssetPolicy": "semantic_slots_only"
+  },
+  "storyPatterns": [
+    {
+      "patternId": "repeat-gag",
+      "title": "重复互动递进",
+      "validationState": "validated",
+      "categories": [
+        "comedy",
+        "skill"
+      ],
+      "signal": {
+        "evidenceKinds": [
+          "trigger",
+          "response",
+          "verification"
+        ],
+        "groupingKeys": [
+          "primary_hero",
+          "interaction_signature"
+        ],
+        "minOccurrences": 3,
+        "maxSpanSeconds": 1800,
+        "minimumConfidence": 0.8
+      },
+      "beatProgram": [
+        {
+          "beatId": "setup",
+          "role": "setup",
+          "selector": "first",
+          "required": true,
+          "purpose": "第一次完整建立互动规则"
+        },
+        {
+          "beatId": "recognition",
+          "role": "recognition",
+          "selector": "second",
+          "required": true,
+          "purpose": "让观众确认相同行为再次发生"
+        },
+        {
+          "beatId": "payoff",
+          "role": "payoff",
+          "selector": "last",
+          "required": true,
+          "purpose": "用最后一次或最强一次完成包袱"
+        }
+      ],
+      "jokePointProgram": [
+        {
+          "cueId": "recognition-callback",
+          "anchorBeatId": "recognition",
+          "cueType": "callback",
+          "execution": "automatic_clean_edit",
+          "purpose": "通过剪切节奏呼应第一次互动"
+        },
+        {
+          "cueId": "payoff-reaction-slot",
+          "anchorBeatId": "payoff",
+          "cueType": "reaction_slot",
+          "execution": "marker_only",
+          "purpose": "为用户后期反应素材保留语义位置"
+        }
+      ],
+      "coverageProgram": [
+        {
+          "beatId": "setup",
+          "primaryCamera": "player-view",
+          "alternateCameras": [],
+          "alternateWhen": [],
+          "purpose": "完整交代第一次互动"
+        },
+        {
+          "beatId": "recognition",
+          "primaryCamera": "player-view",
+          "alternateCameras": [],
+          "alternateWhen": [],
+          "purpose": "保持重复行为可比较"
+        },
+        {
+          "beatId": "payoff",
+          "primaryCamera": "player-view",
+          "alternateCameras": [
+            "hero-chase-close"
+          ],
+          "alternateWhen": [
+            "action_is_visible",
+            "not_occluded"
+          ],
+          "purpose": "在最终动作清楚时提供同步近景"
+        }
+      ],
+      "selectionPolicy": {
+        "maxOccurrencesInCut": 4,
+        "preserveFirst": true,
+        "preserveLast": true,
+        "middleSelector": "highest_information_gain"
+      }
+    }
+  ],
+  "episodePolicy": {
+    "targetDurationSeconds": 90,
+    "maxStories": 6,
+    "orderingSignals": [
+      "clarity",
+      "escalation",
+      "variety"
+    ],
+    "finalePreference": [
+      "highest_payoff",
+      "largest_spatial_scale"
+    ]
+  }
+}

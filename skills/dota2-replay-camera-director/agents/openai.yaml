@@ -1,4 +1,4 @@
 interface:
-  display_name: "Dota 2 回放镜头导演"
-  short_description: "Plan and validate synchronized Dota 2 replay camera takes"
-  default_prompt: "Use $dota2-replay-camera-director to plan and validate synchronized Dota 2 replay camera takes for this story."
+  display_name: "Dota 2 智能回放导演"
+  short_description: "Plan WTF stories, joke points, rough cuts, and synchronized replay takes"
+  default_prompt: "Use $dota2-replay-camera-director to turn verified DEM evidence into a validated WTF story, joke-point, rough-cut, and synchronized camera plan."

@@ -1,0 +1,117 @@
+{
+  "schemaVersion": "d2h.wtf-director-plan/1.0",
+  "mode": "wtf_director",
+  "profileRef": {
+    "profileId": "synthetic-repeat-gag",
+    "profileVersion": "1.0.0"
+  },
+  "sourceSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "fallbackMode": "precision",
+  "precisionPlanRef": "director/edit-plan.json",
+  "protagonist": {
+    "hero": "npc_dota_hero_windrunner",
+    "slot": 2
+  },
+  "stories": [
+    {
+      "storyId": "W001",
+      "patternId": "repeat-gag",
+      "title": "三次拆掉同一种临时树",
+      "confidence": {
+        "score": 0.94,
+        "reasons": [
+          "三次互动具有同一结构化签名",
+          "每次均有触发、响应和实体删除证据"
+        ]
+      },
+      "evidenceIds": [
+        "e-tree-01-trigger",
+        "e-tree-01-proof",
+        "e-tree-02-trigger",
+        "e-tree-02-proof",
+        "e-tree-03-trigger",
+        "e-tree-03-proof"
+      ],
+      "beats": [
+        {
+          "beatId": "W001-B01",
+          "role": "setup",
+          "sourceStartSeconds": 116.0,
+          "sourceEndSeconds": 124.0,
+          "evidenceIds": [
+            "e-tree-01-trigger",
+            "e-tree-01-proof"
+          ]
+        },
+        {
+          "beatId": "W001-B02",
+          "role": "recognition",
+          "sourceStartSeconds": 178.0,
+          "sourceEndSeconds": 185.5,
+          "evidenceIds": [
+            "e-tree-02-trigger",
+            "e-tree-02-proof"
+          ]
+        },
+        {
+          "beatId": "W001-B03",
+          "role": "payoff",
+          "sourceStartSeconds": 252.0,
+          "sourceEndSeconds": 261.0,
+          "evidenceIds": [
+            "e-tree-03-trigger",
+            "e-tree-03-proof"
+          ]
+        }
+      ],
+      "jokePoints": [
+        {
+          "cueId": "W001-J01",
+          "programCueId": "recognition-callback",
+          "anchorSeconds": 183.2,
+          "cueType": "callback",
+          "execution": "automatic_clean_edit",
+          "purpose": "第二次成功后形成第一次回调"
+        },
+        {
+          "cueId": "W001-J02",
+          "programCueId": "payoff-reaction-slot",
+          "anchorSeconds": 258.4,
+          "cueType": "reaction_slot",
+          "execution": "marker_only",
+          "purpose": "最终成功后预留反应素材位置"
+        }
+      ],
+      "sceneIds": [
+        "S001",
+        "S002",
+        "S003"
+      ]
+    }
+  ],
+  "cameraPlanRef": "director/wtf-camera-plan.json",
+  "roughCut": [
+    {
+      "order": 1,
+      "sceneId": "S001",
+      "takeId": "S001-A",
+      "sourceStartSeconds": 116.0,
+      "sourceEndSeconds": 124.0
+    },
+    {
+      "order": 2,
+      "sceneId": "S002",
+      "takeId": "S002-A",
+      "sourceStartSeconds": 178.0,
+      "sourceEndSeconds": 185.5
+    },
+    {
+      "order": 3,
+      "sceneId": "S003",
+      "takeId": "S003-A",
+      "sourceStartSeconds": 252.0,
+      "sourceEndSeconds": 261.0
+    }
+  ],
+  "reviewRequired": false
+}
