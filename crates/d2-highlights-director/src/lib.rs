@@ -1,3 +1,7 @@
+mod story;
+
+pub use story::{StoryValidationError, build_story_document, validate_story_document};
+
 use d2_highlights_core::{
     AudioCue, AudioPlan, CameraPlan, DIRECTOR_SCHEMA_VERSION, DirectorDocument, DirectorSegment,
     HighlightCandidate, HighlightDocument, StoryBeat,

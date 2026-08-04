@@ -7,7 +7,7 @@ use d2_highlights_core::{
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const DETECTOR_NAME: &str = "rules-v2";
-pub const DETECTOR_VERSION: &str = "0.4.1";
+pub const DETECTOR_VERSION: &str = "0.5.0";
 const CLUSTER_GAP_SECONDS: f32 = 18.0;
 const SETUP_SECONDS: f32 = 12.0;
 const RESULT_SECONDS: f32 = 8.0;
@@ -25,6 +25,9 @@ const TREE_CREATION_WINDOW_TICKS: u32 = 16;
 const TREE_ACTION_TICK_TOLERANCE: u32 = 2;
 const FIRST_FIFTEEN_MINUTES_SECONDS: f32 = 15.0 * 60.0;
 const REPEATED_INTERACTION_BONUS: f32 = 140.0;
+const BUYBACK_DIEBACK_MAX_SECONDS: f32 = 90.0;
+const BUYBACK_DIEBACK_SETUP_SECONDS: f32 = 2.0;
+const BUYBACK_DIEBACK_RESULT_SECONDS: f32 = 4.0;
 
 pub fn detect_highlights(
     timeline: &TimelineDocument,
@@ -92,7 +95,14 @@ pub fn detect_highlights(
         candidate.rank = generic_candidate_count + index + 1;
         candidate.id = format!("hk-{:03}", index + 1);
     }
+    let hero_kill_candidate_count = hero_kill_candidates.len();
     candidates.extend(hero_kill_candidates);
+    let mut mistake_candidates = buyback_dieback_candidates(timeline);
+    for (index, candidate) in mistake_candidates.iter_mut().enumerate() {
+        candidate.rank = generic_candidate_count + hero_kill_candidate_count + index + 1;
+        candidate.id = format!("ms-{:03}", index + 1);
+    }
+    candidates.extend(mistake_candidates);
 
     HighlightDocument {
         schema_version: HIGHLIGHT_SCHEMA_VERSION.to_string(),
@@ -103,6 +113,82 @@ pub fn detect_highlights(
         },
         candidates,
     }
+}
+
+fn buyback_dieback_candidates(timeline: &TimelineDocument) -> Vec<HighlightCandidate> {
+    let mut used_death_ticks = BTreeSet::new();
+    timeline
+        .events
+        .iter()
+        .filter(|event| event.event_type == "DotaCombatlogBuyback")
+        .filter_map(|buyback| {
+            let buyback_time = buyback.time_seconds?;
+            let player_slot = u8::try_from(buyback.value?).ok()?;
+            let hero = timeline
+                .replay
+                .players
+                .iter()
+                .find(|player| player.slot == player_slot)?
+                .hero_name
+                .as_str();
+            let death = timeline
+                .events
+                .iter()
+                .filter(|event| {
+                    event.event_type == "DotaCombatlogDeath"
+                        && event.target.as_deref() == Some(hero)
+                        && event.target_is_hero == Some(true)
+                        && event.will_reincarnate != Some(true)
+                        && event.time_seconds.is_some_and(|death_time| {
+                            death_time > buyback_time
+                                && death_time - buyback_time <= BUYBACK_DIEBACK_MAX_SECONDS
+                        })
+                })
+                .min_by(|left, right| {
+                    left.time_seconds
+                        .unwrap_or_default()
+                        .total_cmp(&right.time_seconds.unwrap_or_default())
+                })?;
+            if !used_death_ticks.insert(death.tick) {
+                return None;
+            }
+            let death_time = death.time_seconds?;
+            let delay = death_time - buyback_time;
+            let killer = death
+                .attacker
+                .as_deref()
+                .filter(|name| name.starts_with("npc_dota_hero_"));
+            let mut participants = BTreeSet::from([hero.to_string()]);
+            participants.extend(killer.map(ToOwned::to_owned));
+            let immediacy_score = ((BUYBACK_DIEBACK_MAX_SECONDS - delay)
+                / BUYBACK_DIEBACK_MAX_SECONDS)
+                .clamp(0.0, 1.0)
+                * 70.0;
+
+            Some(HighlightCandidate {
+                id: String::new(),
+                rank: 0,
+                kind: "buyback_dieback".to_string(),
+                title: format!("Buyback death after {delay:.1}s"),
+                score: 90.0 + immediacy_score,
+                start_seconds: (buyback_time - BUYBACK_DIEBACK_SETUP_SECONDS).max(0.0),
+                peak_seconds: death_time,
+                end_seconds: (death_time + BUYBACK_DIEBACK_RESULT_SECONDS)
+                    .min(timeline.replay.playback_time_seconds),
+                hero_deaths: 1,
+                anchor_tick: death.tick,
+                primary_hero: Some(hero.to_string()),
+                participants: participants.into_iter().collect(),
+                reasons: vec![
+                    format!("player slot {player_slot} bought back at {buyback_time:.3}s"),
+                    format!("the same hero died again {delay:.2}s later"),
+                    "death does not consume a reincarnation".to_string(),
+                ],
+                interaction: None,
+                kill_sequence: None,
+            })
+        })
+        .collect()
 }
 
 fn score_cluster(timeline: &TimelineDocument, cluster: &[&CombatEvent]) -> HighlightCandidate {
@@ -960,6 +1046,32 @@ mod tests {
         result
     }
 
+    fn buyback_event(time: f32, player_slot: u8) -> CombatEvent {
+        let mut result = event(time, 3);
+        result.event_type = "DotaCombatlogBuyback".to_string();
+        result.attacker = None;
+        result.target = None;
+        result.target_is_hero = None;
+        result.value = Some(u32::from(player_slot));
+        result
+    }
+
+    fn hero_death_event(time: f32, hero: &str, will_reincarnate: bool) -> CombatEvent {
+        let mut result = event(time, 3);
+        result.target = Some(hero.to_string());
+        result.will_reincarnate = Some(will_reincarnate);
+        result
+    }
+
+    fn add_mirana_player(replay: &mut TimelineDocument) {
+        replay.replay.players = vec![ReplayPlayer {
+            slot: 0,
+            hero_name: "npc_dota_hero_mirana".to_string(),
+            game_team: Some(3),
+            is_fake_client: false,
+        }];
+    }
+
     fn add_tree_proof(
         timeline: &mut TimelineDocument,
         trigger_time: f32,
@@ -1392,5 +1504,64 @@ mod tests {
             assert_eq!(verification.first_fifteen_occurrence_count, 4);
             assert_eq!(verification.source_to_responder_salute_count, 3);
         }
+    }
+
+    #[test]
+    fn detects_same_hero_death_within_ninety_seconds_of_buyback() {
+        let mut replay = timeline(vec![
+            buyback_event(100.0, 0),
+            hero_death_event(112.0, "npc_dota_hero_mirana", false),
+        ]);
+        add_mirana_player(&mut replay);
+
+        let result = detect_highlights(&replay, 10, 0.0);
+        let mistakes = result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.kind == "buyback_dieback")
+            .collect::<Vec<_>>();
+
+        assert_eq!(mistakes.len(), 1);
+        assert_eq!(
+            mistakes[0].primary_hero.as_deref(),
+            Some("npc_dota_hero_mirana")
+        );
+        assert_eq!(mistakes[0].peak_seconds, 112.0);
+    }
+
+    #[test]
+    fn ignores_death_more_than_ninety_seconds_after_buyback() {
+        let mut replay = timeline(vec![
+            buyback_event(100.0, 0),
+            hero_death_event(190.1, "npc_dota_hero_mirana", false),
+        ]);
+        add_mirana_player(&mut replay);
+
+        let result = detect_highlights(&replay, 10, 0.0);
+
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| candidate.kind != "buyback_dieback")
+        );
+    }
+
+    #[test]
+    fn ignores_reincarnation_death_after_buyback() {
+        let mut replay = timeline(vec![
+            buyback_event(100.0, 0),
+            hero_death_event(112.0, "npc_dota_hero_mirana", true),
+        ]);
+        add_mirana_player(&mut replay);
+
+        let result = detect_highlights(&replay, 10, 0.0);
+
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| candidate.kind != "buyback_dieback")
+        );
     }
 }

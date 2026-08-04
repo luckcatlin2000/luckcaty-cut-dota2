@@ -1,10 +1,11 @@
 use d2_highlights_core::{
     DIRECTOR_SCHEMA_VERSION, DemSource, DirectorDocument, HIGHLIGHT_SCHEMA_VERSION,
-    HighlightDocument, IngestError, JobManifest, ReplayMetadata, StageStatus,
-    TIMELINE_SCHEMA_VERSION, TimelineDocument, ingest_dem, update_stage, write_json_pretty,
+    HighlightDocument, IngestError, JobManifest, ReplayMetadata, STORY_SCHEMA_VERSION, StageStatus,
+    StoryDocument, TIMELINE_SCHEMA_VERSION, TimelineDocument, ingest_dem, update_stage,
+    write_json_pretty,
 };
 use d2_highlights_detector::{DETECTOR_NAME, DETECTOR_VERSION, detect_highlights};
-use d2_highlights_director::build_director_plan;
+use d2_highlights_director::{StoryValidationError, build_director_plan, build_story_document};
 use d2_highlights_parser_source2::{ParserAdapterError, parse_combat_timeline};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fs;
@@ -26,6 +27,7 @@ pub struct AnalysisSummary {
     pub replay: ReplayMetadata,
     pub event_count: usize,
     pub highlights: HighlightDocument,
+    pub stories: StoryDocument,
     pub director: DirectorDocument,
     pub reused_existing_job: bool,
 }
@@ -36,6 +38,8 @@ pub enum PipelineError {
     Ingest(#[from] IngestError),
     #[error("DEM parsing failed: {0}")]
     Parse(#[from] ParserAdapterError),
+    #[error("story planning failed: {0}")]
+    Story(#[from] StoryValidationError),
     #[error("unable to read pipeline artifact {path}: {source}")]
     ReadArtifact {
         path: PathBuf,
@@ -74,12 +78,14 @@ where
 
     let timeline_path = ingested.job_dir.join("timeline").join("combat-events.json");
     let highlights_path = ingested.job_dir.join("timeline").join("highlights.json");
+    let stories_path = ingested.job_dir.join("director").join("stories.json");
     let director_path = ingested.job_dir.join("director").join("plan.json");
 
     if completed_artifacts_exist(
         &ingested.manifest,
         &timeline_path,
         &highlights_path,
+        &stories_path,
         &director_path,
     ) {
         report(progress(
@@ -92,59 +98,76 @@ where
             &ingested.job_dir,
             &timeline_path,
             &highlights_path,
+            &stories_path,
             &director_path,
             true,
         );
     }
 
-    update_stage(&ingested.job_dir, "parse", StageStatus::Running, None, None)?;
-    report(progress("parse", StageStatus::Running, "正在读取比赛事件"));
-    let timeline = match parse_combat_timeline(dem_path, &ingested.manifest.source.sha256) {
-        Ok(timeline) => timeline,
-        Err(error) => {
-            let _ = update_stage(
-                &ingested.job_dir,
-                "parse",
-                StageStatus::Failed,
-                None,
-                Some(error.to_string()),
-            );
-            report(progress("parse", StageStatus::Failed, "录像解析失败"));
-            return Err(error.into());
-        }
+    let timeline = if stage_complete(&ingested.manifest, "parse")
+        && artifact_schema_matches(&timeline_path, TIMELINE_SCHEMA_VERSION)
+    {
+        report(progress("parse", StageStatus::Complete, "已复用比赛事件"));
+        read_json(&timeline_path)?
+    } else {
+        update_stage(&ingested.job_dir, "parse", StageStatus::Running, None, None)?;
+        report(progress("parse", StageStatus::Running, "正在读取比赛事件"));
+        let timeline = match parse_combat_timeline(dem_path, &ingested.manifest.source.sha256) {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                let _ = update_stage(
+                    &ingested.job_dir,
+                    "parse",
+                    StageStatus::Failed,
+                    None,
+                    Some(error.to_string()),
+                );
+                report(progress("parse", StageStatus::Failed, "录像解析失败"));
+                return Err(error.into());
+            }
+        };
+        write_json_pretty(&timeline_path, &timeline)?;
+        update_stage(
+            &ingested.job_dir,
+            "parse",
+            StageStatus::Complete,
+            Some("timeline/combat-events.json".to_string()),
+            None,
+        )?;
+        report(progress("parse", StageStatus::Complete, "比赛事件读取完成"));
+        timeline
     };
-    write_json_pretty(&timeline_path, &timeline)?;
-    update_stage(
-        &ingested.job_dir,
-        "parse",
-        StageStatus::Complete,
-        Some("timeline/combat-events.json".to_string()),
-        None,
-    )?;
-    report(progress("parse", StageStatus::Complete, "比赛事件读取完成"));
 
-    update_stage(
-        &ingested.job_dir,
-        "detect",
-        StageStatus::Running,
-        None,
-        None,
-    )?;
-    report(progress("detect", StageStatus::Running, "正在寻找高光片段"));
-    let highlights = detect_highlights(&timeline, 20, 18.0);
-    write_json_pretty(&highlights_path, &highlights)?;
-    update_stage(
-        &ingested.job_dir,
-        "detect",
-        StageStatus::Complete,
-        Some("timeline/highlights.json".to_string()),
-        None,
-    )?;
-    report(progress(
-        "detect",
-        StageStatus::Complete,
-        "高光候选已经整理好",
-    ));
+    let highlights = if stage_complete(&ingested.manifest, "detect")
+        && highlight_artifact_matches(&highlights_path)
+    {
+        report(progress("detect", StageStatus::Complete, "已复用高光候选"));
+        read_json(&highlights_path)?
+    } else {
+        update_stage(
+            &ingested.job_dir,
+            "detect",
+            StageStatus::Running,
+            None,
+            None,
+        )?;
+        report(progress("detect", StageStatus::Running, "正在寻找高光片段"));
+        let highlights = detect_highlights(&timeline, 20, 18.0);
+        write_json_pretty(&highlights_path, &highlights)?;
+        update_stage(
+            &ingested.job_dir,
+            "detect",
+            StageStatus::Complete,
+            Some("timeline/highlights.json".to_string()),
+            None,
+        )?;
+        report(progress(
+            "detect",
+            StageStatus::Complete,
+            "高光候选已经整理好",
+        ));
+        highlights
+    };
 
     update_stage(
         &ingested.job_dir,
@@ -154,7 +177,22 @@ where
         None,
     )?;
     report(progress("direct", StageStatus::Running, "正在编排剧情节奏"));
+    let stories = match build_story_document(&timeline, &highlights) {
+        Ok(stories) => stories,
+        Err(error) => {
+            let _ = update_stage(
+                &ingested.job_dir,
+                "direct",
+                StageStatus::Failed,
+                None,
+                Some(error.to_string()),
+            );
+            report(progress("direct", StageStatus::Failed, "故事证据校验失败"));
+            return Err(error.into());
+        }
+    };
     let director = build_director_plan(&highlights, "comic_hype_v1", 10, 90.0);
+    write_json_pretty(&stories_path, &stories)?;
     write_json_pretty(&director_path, &director)?;
     update_stage(
         &ingested.job_dir,
@@ -173,6 +211,7 @@ where
         replay: timeline.replay,
         event_count: timeline.events.len(),
         highlights,
+        stories,
         director,
         reused_existing_job: false,
     })
@@ -190,6 +229,7 @@ fn completed_artifacts_exist(
     manifest: &JobManifest,
     timeline_path: &Path,
     highlights_path: &Path,
+    stories_path: &Path,
     director_path: &Path,
 ) -> bool {
     ["parse", "detect", "direct"].iter().all(|stage| {
@@ -199,10 +239,19 @@ fn completed_artifacts_exist(
             .is_some_and(|record| record.status == StageStatus::Complete)
     }) && timeline_path.is_file()
         && highlights_path.is_file()
+        && stories_path.is_file()
         && director_path.is_file()
         && artifact_schema_matches(timeline_path, TIMELINE_SCHEMA_VERSION)
         && highlight_artifact_matches(highlights_path)
+        && story_artifact_matches(stories_path)
         && artifact_schema_matches(director_path, DIRECTOR_SCHEMA_VERSION)
+}
+
+fn stage_complete(manifest: &JobManifest, stage: &str) -> bool {
+    manifest
+        .stages
+        .get(stage)
+        .is_some_and(|record| record.status == StageStatus::Complete)
 }
 
 fn artifact_schema_matches(path: &Path, expected: &str) -> bool {
@@ -240,16 +289,41 @@ fn highlight_artifact_matches(path: &Path) -> bool {
         })
 }
 
+fn story_artifact_matches(path: &Path) -> bool {
+    #[derive(Deserialize)]
+    struct DetectorArtifact {
+        name: String,
+        version: String,
+    }
+
+    #[derive(Deserialize)]
+    struct StoryArtifact {
+        schema_version: String,
+        detector: DetectorArtifact,
+    }
+
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<StoryArtifact>(&bytes).ok())
+        .is_some_and(|artifact| {
+            artifact.schema_version == STORY_SCHEMA_VERSION
+                && artifact.detector.name == DETECTOR_NAME
+                && artifact.detector.version == DETECTOR_VERSION
+        })
+}
+
 fn load_summary(
     manifest: &JobManifest,
     job_dir: &Path,
     timeline_path: &Path,
     highlights_path: &Path,
+    stories_path: &Path,
     director_path: &Path,
     reused_existing_job: bool,
 ) -> Result<AnalysisSummary, PipelineError> {
     let timeline: TimelineDocument = read_json(timeline_path)?;
     let highlights = read_json(highlights_path)?;
+    let stories = read_json(stories_path)?;
     let director = read_json(director_path)?;
 
     Ok(AnalysisSummary {
@@ -259,6 +333,7 @@ fn load_summary(
         replay: timeline.replay,
         event_count: timeline.events.len(),
         highlights,
+        stories,
         director,
         reused_existing_job,
     })
@@ -286,6 +361,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let timeline = temp.path().join("timeline.json");
         let highlights = temp.path().join("highlights.json");
+        let stories = temp.path().join("stories.json");
         let director = temp.path().join("director.json");
         fs::write(
             &timeline,
@@ -296,6 +372,13 @@ mod tests {
             &highlights,
             format!(
                 r#"{{"schema_version":"{HIGHLIGHT_SCHEMA_VERSION}","detector":{{"name":"{DETECTOR_NAME}","version":"{DETECTOR_VERSION}"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &stories,
+            format!(
+                r#"{{"schema_version":"{STORY_SCHEMA_VERSION}","detector":{{"name":"{DETECTOR_NAME}","version":"{DETECTOR_VERSION}"}}}}"#
             ),
         )
         .unwrap();
@@ -333,6 +416,7 @@ mod tests {
             &manifest,
             &timeline,
             &highlights,
+            &stories,
             &director
         ));
 
@@ -341,6 +425,7 @@ mod tests {
             &manifest,
             &timeline,
             &highlights,
+            &stories,
             &director
         ));
 
@@ -360,6 +445,23 @@ mod tests {
             &manifest,
             &timeline,
             &highlights,
+            &stories,
+            &director
+        ));
+
+        fs::write(
+            &highlights,
+            format!(
+                r#"{{"schema_version":"{HIGHLIGHT_SCHEMA_VERSION}","detector":{{"name":"{DETECTOR_NAME}","version":"{DETECTOR_VERSION}"}}}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(&stories, br#"{"schema_version":"0.9"}"#).unwrap();
+        assert!(!completed_artifacts_exist(
+            &manifest,
+            &timeline,
+            &highlights,
+            &stories,
             &director
         ));
     }

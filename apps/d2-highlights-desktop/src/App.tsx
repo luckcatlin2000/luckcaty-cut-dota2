@@ -86,6 +86,7 @@ import type {
   ClipCameraMode,
   EditPlanClip,
   HighlightCandidate,
+  HighlightStory,
   LoadedEditPlan,
   RecentJob,
   ReplayLookupResult,
@@ -95,11 +96,13 @@ import type {
   RenderSettings,
   SaveEditPlanResult,
   StageStatus,
+  StoryCategory,
+  StoryTakeRole,
 } from "./types";
 
 type View = "workbench" | "library";
 type TitlebarPanel = "notifications" | "settings" | null;
-type InspectorTab = "edit" | "camera";
+type InspectorTab = "story" | "edit" | "camera";
 
 interface AppNotice {
   kind: "success" | "error";
@@ -112,6 +115,9 @@ interface ClipEditState {
   candidateId: string;
   viewHero: string;
   cameraMode: ClipCameraMode;
+  takeGroupId: string | null;
+  takeRole: StoryTakeRole;
+  includeInFinal: boolean;
   startSeconds: number;
   endSeconds: number;
 }
@@ -120,8 +126,11 @@ type ClipEdits = ClipEditState[];
 
 const isTauriRuntime = "__TAURI_INTERNALS__" in window;
 const appWindow = isTauriRuntime ? getCurrentWindow() : null;
+const developmentFixtureEnabled =
+  import.meta.env.DEV &&
+  new URLSearchParams(window.location.search).get("fixture") === "mirana";
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
-const fallbackAppVersion = "1.7.0";
+const fallbackAppVersion = "1.8.0";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,
@@ -153,6 +162,16 @@ const pipelineStages = [
   { id: "detect", label: "高光" },
   { id: "direct", label: "编排" },
 ] as const;
+
+const storyCategoryOptions: Array<{
+  id: StoryCategory | "all";
+  label: string;
+}> = [
+  { id: "all", label: "全部" },
+  { id: "comedy", label: "趣味" },
+  { id: "skill", label: "精彩" },
+  { id: "mistake", label: "失误" },
+];
 
 function App() {
   const [view, setView] = useState<View>("workbench");
@@ -199,6 +218,22 @@ function App() {
   const [replayId, setReplayId] = useState("");
   const [replayLookupBusy, setReplayLookupBusy] = useState(false);
   const [replayLookupError, setReplayLookupError] = useState("");
+
+  useEffect(() => {
+    if (!developmentFixtureEnabled) {
+      return;
+    }
+    let disposed = false;
+    void import("./devFixture").then(({ miranaDevelopmentSummary }) => {
+      if (!disposed) {
+        setSelectedPath(miranaDevelopmentSummary.source.path);
+        setResult(miranaDevelopmentSummary);
+      }
+    });
+    return () => {
+      disposed = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!isTauriRuntime) {
@@ -563,9 +598,30 @@ function App() {
 
   function updateClipEdit(clipId: string, patch: Partial<ClipEditState>) {
     setClipEdits((current) => {
-      return current.map((clip) =>
-        clip.clipId === clipId ? { ...clip, ...patch } : clip,
-      );
+      const selected = current.find((clip) => clip.clipId === clipId);
+      const synchronizesTime =
+        Boolean(selected?.takeGroupId) &&
+        ("startSeconds" in patch || "endSeconds" in patch);
+      return current.map((clip) => {
+        if (clip.clipId === clipId) {
+          return { ...clip, ...patch };
+        }
+        if (
+          synchronizesTime &&
+          clip.takeGroupId === selected?.takeGroupId
+        ) {
+          return {
+            ...clip,
+            ...(patch.startSeconds === undefined
+              ? {}
+              : { startSeconds: patch.startSeconds }),
+            ...(patch.endSeconds === undefined
+              ? {}
+              : { endSeconds: patch.endSeconds }),
+          };
+        }
+        return clip;
+      });
     });
     setPlanFeedback("");
   }
@@ -624,6 +680,37 @@ function App() {
     }
   }
 
+  function applyStoryPlan(storyId: string) {
+    if (!result) {
+      return;
+    }
+    const story = result.stories.stories.find((item) => item.id === storyId);
+    if (!story) {
+      return;
+    }
+    const next = createStoryClips(story);
+    setHighlightHero(story.primary_hero);
+    setClipEdits(next);
+    setSelectedClipId(
+      next.find((clip) => clip.includeInFinal)?.clipId ??
+        next[0]?.clipId ??
+        "",
+    );
+    setRenderResult(null);
+    setRenderError("");
+    const message = `已采用“${storyTitle(story)}”：${storySceneCount(
+      story,
+    )} 个场次、${next.length} 份独立素材，默认成片 ${formatDuration(
+      storyDefaultDuration(story),
+    )}`;
+    setPlanFeedback(message);
+    setNotice({
+      kind: "success",
+      title: "导演素材方案已采用",
+      message,
+    });
+  }
+
   function addClip() {
     if (!result) {
       return;
@@ -652,6 +739,9 @@ function App() {
       candidateId,
       viewHero: hero,
       cameraMode: "player_perspective",
+      takeGroupId: null,
+      takeRole: "primary",
+      includeInFinal: true,
       startSeconds: roundFrame(baseStart),
       endSeconds: roundFrame(Math.min(replayDuration, baseStart + 12)),
     };
@@ -708,6 +798,9 @@ function App() {
         result.replay.players[0]?.hero_name ||
         "",
       cameraMode: "player_perspective",
+      takeGroupId: null,
+      takeRole: "primary",
+      includeInFinal: true,
       startSeconds,
       endSeconds,
     };
@@ -732,7 +825,13 @@ function App() {
     if (!source) {
       return;
     }
-    const copy = { ...source, clipId: createClipId() };
+    const copy = {
+      ...source,
+      clipId: createClipId(),
+      takeGroupId: null,
+      takeRole: "primary" as const,
+      includeInFinal: true,
+    };
     const next = [...clipEdits];
     next.splice(index + 1, 0, copy);
     setClipEdits(next);
@@ -745,7 +844,17 @@ function App() {
     if (index < 0) {
       return;
     }
-    const next = clipEdits.filter((clip) => clip.clipId !== clipId);
+    const source = clipEdits[index]!;
+    const deleteWholeGroup =
+      source.takeRole === "primary" && Boolean(source.takeGroupId);
+    const next = clipEdits.filter(
+      (clip) =>
+        clip.clipId !== clipId &&
+        !(
+          deleteWholeGroup &&
+          clip.takeGroupId === source.takeGroupId
+        ),
+    );
     const fallback = next[Math.min(index, Math.max(0, next.length - 1))];
     setClipEdits(next);
     setSelectedClipId(fallback?.clipId ?? "");
@@ -781,6 +890,10 @@ function App() {
       setPlanFeedback("请至少启用一个高光片段。");
       return null;
     }
+    if (!clips.some((clip) => clip.includeInFinal)) {
+      setPlanFeedback("请至少保留一个默认入片的主机位素材。");
+      return null;
+    }
 
     setSavingPlan(true);
     setPlanFeedback("");
@@ -793,7 +906,7 @@ function App() {
           settings: renderSettings,
         },
       });
-      const message = `已保存 ${saved.selectedClipCount} 个片段，共 ${formatDuration(
+      const message = `已保存 ${saved.selectedClipCount} 份源素材，默认成片 ${formatDuration(
         saved.totalDurationSeconds,
       )}`;
       setPlanFeedback(message);
@@ -1077,6 +1190,7 @@ function App() {
             onUpdateClip={updateClipEdit}
             onSelectHighlightHero={selectHeroHighlights}
             onUpdateHighlightRules={updateHighlightRules}
+            onApplyStory={applyStoryPlan}
             onUpdateRenderSettings={updateRenderSettings}
             onAddClip={addClip}
             onActivateTimelineCandidate={activateTimelineCandidate}
@@ -1924,6 +2038,7 @@ interface ResultsViewProps {
   onUpdateClip: (clipId: string, patch: Partial<ClipEditState>) => void;
   onSelectHighlightHero: (hero: string) => void;
   onUpdateHighlightRules: (ruleIds: HighlightRuleId[]) => void;
+  onApplyStory: (storyId: string) => void;
   onUpdateRenderSettings: (patch: Partial<RenderSettings>) => void;
   onAddClip: () => void;
   onActivateTimelineCandidate: (candidateId: string) => void;
@@ -1944,6 +2059,7 @@ function ResultsView({
   onUpdateClip,
   onSelectHighlightHero,
   onUpdateHighlightRules,
+  onApplyStory,
   onUpdateRenderSettings,
   onAddClip,
   onActivateTimelineCandidate,
@@ -1951,7 +2067,11 @@ function ResultsView({
   onDeleteClip,
   onMoveClip,
 }: ResultsViewProps) {
-  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("edit");
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("story");
+  const [storyCategory, setStoryCategory] = useState<
+    StoryCategory | "all"
+  >("all");
+  const [selectedStoryId, setSelectedStoryId] = useState("");
   const [highlightQuery, setHighlightQuery] = useState("");
   const [highlightQueryFeedback, setHighlightQueryFeedback] = useState<{
     kind: "success" | "error";
@@ -1961,16 +2081,23 @@ function ResultsView({
   const rosterPlayers = replayPlayers(result);
   const totalDuration = clipEdits.reduce(
     (total, clip) =>
-      total + Math.max(0, clip.endSeconds - clip.startSeconds),
+      total +
+      (clip.includeInFinal
+        ? Math.max(0, clip.endSeconds - clip.startSeconds)
+        : 0),
     0,
   );
+  const finalClipCount = clipEdits.filter(
+    (clip) => clip.includeInFinal,
+  ).length;
+  const assetLabels = clipAssetLabels(clipEdits);
   const selectedRuleLabel = formatHighlightRuleSelection(highlightRuleIds);
   const selectedHighlightSummary = highlightHero
     ? heroHighlightSummary(
         result,
         highlightHero,
         highlightRuleIds,
-        clipEdits.length,
+        finalClipCount,
       )
     : null;
   const filteredAnchorCandidates = highlightHero
@@ -1987,11 +2114,37 @@ function ResultsView({
           (left, right) => left.peak_seconds - right.peak_seconds,
         )
       : filteredAnchorCandidates;
+  const heroStories = highlightHero
+    ? result.stories.stories.filter(
+        (story) => story.primary_hero === highlightHero,
+      )
+    : result.stories.stories;
+  const visibleStories =
+    storyCategory === "all"
+      ? heroStories
+      : heroStories.filter((story) => story.category === storyCategory);
+  const selectedStory =
+    visibleStories.find((story) => story.id === selectedStoryId) ??
+    visibleStories[0] ??
+    null;
+  const selectedStoryAssetLabels = selectedStory
+    ? storyAssetLabels(selectedStory)
+    : new Map<string, string>();
 
   useEffect(() => {
     setHighlightQuery("");
     setHighlightQueryFeedback(null);
+    setStoryCategory("all");
+    setSelectedStoryId("");
   }, [result.job_id]);
+
+  useEffect(() => {
+    setSelectedStoryId((current) =>
+      visibleStories.some((story) => story.id === current)
+        ? current
+        : (visibleStories[0]?.id ?? ""),
+    );
+  }, [highlightHero, storyCategory, result.job_id]);
 
   useEffect(() => {
     if (highlightQueryFeedback) {
@@ -2070,7 +2223,7 @@ function ResultsView({
         <div className="result-summary">
           <SummaryStat
             icon={<ListChecks />}
-            label="剪辑片段"
+            label="源素材"
             value={`${clipEdits.length}`}
             tone="pink"
           />
@@ -2130,12 +2283,12 @@ function ResultsView({
             return (
               <div
                 className={`candidate-row review included clip-row ${
-                  isSelected ? "selected" : ""
-                }`}
+                  clip.takeRole === "alternate" ? "alternate-source" : ""
+                } ${isSelected ? "selected" : ""}`}
                 key={clip.clipId}
                 role="button"
                 tabIndex={0}
-                aria-label={`片段 ${index + 1}，${
+                aria-label={`${assetLabels.get(clip.clipId) ?? `素材 ${index + 1}`}，${
                   candidate ? candidateTitle(candidate) : "自定义片段"
                 }`}
                 onClick={() => onSelectClip(clip.clipId)}
@@ -2149,18 +2302,31 @@ function ResultsView({
                 <span className="candidate-rank">{index + 1}</span>
                 <span className="candidate-main">
                   <strong>
+                    <span className="source-asset-code">
+                      {assetLabels.get(clip.clipId) ??
+                        `S${String(index + 1).padStart(3, "0")}-A`}
+                    </span>
                     {candidate
                       ? candidateTitle(candidate)
                       : `自定义片段 ${index + 1}`}
                   </strong>
                   <small>
+                    {clip.includeInFinal
+                      ? "默认入片"
+                      : "备用素材，不计入成片"}{" "}
+                    ·{" "}
                     {formatTimecode(clip.startSeconds)} -{" "}
                     {formatTimecode(clip.endSeconds)} ·{" "}
-                    {highlightHero ? "主角：" : "视角："}
+                    {clip.takeRole === "alternate"
+                      ? "特写目标："
+                      : highlightHero
+                        ? "主角："
+                        : "视角："}
                     {heroLabel(clip.viewHero)}
                   </small>
                 </span>
                 <span className="candidate-kind">
+                  {takeRoleLabel(clip.takeRole)} ·{" "}
                   {cameraModeShortLabel(clip.cameraMode)}
                 </span>
                 <span className="candidate-score">
@@ -2198,8 +2364,12 @@ function ResultsView({
                   </button>
                   <button
                     className="delete"
-                    title="删除片段"
-                    aria-label={`删除片段 ${index + 1}`}
+                    title={
+                      clip.takeRole === "primary" && clip.takeGroupId
+                        ? "删除整组素材"
+                        : "删除素材"
+                    }
+                    aria-label={`删除素材 ${index + 1}`}
                     onClick={() => onDeleteClip(clip.clipId)}
                   >
                     <Trash2 />
@@ -2241,6 +2411,12 @@ function ResultsView({
       <aside className="result-inspector">
         <div className="inspector-tabs">
           <button
+            className={inspectorTab === "story" ? "active" : ""}
+            onClick={() => setInspectorTab("story")}
+          >
+            故事
+          </button>
+          <button
             className={inspectorTab === "edit" ? "active" : ""}
             onClick={() => setInspectorTab("edit")}
           >
@@ -2253,6 +2429,230 @@ function ResultsView({
             镜头
           </button>
         </div>
+        {inspectorTab === "story" && (
+          <>
+            <div className="inspector-section story-heading">
+              <div className="section-row">
+                <span>
+                  <span className="eyebrow">可解释导演</span>
+                  <h2>
+                    {highlightHero
+                      ? `${heroLabel(highlightHero)}的故事`
+                      : "整局故事"}
+                  </h2>
+                </span>
+                <span className="story-count">
+                  {heroStories.length}
+                </span>
+              </div>
+              <div
+                className="story-category-control"
+                aria-label="故事类型"
+              >
+                {storyCategoryOptions.map((option) => {
+                  const count =
+                    option.id === "all"
+                      ? heroStories.length
+                      : heroStories.filter(
+                          (story) => story.category === option.id,
+                        ).length;
+                  return (
+                    <button
+                      className={
+                        storyCategory === option.id ? "active" : ""
+                      }
+                      key={option.id}
+                      type="button"
+                      aria-pressed={storyCategory === option.id}
+                      onClick={() => setStoryCategory(option.id)}
+                    >
+                      <span>{option.label}</span>
+                      <small>{count}</small>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {visibleStories.length > 0 ? (
+              <>
+                <div className="story-selector" role="listbox">
+                  {visibleStories.slice(0, 20).map((story) => (
+                    <button
+                      className={
+                        selectedStory?.id === story.id ? "selected" : ""
+                      }
+                      key={story.id}
+                      type="button"
+                      role="option"
+                      aria-selected={selectedStory?.id === story.id}
+                      onClick={() => setSelectedStoryId(story.id)}
+                    >
+                      <span
+                        className={`story-category-icon ${story.category}`}
+                      >
+                        {story.category === "comedy" ? (
+                          <Trees />
+                        ) : story.category === "skill" ? (
+                          <Swords />
+                        ) : story.category === "mistake" ? (
+                          <CircleAlert />
+                        ) : (
+                          <Sparkles />
+                        )}
+                      </span>
+                      <span>
+                        <strong>{storyTitle(story)}</strong>
+                        <small>
+                          {storyCategoryLabel(story.category)} ·{" "}
+                          {storySceneCount(story)} 场 ·{" "}
+                          {story.shots.length} 份素材 ·{" "}
+                          {formatDuration(storyDefaultDuration(story))}
+                        </small>
+                      </span>
+                      <ChevronRight />
+                    </button>
+                  ))}
+                </div>
+
+                {selectedStory && (
+                  <>
+                    <div className="inspector-section story-detail">
+                      <div className="story-status-line">
+                        <span
+                          className={`story-confidence ${selectedStory.confidence.level}`}
+                        >
+                          {storyConfidenceLabel(
+                            selectedStory.confidence.level,
+                          )}
+                        </span>
+                        {selectedStory.review_required && (
+                          <span className="story-review-required">
+                            需人工复核
+                          </span>
+                        )}
+                      </div>
+                      <h2>{storyTitle(selectedStory)}</h2>
+                      <p>{storyEvidenceSummary(selectedStory)}</p>
+                      <div className="story-facts">
+                        <span>
+                          <strong>{selectedStory.evidence.length}</strong>
+                          <small>证据</small>
+                        </span>
+                        <span>
+                          <strong>{storySceneCount(selectedStory)}</strong>
+                          <small>场次</small>
+                        </span>
+                        <span>
+                          <strong>{selectedStory.shots.length}</strong>
+                          <small>源素材</small>
+                        </span>
+                      </div>
+                      <button
+                        className="story-apply-button"
+                        type="button"
+                        onClick={() => onApplyStory(selectedStory.id)}
+                      >
+                        <Clapperboard />
+                        <span>采用导演素材方案</span>
+                      </button>
+                    </div>
+
+                    <div className="inspector-section story-beat-section">
+                      <div className="section-row">
+                        <span className="section-title">故事节拍</span>
+                        <span className="section-note">
+                          {selectedStory.beats.length} 段
+                        </span>
+                      </div>
+                      <div className="story-beat-list">
+                        {selectedStory.beats.map((beat, index) => (
+                          <div key={beat.id}>
+                            <span>{index + 1}</span>
+                            <span>
+                              <strong>{storyBeatLabel(beat.kind)}</strong>
+                              <small>
+                                {formatTimecode(
+                                  beat.source_start_seconds,
+                                )}{" "}
+                                -{" "}
+                                {formatTimecode(beat.source_end_seconds)} ·{" "}
+                                {beat.evidence_ids.length} 条证据
+                              </small>
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="inspector-section story-shot-section">
+                      <div className="section-row">
+                        <span className="section-title">分场素材表</span>
+                        <span className="section-note">
+                          同场次时间码一致
+                        </span>
+                      </div>
+                      <div className="story-shot-list">
+                        {selectedStory.shots.map((shot) => {
+                          const switchWindow =
+                            selectedStory.switch_windows.find(
+                              (window) =>
+                                window.alternate_shot_id === shot.id,
+                            );
+                          return (
+                            <div key={shot.id}>
+                              <span>
+                                {selectedStoryAssetLabels.get(shot.id) ??
+                                  shot.order}
+                              </span>
+                              <span>
+                                <strong>
+                                  {takeRoleLabel(shot.take_role)} ·{" "}
+                                  {storyCameraModeLabel(shot.camera_mode)}
+                                </strong>
+                                <small>
+                                  {shot.include_in_default_cut
+                                    ? "默认入片"
+                                    : "备用素材"}{" "}
+                                  ·{" "}
+                                  {heroLabel(
+                                    shot.target_hero ??
+                                      selectedStory.primary_hero,
+                                  )}{" "}
+                                  ·{" "}
+                                  {formatTimecode(
+                                    shot.source_start_seconds,
+                                  )}{" "}
+                                  -{" "}
+                                  {formatTimecode(shot.source_end_seconds)}
+                                  {switchWindow
+                                    ? ` · 建议切换 ${formatTimecode(
+                                        switchWindow.source_start_seconds,
+                                      )}-${formatTimecode(
+                                        switchWindow.source_end_seconds,
+                                      )}`
+                                    : ""}
+                                </small>
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </>
+            ) : (
+              <div className="inspector-empty story-empty">
+                <Sparkles />
+                <strong>当前筛选没有故事</strong>
+                <span>
+                  只展示具备录像证据的结果，不补猜玩家意图。
+                </span>
+              </div>
+            )}
+          </>
+        )}
         {selectedClip && inspectorTab === "edit" && (
           <>
             <div className="inspector-section">
@@ -3098,9 +3498,21 @@ function MovieSetupDialog({
   const totalDuration = clips.reduce(
     (total, clip) =>
       total +
-      Math.max(0, clip.sourceEndSeconds - clip.sourceStartSeconds),
+      (clip.includeInFinal
+        ? Math.max(
+            0,
+            clip.sourceEndSeconds - clip.sourceStartSeconds,
+          )
+        : 0),
     0,
   );
+  const finalClipCount = clips.filter(
+    (clip) => clip.includeInFinal,
+  ).length;
+  const assetLabels = clipAssetLabels(clipEdits);
+  const sceneCount = new Set(
+    clips.map((clip) => clip.takeGroupId ?? `standalone:${clip.clipId}`),
+  ).size;
   const hasInvalidClip = clips.some(
     (clip) =>
       !Number.isFinite(clip.sourceStartSeconds) ||
@@ -3185,22 +3597,22 @@ function MovieSetupDialog({
           <div>
             <ListChecks />
             <span>
-              <small>入选片段</small>
+              <small>源素材</small>
               <strong>{clips.length}</strong>
             </span>
           </div>
           <div>
             <Clock3 />
             <span>
-              <small>预计时长</small>
+              <small>默认成片</small>
               <strong>{formatDuration(totalDuration)}</strong>
             </span>
           </div>
           <div>
             <Camera />
             <span>
-              <small>镜头方案</small>
-              <strong>{new Set(clips.map((clip) => clip.cameraMode)).size} 种</strong>
+              <small>素材场次</small>
+              <strong>{sceneCount}</strong>
             </span>
           </div>
           <div>
@@ -3223,7 +3635,8 @@ function MovieSetupDialog({
                 <small>
                   {formatDuration(renderResult.durationSeconds)} ·{" "}
                   {renderResult.width}x{renderResult.height} ·{" "}
-                  {renderResult.segmentCount} 段
+                  {renderResult.segmentCount} 段成片 ·{" "}
+                  {renderResult.sourceAssetCount} 份源素材
                 </small>
               </span>
             </div>
@@ -3277,7 +3690,9 @@ function MovieSetupDialog({
               );
               return (
                 <div className="movie-plan-row" key={clip.clipId}>
-                  <span className="movie-plan-index">{index + 1}</span>
+                  <span className="movie-plan-index">
+                    {assetLabels.get(clip.clipId) ?? index + 1}
+                  </span>
                   <span className="movie-plan-copy">
                     <strong>
                       {candidate
@@ -3285,6 +3700,7 @@ function MovieSetupDialog({
                         : clip.candidateId}
                     </strong>
                     <small>
+                      {clip.includeInFinal ? "默认入片" : "备用素材"} ·{" "}
                       {formatTimecode(clip.sourceStartSeconds)} -{" "}
                       {formatTimecode(clip.sourceEndSeconds)} ·{" "}
                       {cameraModeShortLabel(clip.cameraMode)}
@@ -3340,6 +3756,17 @@ function MovieSetupDialog({
                 <FolderOpen />
                 <span>打开文件夹</span>
               </button>
+              {renderResult.sourceAssetsDir && (
+                <button
+                  className="secondary-button"
+                  onClick={() =>
+                    onOpenPath(renderResult.sourceAssetsDir)
+                  }
+                >
+                  <FolderOpen />
+                  <span>打开源素材</span>
+                </button>
+              )}
               <button
                 className="secondary-button"
                 onClick={() => onOpenPath(renderResult.outputPath)}
@@ -3352,7 +3779,7 @@ function MovieSetupDialog({
                 disabled={
                   saving ||
                   !capabilities.renderReady ||
-                  clips.length === 0 ||
+                  finalClipCount === 0 ||
                   hasInvalidClip
                 }
                 onClick={onStart}
@@ -3376,7 +3803,7 @@ function MovieSetupDialog({
                 disabled={
                   saving ||
                   !capabilities.renderReady ||
-                  clips.length === 0 ||
+                  finalClipCount === 0 ||
                   hasInvalidClip
                 }
                 onClick={onStart}
@@ -3589,6 +4016,9 @@ function createClipEdits(
         result.replay.players[0]?.hero_name ??
         "",
       cameraMode: normalizeUserCameraMode(clip.cameraMode),
+      takeGroupId: clip.takeGroupId ?? null,
+      takeRole: clip.takeRole ?? "primary",
+      includeInFinal: clip.includeInFinal ?? true,
       startSeconds: roundFrame(clip.sourceStartSeconds),
       endSeconds: roundFrame(clip.sourceEndSeconds),
     }));
@@ -3628,6 +4058,9 @@ function createClipEdits(
         result.replay.players[0]?.hero_name ??
         "",
       cameraMode: "player_perspective",
+      takeGroupId: null,
+      takeRole: "primary",
+      includeInFinal: true,
       startSeconds: roundFrame(start),
       endSeconds: roundFrame(end),
     };
@@ -3657,10 +4090,248 @@ function createHeroHighlightClips(
       candidateId: candidate.id,
       viewHero: hero,
       cameraMode: "player_perspective",
+      takeGroupId: null,
+      takeRole: "primary",
+      includeInFinal: true,
       startSeconds: roundFrame(candidate.start_seconds),
       endSeconds: roundFrame(candidate.end_seconds),
     }),
   );
+}
+
+function createStoryClips(story: HighlightStory): ClipEdits {
+  return [...story.shots]
+    .sort((left, right) => left.order - right.order)
+    .map((shot) => ({
+      clipId: `clip-${shot.id}`,
+      candidateId: shot.candidate_id,
+      viewHero: shot.target_hero ?? story.primary_hero,
+      cameraMode:
+        shot.camera_mode === "hero_chase"
+          ? "hero_chase"
+          : "player_perspective",
+      takeGroupId: shot.take_group_id,
+      takeRole: shot.take_role,
+      includeInFinal: shot.include_in_default_cut,
+      startSeconds: roundFrame(shot.source_start_seconds),
+      endSeconds: roundFrame(shot.source_end_seconds),
+    }));
+}
+
+function storyDefaultDuration(story: HighlightStory) {
+  return story.shots.reduce(
+    (total, shot) =>
+      total +
+      (shot.include_in_default_cut
+        ? Math.max(
+            0,
+            shot.source_end_seconds - shot.source_start_seconds,
+          )
+        : 0),
+    0,
+  );
+}
+
+function storySceneCount(story: HighlightStory) {
+  return new Set(story.shots.map((shot) => shot.take_group_id)).size;
+}
+
+function storyTitle(story: HighlightStory) {
+  if (
+    story.category === "comedy" &&
+    story.template_id === "hoodwink_ground_acorn_quelling_blade"
+  ) {
+    return `${heroLabel(story.primary_hero)}反复用补刀斧砍树`;
+  }
+  if (story.category === "skill") {
+    const kills = story.evidence.filter(
+      (evidence) => evidence.kind === "kill",
+    ).length;
+    return `${heroLabel(story.primary_hero)} · ${kills} 次击杀连续段`;
+  }
+  if (
+    story.category === "mistake" &&
+    story.template_id === "buyback_dieback_v1"
+  ) {
+    const setup = story.evidence.find(
+      (evidence) => evidence.action === "buyback",
+    );
+    const death = story.evidence.find(
+      (evidence) => evidence.kind === "kill",
+    );
+    const delay =
+      setup && death
+        ? Math.max(0, death.time_seconds - setup.time_seconds)
+        : null;
+    return `${heroLabel(story.primary_hero)}买活后${
+      delay === null ? "" : `${delay.toFixed(1)} 秒`
+    }再次阵亡`;
+  }
+  return `${heroLabel(story.primary_hero)} · ${storyCategoryLabel(
+    story.category,
+  )}故事`;
+}
+
+function storyCategoryLabel(category: StoryCategory) {
+  switch (category) {
+    case "comedy":
+      return "趣味互动";
+    case "skill":
+      return "精彩操作";
+    case "mistake":
+      return "失误与惩罚";
+    case "fight":
+      return "团战";
+    case "objective":
+      return "推进";
+  }
+}
+
+function storyConfidenceLabel(
+  level: HighlightStory["confidence"]["level"],
+) {
+  switch (level) {
+    case "high":
+      return "高置信";
+    case "medium":
+      return "中置信";
+    case "low":
+      return "低置信";
+  }
+}
+
+function storyBeatLabel(kind: HighlightStory["beats"][number]["kind"]) {
+  switch (kind) {
+    case "setup":
+      return "铺垫";
+    case "development":
+      return "发展";
+    case "turn":
+      return "转折";
+    case "payoff":
+      return "落点";
+    case "reaction":
+      return "反应";
+  }
+}
+
+function storyCameraModeLabel(
+  mode: HighlightStory["shots"][number]["camera_mode"],
+) {
+  switch (mode) {
+    case "player_perspective":
+      return "玩家视角";
+    case "hero_chase":
+      return "英雄近景";
+    case "directed":
+      return "导播视角";
+  }
+}
+
+function takeRoleLabel(role: StoryTakeRole) {
+  return role === "primary" ? "主机位" : "备用机位";
+}
+
+function clipAssetLabels(clips: ClipEdits) {
+  return buildAssetLabels(
+    clips.map((clip) => ({
+      id: clip.clipId,
+      groupId: clip.takeGroupId,
+      role: clip.takeRole,
+    })),
+  );
+}
+
+function storyAssetLabels(story: HighlightStory) {
+  return buildAssetLabels(
+    [...story.shots]
+      .sort((left, right) => left.order - right.order)
+      .map((shot) => ({
+        id: shot.id,
+        groupId: shot.take_group_id,
+        role: shot.take_role,
+      })),
+  );
+}
+
+function buildAssetLabels(
+  assets: Array<{
+    id: string;
+    groupId: string | null;
+    role: StoryTakeRole;
+  }>,
+) {
+  const groups = new Map<
+    string,
+    Array<{ id: string; role: StoryTakeRole }>
+  >();
+  for (const asset of assets) {
+    const groupKey = asset.groupId ?? `standalone:${asset.id}`;
+    const group = groups.get(groupKey) ?? [];
+    group.push({ id: asset.id, role: asset.role });
+    groups.set(groupKey, group);
+  }
+
+  const labels = new Map<string, string>();
+  Array.from(groups.values()).forEach((group, sceneIndex) => {
+    const ordered = [
+      ...group.filter((asset) => asset.role === "primary"),
+      ...group.filter((asset) => asset.role === "alternate"),
+    ];
+    ordered.forEach((asset, takeIndex) => {
+      labels.set(
+        asset.id,
+        `S${String(sceneIndex + 1).padStart(3, "0")}-${takeCode(
+          takeIndex,
+        )}`,
+      );
+    });
+  });
+  return labels;
+}
+
+function takeCode(index: number) {
+  let value = index + 1;
+  let code = "";
+  while (value > 0) {
+    value -= 1;
+    code = String.fromCharCode(65 + (value % 26)) + code;
+    value = Math.floor(value / 26);
+  }
+  return code;
+}
+
+function storyEvidenceSummary(story: HighlightStory) {
+  if (story.category === "comedy") {
+    const reactions = story.evidence.filter(
+      (evidence) => evidence.kind === "reaction",
+    ).length;
+    return `${story.candidate_ids.length} 次临时树创建、补刀斧指令与同树删除均已匹配${
+      reactions > 0 ? `，另有 ${reactions} 次打赏反应` : ""
+    }。`;
+  }
+  if (story.category === "skill") {
+    const kills = story.evidence.filter(
+      (evidence) => evidence.kind === "kill",
+    );
+    const actions = Array.from(
+      new Set(
+        story.evidence
+          .filter((evidence) => evidence.kind === "trigger")
+          .map((evidence) => actionLabel(evidence.action))
+          .filter(Boolean),
+      ),
+    );
+    return `${kills.length} 次英雄死亡归因明确${
+      actions.length > 0 ? `，起手包含 ${actions.join("、")}` : ""
+    }。`;
+  }
+  if (story.category === "mistake") {
+    return story.review_required
+      ? "买活与再次阵亡均已确认，但间隔较长，采用前需要人工判断剧情是否成立。"
+      : "买活后短时间内再次阵亡，因果时间紧密，可作为失误与惩罚故事。";
+  }
+  return `${story.evidence.length} 条录像证据，${story.beats.length} 个故事节拍。`;
 }
 
 function heroKillCount(result: AnalysisSummary, hero: string) {
@@ -3730,6 +4401,9 @@ function planClips(clipEdits: ClipEdits): EditPlanClip[] {
     candidateId: clip.candidateId,
     viewHero: clip.viewHero || null,
     cameraMode: clip.cameraMode,
+    takeGroupId: clip.takeGroupId,
+    takeRole: clip.takeRole,
+    includeInFinal: clip.includeInFinal,
     sourceStartSeconds: roundFrame(clip.startSeconds),
     sourceEndSeconds: roundFrame(clip.endSeconds),
   }));

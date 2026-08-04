@@ -3,8 +3,9 @@ use std::collections::BTreeMap;
 
 pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
 pub const TIMELINE_SCHEMA_VERSION: &str = "1.2";
-pub const HIGHLIGHT_SCHEMA_VERSION: &str = "1.3";
+pub const HIGHLIGHT_SCHEMA_VERSION: &str = "1.4";
 pub const DIRECTOR_SCHEMA_VERSION: &str = "1.4";
+pub const STORY_SCHEMA_VERSION: &str = "1.2";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct DemSource {
@@ -222,6 +223,185 @@ pub struct HighlightDocument {
     pub source_sha256: String,
     pub detector: DetectorIdentity,
     pub candidates: Vec<HighlightCandidate>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryCategory {
+    Comedy,
+    Skill,
+    Mistake,
+    Fight,
+    Objective,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryConfidenceLevel {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StoryConfidence {
+    pub level: StoryConfidenceLevel,
+    pub score: f32,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryParticipantRole {
+    Protagonist,
+    Opponent,
+    Target,
+    Support,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StoryParticipant {
+    pub hero: String,
+    pub role: StoryParticipantRole,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryEvidenceKind {
+    Trigger,
+    Response,
+    Verification,
+    Kill,
+    Reaction,
+    Context,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StoryEvidence {
+    pub id: String,
+    pub kind: StoryEvidenceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tick: Option<u32>,
+    pub time_seconds: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryArcBeatKind {
+    Setup,
+    Development,
+    Turn,
+    Payoff,
+    Reaction,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StoryArcBeat {
+    pub id: String,
+    pub kind: StoryArcBeatKind,
+    pub source_start_seconds: f32,
+    pub source_end_seconds: f32,
+    pub summary: String,
+    pub evidence_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryCameraMode {
+    PlayerPerspective,
+    HeroChase,
+    Directed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryFraming {
+    NormalGameplay,
+    CloseAction,
+    CombatWide,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryTakeRole {
+    Primary,
+    Alternate,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StoryShotFallback {
+    pub camera_mode: StoryCameraMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_hero: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StoryShot {
+    pub id: String,
+    pub order: usize,
+    pub take_group_id: String,
+    pub take_role: StoryTakeRole,
+    pub include_in_default_cut: bool,
+    pub beat_id: String,
+    pub candidate_id: String,
+    pub source_start_seconds: f32,
+    pub source_end_seconds: f32,
+    pub camera_mode: StoryCameraMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_hero: Option<String>,
+    pub framing: StoryFraming,
+    pub purpose: String,
+    pub fallback: StoryShotFallback,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StorySwitchWindow {
+    pub take_group_id: String,
+    pub alternate_shot_id: String,
+    pub source_start_seconds: f32,
+    pub source_end_seconds: f32,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HighlightStory {
+    pub id: String,
+    pub rank: usize,
+    pub category: StoryCategory,
+    pub template_id: String,
+    pub title: String,
+    pub primary_hero: String,
+    pub participants: Vec<StoryParticipant>,
+    pub candidate_ids: Vec<String>,
+    pub source_start_seconds: f32,
+    pub source_peak_seconds: f32,
+    pub source_end_seconds: f32,
+    pub priority_score: f32,
+    pub confidence: StoryConfidence,
+    pub review_required: bool,
+    pub evidence: Vec<StoryEvidence>,
+    pub beats: Vec<StoryArcBeat>,
+    pub shots: Vec<StoryShot>,
+    pub switch_windows: Vec<StorySwitchWindow>,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct StoryDocument {
+    pub schema_version: String,
+    pub source_sha256: String,
+    pub detector: DetectorIdentity,
+    pub stories: Vec<HighlightStory>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

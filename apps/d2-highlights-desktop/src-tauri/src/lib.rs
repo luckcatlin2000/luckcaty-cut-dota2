@@ -2,10 +2,11 @@ use d2_highlights_core::{DirectorDocument, HighlightDocument, JobManifest, Timel
 use d2_highlights_pipeline::{AnalysisProgress, AnalysisSummary, analyze_dem_with_progress};
 use d2_highlights_renderer::{
     BgmMode, CameraStyle, CancellationToken, ClipCameraMode, RENDER_SCHEMA_VERSION, RenderClip,
-    RenderProgress, RenderRequest, RenderResult, RenderSettings, render,
+    RenderProgress, RenderRequest, RenderResult, RenderSettings, RenderSourceAsset, RenderTakeRole,
+    render,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Read;
@@ -17,7 +18,12 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
-const EDIT_PLAN_SCHEMA_VERSION: &str = "d2h.edit-plan/1.3";
+const EDIT_PLAN_SCHEMA_VERSION: &str = "d2h.edit-plan/1.4";
+const LEGACY_EDIT_PLAN_SCHEMA_VERSION: &str = "d2h.edit-plan/1.3";
+
+const fn default_true() -> bool {
+    true
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -116,6 +122,12 @@ struct EditPlanClipInput {
     view_hero: Option<String>,
     #[serde(default)]
     camera_mode: ClipCameraMode,
+    #[serde(default)]
+    take_group_id: Option<String>,
+    #[serde(default)]
+    take_role: RenderTakeRole,
+    #[serde(default = "default_true")]
+    include_in_final: bool,
     source_start_seconds: f32,
     source_end_seconds: f32,
 }
@@ -140,6 +152,12 @@ struct EditPlanClip {
     view_hero: Option<String>,
     #[serde(default)]
     camera_mode: ClipCameraMode,
+    #[serde(default)]
+    take_group_id: Option<String>,
+    #[serde(default)]
+    take_role: RenderTakeRole,
+    #[serde(default = "default_true")]
+    include_in_final: bool,
     source_start_seconds: f32,
     source_end_seconds: f32,
 }
@@ -166,6 +184,9 @@ struct LoadedEditPlanClip {
     candidate_id: String,
     view_hero: Option<String>,
     camera_mode: ClipCameraMode,
+    take_group_id: Option<String>,
+    take_role: RenderTakeRole,
+    include_in_final: bool,
     source_start_seconds: f32,
     source_end_seconds: f32,
 }
@@ -177,6 +198,12 @@ struct StoredQcReport {
     duration_seconds: f32,
     width: u32,
     height: u32,
+    #[serde(default)]
+    final_segment_count: usize,
+    #[serde(default)]
+    source_assets_dir: String,
+    #[serde(default)]
+    source_assets: Vec<RenderSourceAsset>,
     #[serde(default)]
     warnings: Vec<String>,
 }
@@ -392,16 +419,22 @@ fn save_edit_plan(
             }
         }
 
-        total_duration_seconds += clip.source_end_seconds - clip.source_start_seconds;
+        if clip.include_in_final {
+            total_duration_seconds += clip.source_end_seconds - clip.source_start_seconds;
+        }
         clips.push(EditPlanClip {
             clip_id: clip.clip_id,
             candidate_id: clip.candidate_id,
             view_hero: clip.view_hero,
             camera_mode: normalize_user_camera_mode(clip.camera_mode),
+            take_group_id: clip.take_group_id,
+            take_role: clip.take_role,
+            include_in_final: clip.include_in_final,
             source_start_seconds: clip.source_start_seconds,
             source_end_seconds: clip.source_end_seconds,
         });
     }
+    validate_edit_plan_take_groups(&clips)?;
 
     let document = EditPlanDocument {
         schema_version: EDIT_PLAN_SCHEMA_VERSION.to_string(),
@@ -427,6 +460,67 @@ fn save_edit_plan(
     })
 }
 
+fn validate_edit_plan_take_groups(clips: &[EditPlanClip]) -> Result<(), String> {
+    let mut groups = HashMap::<String, Vec<&EditPlanClip>>::new();
+    for clip in clips {
+        if let Some(group_id) = clip.take_group_id.as_deref() {
+            if group_id.is_empty()
+                || group_id.len() > 160
+                || !group_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(format!(
+                    "素材 {} 的场次编号无效，请重新采用导演方案。",
+                    clip.clip_id
+                ));
+            }
+            groups.entry(group_id.to_string()).or_default().push(clip);
+        } else if clip.take_role != RenderTakeRole::Primary || !clip.include_in_final {
+            return Err(format!(
+                "独立素材 {} 必须作为默认入片的主机位。",
+                clip.clip_id
+            ));
+        }
+    }
+    if !clips.iter().any(|clip| clip.include_in_final) {
+        return Err("请至少保留一个默认入片的主机位素材。".to_string());
+    }
+    for (group_id, group) in groups {
+        let primaries = group
+            .iter()
+            .copied()
+            .filter(|clip| clip.take_role == RenderTakeRole::Primary)
+            .collect::<Vec<_>>();
+        if primaries.len() != 1 {
+            return Err(format!("素材场次 {group_id} 必须且只能有一个主机位。"));
+        }
+        let primary = primaries[0];
+        if !primary.include_in_final {
+            return Err(format!("素材场次 {group_id} 的主机位必须默认入片。"));
+        }
+        if group
+            .iter()
+            .any(|clip| clip.take_role == RenderTakeRole::Alternate && clip.include_in_final)
+        {
+            return Err(format!(
+                "素材场次 {group_id} 的备用机位不能直接增加成片时长。"
+            ));
+        }
+        for take in group {
+            if take.candidate_id != primary.candidate_id
+                || (take.source_start_seconds - primary.source_start_seconds).abs() > 0.001
+                || (take.source_end_seconds - primary.source_end_seconds).abs() > 0.001
+            {
+                return Err(format!(
+                    "素材场次 {group_id} 的所有机位必须对应同一事件和完全相同的时间段。"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn get_edit_plan(
     job_id: String,
@@ -449,7 +543,9 @@ fn get_edit_plan(
 }
 
 fn load_edit_plan(document: EditPlanDocument) -> Option<LoadedEditPlan> {
-    if document.schema_version != EDIT_PLAN_SCHEMA_VERSION {
+    if document.schema_version != EDIT_PLAN_SCHEMA_VERSION
+        && document.schema_version != LEGACY_EDIT_PLAN_SCHEMA_VERSION
+    {
         return None;
     }
     Some(LoadedEditPlan {
@@ -467,6 +563,9 @@ fn load_edit_plan(document: EditPlanDocument) -> Option<LoadedEditPlan> {
                 candidate_id: clip.candidate_id,
                 view_hero: clip.view_hero,
                 camera_mode: normalize_user_camera_mode(clip.camera_mode),
+                take_group_id: clip.take_group_id,
+                take_role: clip.take_role,
+                include_in_final: clip.include_in_final,
                 source_start_seconds: clip.source_start_seconds,
                 source_end_seconds: clip.source_end_seconds,
             })
@@ -510,9 +609,17 @@ fn get_latest_render(
     });
 
     let job_root = fs::canonicalize(&job_dir).map_err(|error| error.to_string())?;
-    let segment_count =
+    let (fallback_segment_count, fallback_source_asset_count) =
         read_json::<EditPlanDocument>(&job_dir.join("director").join("edit-plan.json"))
-            .map(|plan| plan.clips.len())
+            .map(|plan| {
+                (
+                    plan.clips
+                        .iter()
+                        .filter(|clip| clip.include_in_final)
+                        .count(),
+                    plan.clips.len(),
+                )
+            })
             .unwrap_or_default();
 
     for report_path in reports.into_iter().rev() {
@@ -540,14 +647,47 @@ fn get_latest_render(
         if !output_path.starts_with(&job_root) || !report_path.starts_with(&job_root) {
             continue;
         }
+        let source_assets_dir = PathBuf::from(&report.source_assets_dir);
+        let source_assets_dir = if source_assets_dir.is_dir() {
+            fs::canonicalize(source_assets_dir)
+                .ok()
+                .filter(|path| path.starts_with(&job_root))
+                .map(|path| path.display().to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let mut source_assets = report.source_assets;
+        source_assets.retain_mut(|asset| {
+            let Ok(path) = fs::canonicalize(&asset.output_path) else {
+                return false;
+            };
+            if !path.starts_with(&job_root) {
+                return false;
+            }
+            asset.output_path = path.display().to_string();
+            true
+        });
+        let source_asset_count = if source_assets.is_empty() {
+            fallback_source_asset_count
+        } else {
+            source_assets.len()
+        };
 
         return Ok(Some(RenderResult {
             output_path: output_path.display().to_string(),
             qc_report_path: report_path.display().to_string(),
+            source_assets_dir,
+            source_assets,
             duration_seconds: report.duration_seconds,
             width: report.width,
             height: report.height,
-            segment_count,
+            segment_count: if report.final_segment_count == 0 {
+                fallback_segment_count
+            } else {
+                report.final_segment_count
+            },
+            source_asset_count,
             warnings: report.warnings,
         }));
     }
@@ -788,6 +928,9 @@ fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest,
                 .clone()
                 .or_else(|| candidate.primary_hero.clone()),
             camera_mode: normalize_user_camera_mode(clip.camera_mode.clone()),
+            take_group_id: clip.take_group_id.clone(),
+            take_role: clip.take_role,
+            include_in_final: clip.include_in_final,
             source_start_seconds: clip.source_start_seconds,
             source_peak_seconds: style_peak,
             source_end_seconds: clip.source_end_seconds,
@@ -1049,11 +1192,14 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        EditPlanDocument, load_edit_plan, manual_render_settings, normalize_user_camera_mode,
-        replay_directory_from_dota2, resolve_replay_by_id, sanitize_update_notes, valid_clip_id,
-        valid_job_id, valid_replay_id,
+        EditPlanClip, EditPlanDocument, load_edit_plan, manual_render_settings,
+        normalize_user_camera_mode, replay_directory_from_dota2, resolve_replay_by_id,
+        sanitize_update_notes, valid_clip_id, valid_job_id, valid_replay_id,
+        validate_edit_plan_take_groups,
     };
-    use d2_highlights_renderer::{BgmMode, CameraStyle, ClipCameraMode, RenderSettings};
+    use d2_highlights_renderer::{
+        BgmMode, CameraStyle, ClipCameraMode, RenderSettings, RenderTakeRole,
+    };
     use std::fs;
     use std::io::Write;
     use std::path::Path;
@@ -1182,6 +1328,25 @@ mod tests {
     }
 
     #[test]
+    fn synchronized_edit_plan_pair_is_valid() {
+        let primary = paired_clip("clip-player", RenderTakeRole::Primary, true, 10.0, 20.0);
+        let alternate = paired_clip("clip-close", RenderTakeRole::Alternate, false, 10.0, 20.0);
+
+        validate_edit_plan_take_groups(&[primary, alternate]).expect("valid synchronized pair");
+    }
+
+    #[test]
+    fn synchronized_edit_plan_rejects_mismatched_timecodes() {
+        let primary = paired_clip("clip-player", RenderTakeRole::Primary, true, 10.0, 20.0);
+        let alternate = paired_clip("clip-close", RenderTakeRole::Alternate, false, 11.0, 20.0);
+
+        let error = validate_edit_plan_take_groups(&[primary, alternate])
+            .expect_err("mismatched timecodes must fail");
+
+        assert!(error.contains("完全相同的时间段"));
+    }
+
+    #[test]
     fn stale_edit_plan_does_not_override_new_detector_results() {
         let stale = EditPlanDocument {
             schema_version: "d2h.edit-plan/1.2".to_string(),
@@ -1194,5 +1359,29 @@ mod tests {
         };
 
         assert!(load_edit_plan(stale).is_none());
+    }
+
+    fn paired_clip(
+        clip_id: &str,
+        take_role: RenderTakeRole,
+        include_in_final: bool,
+        source_start_seconds: f32,
+        source_end_seconds: f32,
+    ) -> EditPlanClip {
+        EditPlanClip {
+            clip_id: clip_id.to_string(),
+            candidate_id: "hk-001".to_string(),
+            view_hero: Some("npc_dota_hero_mirana".to_string()),
+            camera_mode: if take_role == RenderTakeRole::Primary {
+                ClipCameraMode::PlayerPerspective
+            } else {
+                ClipCameraMode::HeroChase
+            },
+            take_group_id: Some("story-001".to_string()),
+            take_role,
+            include_in_final,
+            source_start_seconds,
+            source_end_seconds,
+        }
     }
 }

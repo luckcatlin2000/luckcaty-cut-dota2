@@ -9,13 +9,14 @@ Tauri Desktop UI
   -> Ingest（校验、哈希、版本、任务目录）
   -> Parse（成熟 Dota 2 DEM 解析器）
   -> Timeline（完整 10 人阵容、统一事件、实体、位置和状态 JSON）
-  -> Highlight Engine（只作为时间与 tick 定位锚点）
+  -> Highlight Engine（可解释事件与时间/tick 锚点）
+  -> Story Director（证据、置信度、节拍、场次、机位与切换窗）
   -> Local Highlight Rules（高光主角、击杀/砍树内容筛选）
   -> Candidate Event Timeline（事件轨道、英雄范围、片段覆盖关系）
-  -> Manual Edit Plan（片段顺序、入点、出点、英雄、镜头）
+  -> Edit Plan（场次顺序、同步机位、入点、出点、英雄、镜头）
   -> Replay Controller（启动、精确跳转、官方观战模式）
-  -> Capture（视频、游戏音频、时间码、完整性检测）
-  -> Editor（按顺序拼接、游戏原声编码）
+  -> Capture（逐机位视频、游戏音频、时间码、完整性检测）
+  -> Editor（编号源素材、默认主机位拼接、游戏原声编码）
   -> QC（黑屏、冻结、响度、时长和编码）
   -> Deliver（MP4、时间轴、manifest、日志）
 ```
@@ -32,33 +33,39 @@ Tauri Desktop UI
 
 ### 3. Highlight Engine
 
-采用可解释规则生成事件候选。候选不是自动成片决定，只提供标题、峰值秒数和真实 `anchor_tick`，用户可自由调整片段时间和顺序。`1.7.0` 的桌面端将候选投影到击杀、技巧互动、团战和地图目标四条轨道；这个投影只负责复核和选片，不修改解析结果。
+采用可解释规则生成事件候选。候选保存标题、峰值秒数、真实 `anchor_tick` 和技术互动证据；它既是手工定位锚点，也是故事导演的事实输入，不直接等于最终剪辑决定。桌面端将候选投影到击杀、技巧互动、团战和地图目标四条轨道，这个投影只负责复核和选片，不修改解析结果。
 
-### 4. Manual Edit Plan
+### 4. Story Director
 
-`d2h.edit-plan/1.3` 保存有序片段。每段包含稳定 `clipId`、`candidateId`、入点、出点、目标英雄和镜头模式。当前用户合同只允许 `player_perspective` 和 `hero_chase`；旧方案中的 `directed/free_camera` 会归一为 `player_perspective`。当候选检测合同升级时，旧 schema 的方案不会覆盖新英雄筛选结果。同一候选可复制成多段，缓存不再因重复候选冲突。
+`d2h.story/1.2` 把候选组织为带类别、参与者、证据、置信度、剧情节拍、机位目的、后备镜头和建议切换时间窗的故事。当前确定性模板覆盖英雄连续击杀、重复补刀斧砍临时树和保守的买活再死；不从孤立施法猜测玩家意图。普通场次可只有玩家视角，关键技术动作、反转或明确落点才增加同步近景。
 
-### 5. Replay Controller
+### 5. Edit Plan
+
+`d2h.edit-plan/1.4` 保存有序片段。每段包含稳定 `clipId`、`candidateId`、入点、出点、目标英雄、镜头模式、`takeGroupId`、机位角色和默认入片标记。同一场次必须有且只有一个主机位；所有机位对应同一候选和完全相同的时间段。备用机位独立渲染但不增加默认成片时长。手工复制会建立独立场次；同步场次的时间编辑会联动。当前用户合同只允许 `player_perspective` 和 `hero_chase`，旧 `directed/free_camera` 归一为玩家视角。
+
+### 6. Replay Controller
 
 只控制本地回放。所有客户端命令必须列入白名单并可恢复；不得注入在线进程。当前实现通过 Valve VConsole2 的本机 TCP 控制面发送 `CMND`，只允许 `127.0.0.1`。
 
 片段时间使用检测器保存的真实 `anchor_tick` 相对换算，不从比赛秒数猜 DEM 零点。英雄由完整阵容的 `slot 0..9` 映射到 Dota 观战玩家位。选择英雄默认生成 Player View 命令，只有用户明确选择英雄近景时才生成 Hero Chase 命令；不再用战斗坐标冒充玩家视角。
 
-### 6. Capture
+### 7. Capture
 
 离线捕获与游戏控制分离。正式路径是 Dota 2 原生 `startmovie/endmovie` 输出固定帧率帧序列和 WAV，再由 FFmpeg 按帧数/时间码裁切编码；真实回放已完成 1080p、30 FPS、同步 WAV 和 MP4 验证。原生命令会记录暂停等待和命令往返产生的额外帧，渲染服务必须保留预滚后按稳定帧边界裁切，不能把墙钟等待直接当作成片时长。当前产品不依赖 OBS 或独立桌面录制程序。
 
-### 7. Editor
+同一场次的 A/B/C 机位会分别执行一次 Dota 原生导出。渲染前后端都校验候选和时间窗同步，避免后期素材错位。
 
-`d2-highlights-renderer` 按用户片段顺序拼接原生导出，保留游戏原声并生成 1920x1080 H.264/AAC MP4。`1.2.0` 在桌面后端强制禁用 BGM、旁白、音效、自动慢动作和重点回看。FFprobe、blackdetect、freezedetect 和 volumedetect 生成 QC JSON。
+### 8. Editor
+
+`d2-highlights-renderer` 按 `d2h.render/1.9` 为每个机位复制独立 H.264/AAC MP4，按 `S001-A_玩家视角.mp4`、`S001-B_英雄近景.mp4` 命名并生成 `素材清单.json`。默认成片只按场次顺序拼接主机位，保留游戏原声；桌面后端强制禁用 BGM、旁白、音效、自动慢动作和重点回看。FFprobe、blackdetect、freezedetect 和 volumedetect 生成 QC JSON。
 
 每个片段以 DEM、时间窗、镜头和声音设置的指纹作为缓存键。失败或取消后重试可以复用已经完成的原生导出；设置变化时缓存自动失效。
 
-### 8. Local App
+### 9. Local App
 
 桌面界面采用 Tauri 2 + React/TypeScript，只调用稳定的 Rust 任务 API，不包含解析或剪辑业务逻辑。CLI 与 GUI 共用同一服务层，便于自动测试和批处理。
 
-UI 提供拖放/文件选择、完整 10 人阵容、高光主角与内容规则筛选、片段增删复制排序、毫秒时间码、30 FPS 单帧微调、逐段英雄与镜头、导出预览、应用内 MP4 播放、失败恢复和输出定位。事件时间轴支持整局/所选英雄相关范围，片段轨道显示现有剪辑覆盖；点击已有事件会定位对应片段，点击未使用事件会按时间顺序新增 Player View 片段。内容筛选使用本地版本化规则 ID，文本输入只做确定性关键词解析；未知内容整体拒绝，不进行云端推断或部分猜测。长任务由后台 worker 执行，通过有类型的命令和进度通道更新界面。
+UI 提供拖放/文件选择、完整 10 人阵容、故事类别/证据/节拍浏览、高光主角与内容规则筛选、同步素材编号、片段增删复制排序、毫秒时间码、30 FPS 单帧微调、逐段英雄与镜头、导出预览、应用内 MP4 播放、失败恢复和输出定位。事件时间轴支持整局/所选英雄相关范围，片段轨道显示现有剪辑覆盖；点击事件可定位或新增 Player View 片段。内容筛选只做本地确定性解析，未知内容整体拒绝。长任务由后台 worker 执行，通过有类型的命令和进度通道更新界面。
 
 ## 运行模式与依赖
 
@@ -80,6 +87,7 @@ jobs/<job-id>/
   capture/
   edit/
   qc/
+  output/
   logs/
   manifest.json
 ```
@@ -91,4 +99,4 @@ jobs/<job-id>/
 - Dota 2 `startmovie/endmovie`：已验证的主离线素材输出路径。
 - FFmpeg/FFprobe：帧序列编码、编辑、媒体探测、黑屏和冻结 QC。
 
-Windows UI 使用 Tauri 2 + React/TypeScript。公开源码构建不捆绑 FFmpeg/FFprobe，运行时从环境变量、`tools/ffmpeg/bin` 或 PATH 发现；发布者如需捆绑，必须为实际二进制提供对应许可证和源码材料。录像目录由用户输入或原生目录选择器提供并保存在本机，检测到的 Dota 安装目录只作为首次建议；编号查找由 Rust 后端限制为纯数字并校验 Source 2 DEM 文件头。检测器一方面把技能/交战起手、击杀归属和英雄死亡组成按英雄索引的连续击杀段，另一方面继续把对地橡栗、临时树实体生命周期、指定树指令、补刀斧动作和玩家打赏组成可验证的非击杀互动证据。旧候选和旧剪辑方案会按 schema、检测器名称和版本失效后重算。Windows 正式 EXE 必须通过 PE GUI 子系统门禁，避免伴随终端窗口。真实 DEM 全流程已在维护环境通过，公开贡献仍应在干净 Windows 环境完成冷启动验证。
+Windows UI 使用 Tauri 2 + React/TypeScript。源码仓库不提交 FFmpeg/FFprobe 二进制；官方 1.8.0 安装包使用 `tools/ffmpeg/SOURCE.txt` 记录的参考构建，并随包提供许可证与来源说明。录像目录由用户输入或原生目录选择器提供并保存在本机，编号查找由 Rust 后端限制为纯数字并校验 Source 2 DEM 文件头。检测器生成连续击杀段和可验证的非击杀互动证据，故事层只引用这些版本化事实；旧候选、故事和剪辑方案按 schema、检测器名称和版本失效后重算。真实米拉娜同步双机位已验证独立 MP4、相同时间码、不同构图、默认单机位成片、原声、QC 和自动关闭。Windows 正式 EXE 还必须通过 PE GUI 子系统和冷启动门禁。

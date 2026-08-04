@@ -117,6 +117,122 @@ export interface HighlightDocument {
   candidates: HighlightCandidate[];
 }
 
+export type StoryCategory =
+  | "comedy"
+  | "skill"
+  | "mistake"
+  | "fight"
+  | "objective";
+
+export type StoryConfidenceLevel = "high" | "medium" | "low";
+
+export type StoryArcBeatKind =
+  | "setup"
+  | "development"
+  | "turn"
+  | "payoff"
+  | "reaction";
+
+export type StoryCameraMode =
+  | "player_perspective"
+  | "hero_chase"
+  | "directed";
+
+export type StoryTakeRole = "primary" | "alternate";
+
+export interface StoryEvidence {
+  id: string;
+  kind:
+    | "trigger"
+    | "response"
+    | "verification"
+    | "kill"
+    | "reaction"
+    | "context";
+  candidate_id?: string;
+  tick?: number;
+  time_seconds: number;
+  actor?: string;
+  target?: string;
+  action?: string;
+  detail: string;
+}
+
+export interface StoryArcBeat {
+  id: string;
+  kind: StoryArcBeatKind;
+  source_start_seconds: number;
+  source_end_seconds: number;
+  summary: string;
+  evidence_ids: string[];
+}
+
+export interface StoryShot {
+  id: string;
+  order: number;
+  take_group_id: string;
+  take_role: StoryTakeRole;
+  include_in_default_cut: boolean;
+  beat_id: string;
+  candidate_id: string;
+  source_start_seconds: number;
+  source_end_seconds: number;
+  camera_mode: StoryCameraMode;
+  target_hero?: string;
+  framing: "normal_gameplay" | "close_action" | "combat_wide";
+  purpose: string;
+  fallback: {
+    camera_mode: StoryCameraMode;
+    target_hero?: string;
+    reason: string;
+  };
+}
+
+export interface HighlightStory {
+  id: string;
+  rank: number;
+  category: StoryCategory;
+  template_id: string;
+  title: string;
+  primary_hero: string;
+  participants: Array<{
+    hero: string;
+    role: "protagonist" | "opponent" | "target" | "support";
+  }>;
+  candidate_ids: string[];
+  source_start_seconds: number;
+  source_peak_seconds: number;
+  source_end_seconds: number;
+  priority_score: number;
+  confidence: {
+    level: StoryConfidenceLevel;
+    score: number;
+    reasons: string[];
+  };
+  review_required: boolean;
+  evidence: StoryEvidence[];
+  beats: StoryArcBeat[];
+  shots: StoryShot[];
+  switch_windows: Array<{
+    take_group_id: string;
+    alternate_shot_id: string;
+    source_start_seconds: number;
+    source_end_seconds: number;
+    reason: string;
+  }>;
+  reasons: string[];
+}
+
+export interface StoryDocument {
+  schema_version: string;
+  source_sha256: string;
+  detector: {
+    name: string;
+    version: string;
+  };
+  stories: HighlightStory[];
+}
+
 export interface StoryBeat {
   kind: string;
   source_start_seconds: number;
@@ -171,6 +287,7 @@ export interface AnalysisSummary {
   replay: ReplayMetadata;
   event_count: number;
   highlights: HighlightDocument;
+  stories: StoryDocument;
   director: DirectorDocument;
   reused_existing_job: boolean;
 }
@@ -180,6 +297,9 @@ export interface EditPlanClip {
   candidateId: string;
   viewHero: string | null;
   cameraMode: ClipCameraMode;
+  takeGroupId: string | null;
+  takeRole: StoryTakeRole;
+  includeInFinal: boolean;
   sourceStartSeconds: number;
   sourceEndSeconds: number;
 }
@@ -240,9 +360,27 @@ export interface RenderProgress {
 export interface RenderResult {
   outputPath: string;
   qcReportPath: string;
+  sourceAssetsDir: string;
+  sourceAssets: RenderSourceAsset[];
   durationSeconds: number;
   width: number;
   height: number;
   segmentCount: number;
+  sourceAssetCount: number;
   warnings: string[];
+}
+
+export interface RenderSourceAsset {
+  assetId: string;
+  sceneNumber: number;
+  takeIndex: number;
+  clipId: string;
+  takeGroupId: string | null;
+  takeRole: StoryTakeRole;
+  includedInFinal: boolean;
+  outputPath: string;
+  viewHero: string | null;
+  cameraMode: ClipCameraMode;
+  sourceStartSeconds: number;
+  sourceEndSeconds: number;
 }

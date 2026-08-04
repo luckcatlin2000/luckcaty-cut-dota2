@@ -5,7 +5,7 @@ use d2_highlights_core::TimelineDocument;
 use d2_highlights_replay_control::{ReplayControlError, execute_vconsole_commands, probe_vconsole};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -18,10 +18,14 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-pub const RENDER_SCHEMA_VERSION: &str = "d2h.render/1.8";
+pub const RENDER_SCHEMA_VERSION: &str = "d2h.render/1.9";
 const FRAME_RATE: u32 = 30;
 const CAPTURE_PREROLL_SECONDS: f32 = 1.0;
 const VCONSOLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+const fn default_true() -> bool {
+    true
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +43,14 @@ pub enum ClipCameraMode {
     HeroChase,
     #[default]
     PlayerPerspective,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RenderTakeRole {
+    #[default]
+    Primary,
+    Alternate,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -89,6 +101,12 @@ pub struct RenderClip {
     pub view_hero: Option<String>,
     #[serde(default)]
     pub camera_mode: ClipCameraMode,
+    #[serde(default)]
+    pub take_group_id: Option<String>,
+    #[serde(default)]
+    pub take_role: RenderTakeRole,
+    #[serde(default = "default_true")]
+    pub include_in_final: bool,
     pub source_start_seconds: f32,
     pub source_peak_seconds: f32,
     pub source_end_seconds: f32,
@@ -126,11 +144,31 @@ pub struct RenderProgress {
 pub struct RenderResult {
     pub output_path: String,
     pub qc_report_path: String,
+    pub source_assets_dir: String,
+    pub source_assets: Vec<RenderSourceAsset>,
     pub duration_seconds: f32,
     pub width: u32,
     pub height: u32,
     pub segment_count: usize,
+    pub source_asset_count: usize,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RenderSourceAsset {
+    pub asset_id: String,
+    pub scene_number: usize,
+    pub take_index: usize,
+    pub clip_id: String,
+    pub take_group_id: Option<String>,
+    pub take_role: RenderTakeRole,
+    pub included_in_final: bool,
+    pub output_path: String,
+    pub view_hero: Option<String>,
+    pub camera_mode: ClipCameraMode,
+    pub source_start_seconds: f32,
+    pub source_end_seconds: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -162,7 +200,22 @@ struct QcReport {
     freeze_events: usize,
     audio_mean_db: Option<f32>,
     audio_peak_db: Option<f32>,
+    #[serde(default)]
+    final_segment_count: usize,
+    #[serde(default)]
+    source_assets_dir: String,
+    #[serde(default)]
+    source_assets: Vec<RenderSourceAsset>,
     warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceAssetManifest<'a> {
+    schema_version: &'static str,
+    job_id: &'a str,
+    source_sha256: &'a str,
+    assets: &'a [RenderSourceAsset],
 }
 
 #[derive(Clone, Debug, Default)]
@@ -302,7 +355,7 @@ where
         &mut on_progress,
         "edit",
         "running",
-        "正在组合片段并保留游戏原声",
+        "正在整理编号素材并组合默认成片",
         82,
         request.clips.len(),
         request.clips.len(),
@@ -310,10 +363,23 @@ where
     let output_dir = request.job_dir.join("output");
     fs::create_dir_all(&output_dir)?;
     let timestamp = unix_seconds()?;
+    let source_assets_dir =
+        output_dir.join(format!("猫猫高光_{}_{}_源素材", request.job_id, timestamp));
+    let source_assets = export_source_assets(&request, &segments, &source_assets_dir)?;
+    let final_segments = select_final_segments(&request.clips, &segments)?;
+    let final_segment_paths = final_segments
+        .iter()
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
     let joined_path = cache_root.join("joined.mp4");
-    concat_segments(&request.ffmpeg_exe, &segments, &cache_root, &joined_path)?;
+    concat_segments(
+        &request.ffmpeg_exe,
+        &final_segment_paths,
+        &cache_root,
+        &joined_path,
+    )?;
     let joined_duration = probe_media(&request.ffprobe_exe, &joined_path)?.duration_seconds;
-    let impact_cues = impact_cues(&request, &segments);
+    let impact_cues = impact_cues(&request.ffprobe_exe, &final_segments);
 
     let narration_path = if request.settings.system_narration {
         let path = cache_root.join("narration.wav");
@@ -321,7 +387,7 @@ where
             &path,
             &format!(
                 "猫猫为你挑出了{}段精彩高光。现在开始。",
-                request.clips.len()
+                final_segments.len()
             ),
         ) {
             Ok(()) => Some(path),
@@ -385,6 +451,9 @@ where
     );
     let mut qc = run_qc(&request.ffmpeg_exe, &request.ffprobe_exe, &final_path)?;
     warnings.append(&mut qc.warnings);
+    qc.final_segment_count = final_segments.len();
+    qc.source_assets_dir = source_assets_dir.display().to_string();
+    qc.source_assets = source_assets.clone();
     qc.warnings = warnings.clone();
     let qc_report_path = output_dir.join(format!(
         "猫猫高光_{}_{}_质量报告.json",
@@ -407,9 +476,147 @@ where
         duration_seconds: qc.duration_seconds,
         width: qc.width,
         height: qc.height,
-        segment_count: request.clips.len(),
+        segment_count: final_segments.len(),
+        source_assets_dir: source_assets_dir.display().to_string(),
+        source_asset_count: source_assets.len(),
+        source_assets,
         warnings,
     })
+}
+
+fn select_final_segments(
+    clips: &[RenderClip],
+    segments: &[PathBuf],
+) -> Result<Vec<(RenderClip, PathBuf)>, RenderError> {
+    if clips.len() != segments.len() {
+        return Err(RenderError::Media(
+            "导出的源素材数量与剪辑方案不一致。".to_string(),
+        ));
+    }
+    let selected = clips
+        .iter()
+        .zip(segments)
+        .filter(|(clip, _)| clip.include_in_final)
+        .map(|(clip, path)| (clip.clone(), path.clone()))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return Err(RenderError::InvalidPlan(
+            "请至少保留一个默认入片的主机位素材。".to_string(),
+        ));
+    }
+    Ok(selected)
+}
+
+fn export_source_assets(
+    request: &RenderRequest,
+    segments: &[PathBuf],
+    output_dir: &Path,
+) -> Result<Vec<RenderSourceAsset>, RenderError> {
+    if request.clips.len() != segments.len() {
+        return Err(RenderError::Media(
+            "导出的源素材数量与剪辑方案不一致。".to_string(),
+        ));
+    }
+    fs::create_dir_all(output_dir)?;
+    let numbering = source_asset_numbering(&request.clips);
+    let mut assets = Vec::with_capacity(request.clips.len());
+    for ((clip, segment), (asset_id, scene_number, take_index)) in
+        request.clips.iter().zip(segments).zip(numbering)
+    {
+        let output_path = output_dir.join(format!(
+            "{}_{}.mp4",
+            asset_id,
+            camera_asset_label(&clip.camera_mode)
+        ));
+        fs::copy(segment, &output_path)?;
+        assets.push(RenderSourceAsset {
+            asset_id,
+            scene_number,
+            take_index,
+            clip_id: clip.clip_id.clone(),
+            take_group_id: clip.take_group_id.clone(),
+            take_role: clip.take_role,
+            included_in_final: clip.include_in_final,
+            output_path: output_path.display().to_string(),
+            view_hero: clip.view_hero.clone(),
+            camera_mode: clip.camera_mode.clone(),
+            source_start_seconds: clip.source_start_seconds,
+            source_end_seconds: clip.source_end_seconds,
+        });
+    }
+    let manifest = SourceAssetManifest {
+        schema_version: RENDER_SCHEMA_VERSION,
+        job_id: &request.job_id,
+        source_sha256: &request.source_sha256,
+        assets: &assets,
+    };
+    write_json(&output_dir.join("素材清单.json"), &manifest)?;
+    Ok(assets)
+}
+
+fn source_asset_numbering(clips: &[RenderClip]) -> Vec<(String, usize, usize)> {
+    let mut scene_by_group = HashMap::<String, usize>::new();
+    let mut grouped_indices = Vec::<Vec<usize>>::new();
+    for (index, clip) in clips.iter().enumerate() {
+        let key = clip
+            .take_group_id
+            .clone()
+            .unwrap_or_else(|| format!("standalone:{}", clip.clip_id));
+        let scene_index = match scene_by_group.get(&key).copied() {
+            Some(scene_index) => scene_index,
+            None => {
+                let scene_index = grouped_indices.len();
+                grouped_indices.push(Vec::new());
+                scene_by_group.insert(key, scene_index);
+                scene_index
+            }
+        };
+        grouped_indices[scene_index].push(index);
+    }
+
+    let mut numbering = vec![(String::new(), 0, 0); clips.len()];
+    for (scene_index, indices) in grouped_indices.into_iter().enumerate() {
+        let mut ordered = indices
+            .iter()
+            .copied()
+            .filter(|index| clips[*index].take_role == RenderTakeRole::Primary)
+            .collect::<Vec<_>>();
+        ordered.extend(
+            indices
+                .iter()
+                .copied()
+                .filter(|index| clips[*index].take_role == RenderTakeRole::Alternate),
+        );
+        for (take_index, clip_index) in ordered.into_iter().enumerate() {
+            let scene_number = scene_index + 1;
+            numbering[clip_index] = (
+                format!("S{scene_number:03}-{}", take_code(take_index)),
+                scene_number,
+                take_index + 1,
+            );
+        }
+    }
+    numbering
+}
+
+fn take_code(index: usize) -> String {
+    let mut value = index + 1;
+    let mut code = String::new();
+    while value > 0 {
+        value -= 1;
+        code.insert(0, (b'A' + (value % 26) as u8) as char);
+        value /= 26;
+    }
+    code
+}
+
+fn camera_asset_label(mode: &ClipCameraMode) -> &'static str {
+    match mode {
+        ClipCameraMode::PlayerPerspective => "玩家视角",
+        ClipCameraMode::HeroChase => "英雄近景",
+        ClipCameraMode::Directed => "导播视角",
+        ClipCameraMode::FreeCamera => "自由视角",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -951,6 +1158,9 @@ fn run_qc(ffmpeg: &Path, ffprobe: &Path, output: &Path) -> Result<QcReport, Rend
         freeze_events,
         audio_mean_db,
         audio_peak_db,
+        final_segment_count: 0,
+        source_assets_dir: String::new(),
+        source_assets: Vec::new(),
         warnings,
     })
 }
@@ -1037,6 +1247,7 @@ fn validate_request(request: &RenderRequest) -> Result<(), RenderError> {
         ));
     }
     let mut ids = HashSet::new();
+    let mut take_groups = HashMap::<String, Vec<&RenderClip>>::new();
     for clip in &request.clips {
         if !ids.insert(&clip.clip_id) {
             return Err(RenderError::InvalidPlan(format!(
@@ -1067,6 +1278,69 @@ fn validate_request(request: &RenderRequest) -> Result<(), RenderError> {
                 "{} 的所选英雄不在本局十人阵容中",
                 clip.clip_id
             )));
+        }
+        if let Some(group_id) = clip.take_group_id.as_deref() {
+            if group_id.is_empty()
+                || group_id.len() > 160
+                || !group_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err(RenderError::InvalidPlan(format!(
+                    "{} 的素材场次编号无效",
+                    clip.clip_id
+                )));
+            }
+            take_groups
+                .entry(group_id.to_string())
+                .or_default()
+                .push(clip);
+        } else if clip.take_role != RenderTakeRole::Primary || !clip.include_in_final {
+            return Err(RenderError::InvalidPlan(format!(
+                "{} 是独立素材，必须作为默认入片的主机位",
+                clip.clip_id
+            )));
+        }
+    }
+    if !request.clips.iter().any(|clip| clip.include_in_final) {
+        return Err(RenderError::InvalidPlan(
+            "请至少保留一个默认入片的主机位素材。".to_string(),
+        ));
+    }
+    for (group_id, group) in take_groups {
+        let primaries = group
+            .iter()
+            .copied()
+            .filter(|clip| clip.take_role == RenderTakeRole::Primary)
+            .collect::<Vec<_>>();
+        if primaries.len() != 1 {
+            return Err(RenderError::InvalidPlan(format!(
+                "素材场次 {group_id} 必须且只能有一个主机位"
+            )));
+        }
+        let primary = primaries[0];
+        if !primary.include_in_final {
+            return Err(RenderError::InvalidPlan(format!(
+                "素材场次 {group_id} 的主机位必须默认入片"
+            )));
+        }
+        if group
+            .iter()
+            .any(|clip| clip.take_role == RenderTakeRole::Alternate && clip.include_in_final)
+        {
+            return Err(RenderError::InvalidPlan(format!(
+                "素材场次 {group_id} 的备用机位不能直接增加成片时长"
+            )));
+        }
+        for take in group {
+            if take.candidate_id != primary.candidate_id
+                || (take.source_start_seconds - primary.source_start_seconds).abs() > 0.001
+                || (take.source_end_seconds - primary.source_end_seconds).abs() > 0.001
+            {
+                return Err(RenderError::InvalidPlan(format!(
+                    "素材场次 {group_id} 的所有机位必须对应同一事件和完全相同的时间段"
+                )));
+            }
         }
     }
     if request.settings.bgm_mode == BgmMode::Custom
@@ -1600,11 +1874,11 @@ fn segment_cache_is_valid(ffprobe: &Path, path: &Path) -> bool {
             .is_ok_and(|media| media.duration_seconds >= 1.0 && media.has_video && media.has_audio)
 }
 
-fn impact_cues(request: &RenderRequest, segments: &[PathBuf]) -> Vec<f32> {
+fn impact_cues(ffprobe_exe: &Path, segments: &[(RenderClip, PathBuf)]) -> Vec<f32> {
     let mut cues = Vec::new();
     let mut cursor = 0.0;
-    for (clip, segment) in request.clips.iter().zip(segments) {
-        let duration = probe_media(&request.ffprobe_exe, segment)
+    for (clip, segment) in segments {
+        let duration = probe_media(ffprobe_exe, segment)
             .map(|media| media.duration_seconds)
             .unwrap_or_else(|_| clip.source_end_seconds - clip.source_start_seconds);
         let peak_offset =
@@ -1707,9 +1981,11 @@ impl From<ReplayControlError> for RenderError {
 #[cfg(test)]
 mod tests {
     use super::{
-        BgmMode, CameraStyle, ClipCameraMode, RenderClip, RenderSettings, camera_commands_for_clip,
-        clean_hud_commands, concat_segments, frame_count_for_duration, hero_slot_for_clip,
-        mix_final_audio, parse_db_value, probe_media, run_qc, source_to_tick,
+        BgmMode, CameraStyle, ClipCameraMode, RenderClip, RenderRequest, RenderSettings,
+        RenderTakeRole, camera_commands_for_clip, clean_hud_commands, concat_segments,
+        export_source_assets, frame_count_for_duration, hero_slot_for_clip, mix_final_audio,
+        parse_db_value, probe_media, run_qc, select_final_segments, source_asset_numbering,
+        source_to_tick,
     };
     use d2_highlights_core::{ParserIdentity, ReplayMetadata, ReplayPlayer, TimelineDocument};
 
@@ -1720,6 +1996,9 @@ mod tests {
             candidate_id: "hl-003".to_string(),
             view_hero: None,
             camera_mode: ClipCameraMode::Directed,
+            take_group_id: None,
+            take_role: RenderTakeRole::Primary,
+            include_in_final: true,
             source_start_seconds: 2073.8335,
             source_peak_seconds: 2093.8335,
             source_end_seconds: 2101.8335,
@@ -1756,6 +2035,101 @@ mod tests {
         assert!(json.contains("\"cameraStyle\":\"auto_director\""));
         assert!(json.contains("\"bgmMode\":\"game_only\""));
         assert!(json.contains("\"cleanHud\":true"));
+    }
+
+    #[test]
+    fn synchronized_takes_share_a_scene_number_and_primary_is_a() {
+        let mut alternate = mirana_clip(ClipCameraMode::HeroChase);
+        alternate.clip_id = "clip-close".to_string();
+        alternate.take_group_id = Some("story-001".to_string());
+        alternate.take_role = RenderTakeRole::Alternate;
+        alternate.include_in_final = false;
+        let mut primary = mirana_clip(ClipCameraMode::PlayerPerspective);
+        primary.clip_id = "clip-player".to_string();
+        primary.take_group_id = Some("story-001".to_string());
+        let standalone = mirana_clip(ClipCameraMode::PlayerPerspective);
+
+        let numbering = source_asset_numbering(&[alternate, primary, standalone]);
+
+        assert_eq!(numbering[0], ("S001-B".to_string(), 1, 2));
+        assert_eq!(numbering[1], ("S001-A".to_string(), 1, 1));
+        assert_eq!(numbering[2], ("S002-A".to_string(), 2, 1));
+    }
+
+    #[test]
+    fn alternate_take_is_exported_but_not_joined_into_default_cut() {
+        let mut primary = mirana_clip(ClipCameraMode::PlayerPerspective);
+        primary.take_group_id = Some("story-001".to_string());
+        let mut alternate = mirana_clip(ClipCameraMode::HeroChase);
+        alternate.clip_id = "clip-close".to_string();
+        alternate.take_group_id = Some("story-001".to_string());
+        alternate.take_role = RenderTakeRole::Alternate;
+        alternate.include_in_final = false;
+        let segments = vec!["player.mp4".into(), "close.mp4".into()];
+
+        let selected = select_final_segments(&[primary, alternate], &segments).unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0.clip_id, "clip-001");
+        assert_eq!(selected[0].1, std::path::PathBuf::from("player.mp4"));
+    }
+
+    #[test]
+    fn source_assets_are_written_with_matching_scene_take_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let player_segment = temp.path().join("player.mp4");
+        let close_segment = temp.path().join("close.mp4");
+        std::fs::write(&player_segment, b"player").unwrap();
+        std::fs::write(&close_segment, b"close").unwrap();
+        let mut primary = mirana_clip(ClipCameraMode::PlayerPerspective);
+        primary.take_group_id = Some("story-001".to_string());
+        let mut alternate = mirana_clip(ClipCameraMode::HeroChase);
+        alternate.clip_id = "clip-close".to_string();
+        alternate.take_group_id = Some("story-001".to_string());
+        alternate.take_role = RenderTakeRole::Alternate;
+        alternate.include_in_final = false;
+        let request = RenderRequest {
+            job_id: "d2h-test".to_string(),
+            source_sha256: "abc".to_string(),
+            job_dir: temp.path().to_path_buf(),
+            source_replay: temp.path().join("fixture.dem"),
+            dota2_exe: temp.path().join("dota2.exe"),
+            ffmpeg_exe: temp.path().join("ffmpeg.exe"),
+            ffprobe_exe: temp.path().join("ffprobe.exe"),
+            timeline: mirana_timeline(),
+            clips: vec![primary, alternate],
+            settings: RenderSettings::default(),
+        };
+        let output_dir = temp.path().join("source-assets");
+
+        let assets =
+            export_source_assets(&request, &[player_segment, close_segment], &output_dir).unwrap();
+
+        assert_eq!(assets[0].asset_id, "S001-A");
+        assert_eq!(assets[1].asset_id, "S001-B");
+        assert!(output_dir.join("S001-A_玩家视角.mp4").is_file());
+        assert!(output_dir.join("S001-B_英雄近景.mp4").is_file());
+        assert!(output_dir.join("素材清单.json").is_file());
+    }
+
+    #[test]
+    fn legacy_render_clip_defaults_to_a_primary_final_take() {
+        let json = r#"{
+            "clipId":"clip-legacy",
+            "candidateId":"hl-001",
+            "viewHero":null,
+            "cameraMode":"player_perspective",
+            "sourceStartSeconds":10.0,
+            "sourcePeakSeconds":12.0,
+            "sourceEndSeconds":14.0,
+            "anchorSeconds":12.0,
+            "anchorTick":360
+        }"#;
+        let clip: RenderClip = serde_json::from_str(json).unwrap();
+
+        assert_eq!(clip.take_role, RenderTakeRole::Primary);
+        assert!(clip.include_in_final);
+        assert!(clip.take_group_id.is_none());
     }
 
     #[test]
@@ -1827,6 +2201,9 @@ mod tests {
             candidate_id: "hl-001".to_string(),
             view_hero: Some("npc_dota_hero_mirana".to_string()),
             camera_mode,
+            take_group_id: None,
+            take_role: RenderTakeRole::Primary,
+            include_in_final: true,
             source_start_seconds: 10.0,
             source_peak_seconds: 12.0,
             source_end_seconds: 14.0,
