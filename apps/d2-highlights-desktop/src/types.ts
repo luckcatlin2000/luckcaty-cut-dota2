@@ -31,6 +31,7 @@ export interface RecentJob {
   candidateCount: number;
   durationSeconds: number;
   createdUnixSeconds: number;
+  lastOpenedUnixSeconds: number;
 }
 
 export interface DemSource {

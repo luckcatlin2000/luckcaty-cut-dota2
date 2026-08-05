@@ -622,8 +622,12 @@ svg {
 }
 
 .sidebar-section {
+  display: flex;
+  flex: 1 1 auto;
   min-height: 0;
+  flex-direction: column;
   margin-top: 22px;
+  overflow: hidden;
 }
 
 .section-label {
@@ -635,7 +639,10 @@ svg {
 
 .sidebar-jobs {
   display: grid;
+  min-height: 0;
+  overflow-y: auto;
   gap: 2px;
+  padding-right: 2px;
 }
 
 .job-item {
@@ -1685,9 +1692,9 @@ svg {
   background: #ffffff;
 }
 
-.plan-mode-switch {
+.plan-mode-switch,
+.display-mode-switch {
   position: sticky;
-  top: 0;
   z-index: 5;
   display: flex;
   min-height: 58px;
@@ -1699,23 +1706,36 @@ svg {
   background: #ffffff;
 }
 
-.plan-mode-switch > span {
+.plan-mode-switch {
+  top: 0;
+}
+
+.display-mode-switch {
+  top: 58px;
+  min-height: 52px;
+}
+
+.plan-mode-switch > span,
+.display-mode-switch > span {
   display: grid;
   gap: 2px;
   min-width: 74px;
 }
 
-.plan-mode-switch small {
+.plan-mode-switch small,
+.display-mode-switch small {
   color: var(--subtle);
   font-size: 9px;
 }
 
-.plan-mode-switch strong {
+.plan-mode-switch strong,
+.display-mode-switch strong {
   color: var(--text);
   font-size: 12px;
 }
 
-.plan-mode-switch > div {
+.plan-mode-switch > div,
+.display-mode-switch > div {
   display: grid;
   width: 190px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1725,7 +1745,8 @@ svg {
   background: #f8f3f5;
 }
 
-.plan-mode-switch button {
+.plan-mode-switch button,
+.display-mode-switch button {
   min-height: 30px;
   border: 0;
   border-radius: 5px;
@@ -1735,7 +1756,20 @@ svg {
   font-weight: 700;
 }
 
-.plan-mode-switch button.active {
+.display-mode-switch button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+
+.display-mode-switch button svg {
+  width: 13px;
+  height: 13px;
+}
+
+.plan-mode-switch button.active,
+.display-mode-switch button.active {
   background: #ffffff;
   color: #bd5069;
   box-shadow: 0 1px 4px rgba(99, 64, 76, 0.12);
@@ -1743,7 +1777,7 @@ svg {
 
 .inspector-tabs {
   position: sticky;
-  top: 58px;
+  top: 110px;
   z-index: 4;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -2788,7 +2822,7 @@ svg {
   display: grid;
   width: min(620px, calc(100vw - 48px));
   max-height: min(650px, calc(100vh - 48px));
-  grid-template-rows: auto auto auto minmax(100px, 1fr) auto auto;
+  grid-template-rows: auto auto auto auto minmax(100px, 1fr) auto auto;
   overflow: hidden;
   border: 1px solid #ddcdd4;
   border-radius: 8px;
@@ -2868,6 +2902,53 @@ svg {
 
 .render-readiness > span {
   display: grid;
+}
+
+.movie-output-name {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto auto;
+  min-height: 46px;
+  align-items: center;
+  gap: 9px;
+  margin: 0 14px 10px;
+  padding: 7px 10px;
+  border: 1px solid #d7e8f3;
+  border-radius: 6px;
+  background: #f5fbff;
+}
+
+.movie-output-name > svg {
+  width: 16px;
+  height: 16px;
+  color: #4d98c8;
+}
+
+.movie-output-name > span:nth-child(2) {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.movie-output-name small {
+  color: var(--subtle);
+  font-size: 9px;
+}
+
+.movie-output-name strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.movie-output-name > span:nth-last-child(-n + 2) {
+  padding: 3px 6px;
+  border: 1px solid #c9e1f2;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #4d88ad;
+  font-size: 9px;
+  white-space: nowrap;
 }
 
 .render-readiness strong {

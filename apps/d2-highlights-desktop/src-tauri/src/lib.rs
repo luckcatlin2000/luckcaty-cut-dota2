@@ -94,6 +94,12 @@ struct RecentJob {
     candidate_count: usize,
     duration_seconds: f32,
     created_unix_seconds: u64,
+    last_opened_unix_seconds: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct RecentJobActivity {
+    last_opened_unix_seconds: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -360,6 +366,10 @@ fn get_recent_jobs(state: State<'_, AppState>) -> Result<Vec<RecentJob>, String>
             read_json::<HighlightDocument>(&job_dir.join("timeline").join("highlights.json")).ok();
         let director =
             read_json::<DirectorDocument>(&job_dir.join("director").join("plan.json")).ok();
+        let last_opened_unix_seconds =
+            read_json::<RecentJobActivity>(&job_dir.join("recent-activity.json"))
+                .map(|activity| activity.last_opened_unix_seconds)
+                .unwrap_or(manifest.created_unix_seconds);
         jobs.push(RecentJob {
             job_id: manifest.job_id,
             source_name: source_name(&manifest.source.path),
@@ -374,10 +384,13 @@ fn get_recent_jobs(state: State<'_, AppState>) -> Result<Vec<RecentJob>, String>
                 .map(|document| document.total_duration_seconds)
                 .unwrap_or_default(),
             created_unix_seconds: manifest.created_unix_seconds,
+            last_opened_unix_seconds,
         });
     }
 
-    jobs.sort_by_key(|job| std::cmp::Reverse(job.created_unix_seconds));
+    jobs.sort_by_key(|job| {
+        std::cmp::Reverse((job.last_opened_unix_seconds, job.created_unix_seconds))
+    });
     jobs.truncate(12);
     Ok(jobs)
 }
@@ -391,10 +404,12 @@ async fn analyze_dem(
     let dem_path = PathBuf::from(dem_path);
     let jobs_root = state.jobs_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        analyze_dem_with_progress(&dem_path, &jobs_root, |progress| {
+        let summary = analyze_dem_with_progress(&dem_path, &jobs_root, |progress| {
             let _ = on_progress.send(progress);
         })
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        let _ = mark_job_recent(&jobs_root, &summary.job_id);
+        Ok(summary)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -1230,6 +1245,26 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     serde_json::from_slice(&bytes).map_err(|error| error.to_string())
 }
 
+fn mark_job_recent(jobs_root: &Path, job_id: &str) -> Result<(), String> {
+    if !valid_job_id(job_id) {
+        return Err("任务编号无效，无法更新最近任务。".to_string());
+    }
+    let job_dir = jobs_root.join(job_id);
+    if !job_dir.is_dir() {
+        return Err("任务目录不存在，无法更新最近任务。".to_string());
+    }
+    let last_opened_unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "系统时间无效，无法更新最近任务。".to_string())?
+        .as_secs();
+    let mut bytes = serde_json::to_vec_pretty(&RecentJobActivity {
+        last_opened_unix_seconds,
+    })
+    .map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    fs::write(job_dir.join("recent-activity.json"), bytes).map_err(|error| error.to_string())
+}
+
 fn source_name(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -1407,7 +1442,7 @@ pub fn run() {
 mod tests {
     use super::{
         EDIT_PLAN_SCHEMA_VERSION, EditPlanClip, EditPlanDocument, EditPlanMode, EditPlanSlot,
-        load_edit_plan, manual_render_settings, normalize_user_camera_mode,
+        load_edit_plan, manual_render_settings, mark_job_recent, normalize_user_camera_mode,
         replay_directory_from_dota2, resolve_replay_by_id, sanitize_update_notes, valid_clip_id,
         valid_job_id, valid_replay_id, validate_edit_plan_take_groups,
     };
@@ -1421,10 +1456,25 @@ mod tests {
 
     #[test]
     fn edit_plan_job_id_stays_inside_jobs_root() {
-        assert!(valid_job_id("d2h-ff5145119d7415b3"));
-        assert!(!valid_job_id("../d2h-ff5145119d7415b3"));
+        assert!(valid_job_id("d2h-0123456789abcdef"));
+        assert!(!valid_job_id("../d2h-0123456789abcdef"));
         assert!(!valid_job_id("d2h-.."));
         assert!(!valid_job_id("other-job"));
+    }
+
+    #[test]
+    fn recent_job_activity_is_persisted_inside_the_job() {
+        let root = tempdir().expect("create recent jobs root");
+        let job_id = "d2h-0123456789abcdef";
+        fs::create_dir_all(root.path().join(job_id)).expect("create job directory");
+
+        mark_job_recent(root.path(), job_id).expect("mark job recent");
+        let activity: super::RecentJobActivity =
+            super::read_json(&root.path().join(job_id).join("recent-activity.json"))
+                .expect("read recent activity");
+
+        assert!(activity.last_opened_unix_seconds > 0);
+        assert!(mark_job_recent(root.path(), "../outside").is_err());
     }
 
     #[test]

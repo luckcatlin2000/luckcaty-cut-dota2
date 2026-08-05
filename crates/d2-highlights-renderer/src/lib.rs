@@ -418,9 +418,9 @@ where
     );
     let output_dir = request.job_dir.join("output");
     fs::create_dir_all(&output_dir)?;
-    let timestamp = unix_seconds()?;
-    let source_assets_dir =
-        output_dir.join(format!("猫猫高光_{}_{}_源素材", request.job_id, timestamp));
+    let replay_stem = replay_output_stem(&request.source_replay);
+    let output_stem = available_output_stem(&output_dir, &replay_stem);
+    let source_assets_dir = output_dir.join(format!("{output_stem}_源素材"));
     let source_assets = export_source_assets(&request, &segments, &source_assets_dir)?;
     let final_segments = select_final_segments(&request.clips, &segments)?;
     let final_segment_paths = final_segments
@@ -485,7 +485,7 @@ where
         BgmMode::GameOnly => None,
     };
 
-    let final_path = output_dir.join(format!("猫猫高光_{}_{}.mp4", request.job_id, timestamp));
+    let final_path = output_dir.join(format!("{output_stem}.mp4"));
     mix_final_audio(
         &request.ffmpeg_exe,
         &joined_path,
@@ -511,10 +511,7 @@ where
     qc.source_assets_dir = source_assets_dir.display().to_string();
     qc.source_assets = source_assets.clone();
     qc.warnings = warnings.clone();
-    let qc_report_path = output_dir.join(format!(
-        "猫猫高光_{}_{}_质量报告.json",
-        request.job_id, timestamp
-    ));
+    let qc_report_path = output_dir.join(format!("{output_stem}_质量报告.json"));
     write_json(&qc_report_path, &qc)?;
 
     emit(
@@ -538,6 +535,35 @@ where
         source_assets,
         warnings,
     })
+}
+
+fn replay_output_stem(source_replay: &Path) -> String {
+    let stem = source_replay
+        .file_stem()
+        .map(|value| value.to_string_lossy())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "录像".into());
+    stem.chars().take(160).collect()
+}
+
+fn available_output_stem(output_dir: &Path, replay_stem: &str) -> String {
+    let mut sequence = 1_u32;
+    loop {
+        let candidate = if sequence == 1 {
+            replay_stem.to_string()
+        } else {
+            format!("{replay_stem}_{sequence}")
+        };
+        let occupied = output_dir.join(format!("{candidate}.mp4")).exists()
+            || output_dir
+                .join(format!("{candidate}_质量报告.json"))
+                .exists()
+            || output_dir.join(format!("{candidate}_源素材")).exists();
+        if !occupied {
+            return candidate;
+        }
+        sequence = sequence.saturating_add(1);
+    }
 }
 
 fn select_final_segments(
@@ -2065,10 +2091,10 @@ impl From<ReplayControlError> for RenderError {
 mod tests {
     use super::{
         BgmMode, CameraStyle, ClipCameraMode, RenderClip, RenderRequest, RenderSettings,
-        RenderTakeRole, camera_commands_for_clip, clean_hud_commands, concat_segments,
-        encode_frame_sequence, export_source_assets, frame_count_for_duration, hero_slot_for_clip,
-        mix_final_audio, parse_db_value, probe_media, run_qc, select_final_segments,
-        source_asset_numbering, source_to_tick,
+        RenderTakeRole, available_output_stem, camera_commands_for_clip, clean_hud_commands,
+        concat_segments, encode_frame_sequence, export_source_assets, frame_count_for_duration,
+        hero_slot_for_clip, mix_final_audio, parse_db_value, probe_media, replay_output_stem,
+        run_qc, select_final_segments, source_asset_numbering, source_to_tick,
     };
     use d2_highlights_core::{ParserIdentity, ReplayMetadata, ReplayPlayer, TimelineDocument};
 
@@ -2129,6 +2155,21 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
             source_to_tick(clip.source_end_seconds, &clip, 30.0, 100_000),
             64_695
         );
+    }
+
+    #[test]
+    fn output_names_follow_the_replay_and_never_replace_existing_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let replay = std::path::Path::new("fixtures/1234567890.dem");
+        let stem = replay_output_stem(replay);
+        assert_eq!(stem, "1234567890");
+        assert_eq!(available_output_stem(temp.path(), &stem), "1234567890");
+
+        std::fs::write(temp.path().join("1234567890.mp4"), b"old").unwrap();
+        assert_eq!(available_output_stem(temp.path(), &stem), "1234567890_2");
+
+        std::fs::write(temp.path().join("1234567890_2_质量报告.json"), b"{}").unwrap();
+        assert_eq!(available_output_stem(temp.path(), &stem), "1234567890_3");
     }
 
     #[test]

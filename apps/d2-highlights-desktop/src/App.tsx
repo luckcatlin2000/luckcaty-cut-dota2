@@ -141,7 +141,7 @@ const developmentFixtureEnabled =
   import.meta.env.DEV &&
   new URLSearchParams(window.location.search).get("fixture") === "mirana";
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
-const fallbackAppVersion = "1.9.1";
+const fallbackAppVersion = "1.9.2";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,
@@ -1648,7 +1648,7 @@ function Sidebar({
       <div className="sidebar-section">
         <div className="section-label">最近任务</div>
         <div className="sidebar-jobs">
-          {recentJobs.slice(0, 2).map((job, index) => (
+          {recentJobs.map((job, index) => (
             <button
               className="job-item"
               key={job.jobId}
@@ -2541,6 +2541,34 @@ function ResultsView({
             </button>
           </div>
         </div>
+        <div className="display-mode-switch" aria-label="画面显示模式">
+          <span>
+            <small>画面显示</small>
+            <strong>
+              {renderSettings.cleanHud ? "干净画面" : "普通画面"}
+            </strong>
+          </span>
+          <div>
+            <button
+              className={!renderSettings.cleanHud ? "active" : ""}
+              type="button"
+              aria-pressed={!renderSettings.cleanHud}
+              onClick={() => onUpdateRenderSettings({ cleanHud: false })}
+            >
+              <Video />
+              <span>普通画面</span>
+            </button>
+            <button
+              className={renderSettings.cleanHud ? "active" : ""}
+              type="button"
+              aria-pressed={renderSettings.cleanHud}
+              onClick={() => onUpdateRenderSettings({ cleanHud: true })}
+            >
+              <ShieldCheck />
+              <span>干净画面</span>
+            </button>
+          </div>
+        </div>
         <div
           className={`inspector-tabs ${editorMode === "wtf" ? "four-tabs" : ""}`}
         >
@@ -3169,14 +3197,6 @@ function ResultsView({
                 </div>
               </div>
             )}
-            <div className="inspector-section setting-switches">
-              <SettingSwitch
-                label="干净画面"
-                note="隐藏 HUD 与鼠标指针"
-                checked={renderSettings.cleanHud}
-                onChange={(cleanHud) => onUpdateRenderSettings({ cleanHud })}
-              />
-            </div>
           </>
         )}
         {!selectedClip && inspectorTab === "edit" && (
@@ -3701,6 +3721,10 @@ function MovieSetupDialog({
     renderResult && isTauriRuntime
       ? convertFileSrc(renderResult.outputPath)
       : "";
+  const expectedOutputName = fileName(result.source.path).replace(
+    /\.dem$/i,
+    ".mp4",
+  );
 
   useEffect(() => {
     function closeOnEscape(event: KeyboardEvent) {
@@ -3795,6 +3819,16 @@ function MovieSetupDialog({
               <strong>仅游戏原声</strong>
             </span>
           </div>
+        </div>
+
+        <div className="movie-output-name">
+          <FileVideo2 />
+          <span>
+            <small>输出文件</small>
+            <strong>{expectedOutputName}</strong>
+          </span>
+          <span>{renderSettings.cleanHud ? "干净画面" : "普通画面"}</span>
+          <span>重复导出自动编号</span>
         </div>
 
         {renderResult ? (
