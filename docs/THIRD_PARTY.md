@@ -10,13 +10,13 @@
 | Tauri | MIT OR Apache-2.0 | Windows 桌面外壳与 IPC | Cargo/npm 依赖 |
 | React / React DOM | MIT | 桌面 UI | npm 依赖 |
 | Lucide React | ISC | UI 图标 | npm 依赖 |
-| FFmpeg / FFprobe | LGPL 或 GPL，取决于具体构建 | 编码、拼接、媒体探测和 QC | 源码仓库不分发二进制；官方 1.8.0 安装包包含已记录的参考构建 |
+| FFmpeg / FFprobe | LGPL 或 GPL，取决于具体构建 | 编码、拼接、媒体探测和 QC | 源码仓库不分发二进制；官方 1.8.0 及后续安装包包含已记录的参考构建 |
 
 前端构建链还包含 MPL-2.0、Apache-2.0、MIT、ISC、BSD 等许可证的软件包。发布者应从 `Cargo.lock` 和 `package-lock.json` 为每个正式版本生成完整的第三方 notices。
 
 ## FFmpeg 发布边界
 
-源码仓库不跟踪 FFmpeg/FFprobe 二进制。开发者可以使用系统提供的工具；官方 1.8.0 安装包使用 `tools/ffmpeg/SOURCE.txt` 标明的参考构建，并随安装资源提供 GPLv3 许可证和来源记录。
+源码仓库不跟踪 FFmpeg/FFprobe 二进制。开发者可以使用系统提供的工具；官方 1.8.0 及后续安装包使用 `tools/ffmpeg/SOURCE.txt` 标明的参考构建，并随安装资源提供 GPLv3 许可证和来源记录。
 
 维护者如果发布捆绑 FFmpeg 的安装包，必须针对实际二进制重新核验：
 
@@ -26,7 +26,7 @@
 - 许可证、版权声明和源码下载位置是否随发布物提供；
 - 下载页面和应用内说明是否与实际分发一致。
 
-`tools/ffmpeg/SOURCE.txt` 描述官方 1.8.0 使用的参考构建。后续版本如更换二进制，必须同步更新该记录和正式发布的逐版本合规材料。
+`tools/ffmpeg/SOURCE.txt` 描述官方 1.8.0 及后续版本使用的参考构建。后续版本如更换二进制，必须同步更新该记录和正式发布的逐版本合规材料。
 
 ## 协议实现参考
 

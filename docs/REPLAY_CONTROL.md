@@ -28,11 +28,11 @@
 | UI 模式 | Dota 命令 |
 |---|---|
 | 玩家视角 | `dota_spectator_hero_index <slot>`，`dota_spectator_mode 3`，`dota_camera_focus_player <slot>` |
-| 英雄近景 | `dota_spectator_hero_index <slot>`，`dota_spectator_mode 2`，`dota_camera_focus_player <slot>` |
+| 英雄跟随 | `dota_spectator_hero_index <slot>`，`dota_spectator_mode 2`，`dota_camera_focus_player <slot>` |
 
 `1.2.2` 不再使用 `dota_camera_set_lookatpos` 战斗坐标来宣称英雄视角，也不会在爆点和结尾强制跳到其他地图坐标。
 
-选择英雄会自动绑定该玩家位并使用玩家视角。只有用户明确选择“英雄近景”时才使用 Hero Chase。旧方案中的 Directed 和 Free Cam 在加载、保存和渲染前都会归一为玩家视角，当前 UI 不再暴露自由相机或滚轮缩放。
+选择英雄会自动绑定该玩家位并使用玩家视角。只有用户明确选择“英雄跟随”时才使用 Hero Chase。旧方案中的 Directed 和 Free Cam 在加载、保存和渲染前都会归一为玩家视角，当前 UI 不再暴露自由相机或滚轮缩放。
 
 同一故事场次可以包含玩家视角和一个或多个备用近景。它们必须使用同一 `candidateId`、完全一致的源入点/出点和统一 `takeGroupId`，分别执行原生导出并按 `S001-A/B/C` 保存。是否增加近景及其目标由故事证据决定，不使用固定双机位模板。
 

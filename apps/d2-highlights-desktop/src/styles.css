@@ -1685,7 +1685,66 @@ svg {
   background: #ffffff;
 }
 
+.plan-mode-switch {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  min-height: 58px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  background: #ffffff;
+}
+
+.plan-mode-switch > span {
+  display: grid;
+  gap: 2px;
+  min-width: 74px;
+}
+
+.plan-mode-switch small {
+  color: var(--subtle);
+  font-size: 9px;
+}
+
+.plan-mode-switch strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.plan-mode-switch > div {
+  display: grid;
+  width: 190px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 3px;
+  border: 1px solid #eadce2;
+  border-radius: 7px;
+  background: #f8f3f5;
+}
+
+.plan-mode-switch button {
+  min-height: 30px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.plan-mode-switch button.active {
+  background: #ffffff;
+  color: #bd5069;
+  box-shadow: 0 1px 4px rgba(99, 64, 76, 0.12);
+}
+
 .inspector-tabs {
+  position: sticky;
+  top: 58px;
+  z-index: 4;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   height: 46px;
@@ -1982,6 +2041,12 @@ svg {
 
 .story-apply-button:hover {
   background: #e96887;
+}
+
+.story-apply-button.adopted {
+  border-color: #a8d8c2;
+  background: #e9f8f0;
+  color: #39805f;
 }
 
 .story-apply-button svg {
@@ -3476,7 +3541,11 @@ svg {
 }
 
 .inspector-tabs {
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.inspector-tabs.four-tabs {
+  grid-template-columns: repeat(4, 1fr);
 }
 
 .timecode-grid {

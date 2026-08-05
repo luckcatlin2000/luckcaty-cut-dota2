@@ -84,6 +84,8 @@ import type {
   AnalysisSummary,
   Capabilities,
   ClipCameraMode,
+  EditPlanSlot,
+  EditorPlanMode,
   EditPlanClip,
   HighlightCandidate,
   HighlightStory,
@@ -102,7 +104,7 @@ import type {
 
 type View = "workbench" | "library";
 type TitlebarPanel = "notifications" | "settings" | null;
-type InspectorTab = "story" | "edit" | "camera";
+type InspectorTab = "story" | "hero" | "edit" | "camera";
 
 interface AppNotice {
   kind: "success" | "error";
@@ -124,13 +126,22 @@ interface ClipEditState {
 
 type ClipEdits = ClipEditState[];
 
+interface EditorPlanSnapshot {
+  clipEdits: ClipEdits;
+  selectedClipId: string;
+  highlightHero: string;
+  highlightRuleIds: HighlightRuleId[];
+  sourceStoryId: string | null;
+  renderSettings: RenderSettings;
+}
+
 const isTauriRuntime = "__TAURI_INTERNALS__" in window;
 const appWindow = isTauriRuntime ? getCurrentWindow() : null;
 const developmentFixtureEnabled =
   import.meta.env.DEV &&
   new URLSearchParams(window.location.search).get("fixture") === "mirana";
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
-const fallbackAppVersion = "1.8.1";
+const fallbackAppVersion = "1.9.0";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,
@@ -202,6 +213,11 @@ function App() {
   const [renderSettings, setRenderSettings] = useState<RenderSettings>(
     defaultRenderSettings,
   );
+  const [editorMode, setEditorMode] = useState<EditorPlanMode>("default");
+  const [sourceStoryId, setSourceStoryId] = useState<string | null>(null);
+  const [planSlots, setPlanSlots] = useState<
+    Record<EditorPlanMode, EditorPlanSnapshot>
+  >(() => createEmptyPlanWorkspace());
   const [rendering, setRendering] = useState(false);
   const [renderProgress, setRenderProgress] = useState<RenderProgress | null>(
     null,
@@ -353,6 +369,9 @@ function App() {
       setClipEdits([]);
       setHighlightHero("");
       setHighlightRuleIds([...DEFAULT_HIGHLIGHT_RULE_IDS]);
+      setEditorMode("default");
+      setSourceStoryId(null);
+      setPlanSlots(createEmptyPlanWorkspace());
       setMovieSetupOpen(false);
       setPlanFeedback("");
       setRenderSettings(defaultRenderSettings);
@@ -368,10 +387,20 @@ function App() {
       result.highlights.candidates,
       initialClips,
     );
-    setClipEdits(initialClips);
-    setHighlightHero(initialSelection.hero);
-    setHighlightRuleIds(initialSelection.ruleIds);
-    setRenderSettings(defaultRenderSettings);
+    const initialWorkspace: Record<EditorPlanMode, EditorPlanSnapshot> = {
+      default: {
+        clipEdits: initialClips,
+        selectedClipId: initialClips[0]?.clipId ?? "",
+        highlightHero: initialSelection.hero,
+        highlightRuleIds: initialSelection.ruleIds,
+        sourceStoryId: null,
+        renderSettings: defaultRenderSettings,
+      },
+      wtf: createEmptyPlanSnapshot(),
+    };
+    setPlanSlots(initialWorkspace);
+    setEditorMode("default");
+    applyPlanSnapshot(initialWorkspace.default);
     setPlanFeedback("");
     setRenderProgress(null);
     setRenderResult(null);
@@ -382,15 +411,15 @@ function App() {
       })
         .then((saved) => {
           if (!disposed && saved) {
-            const savedClips = createClipEdits(result, saved);
-            const savedSelection = inferHighlightSelection(
-              result.highlights.candidates,
-              savedClips,
+            const savedWorkspace = createSavedPlanWorkspace(
+              result,
+              saved,
+              initialWorkspace.default,
             );
-            setClipEdits(savedClips);
-            setHighlightHero(savedSelection.hero);
-            setHighlightRuleIds(savedSelection.ruleIds);
-            setRenderSettings(sanitizeRenderSettings(saved.settings));
+            const activeMode = saved.activeMode;
+            setPlanSlots(savedWorkspace);
+            setEditorMode(activeMode);
+            applyPlanSnapshot(savedWorkspace[activeMode]);
           }
         })
         .catch(() => {
@@ -413,6 +442,42 @@ function App() {
       disposed = true;
     };
   }, [result]);
+
+  function applyPlanSnapshot(snapshot: EditorPlanSnapshot) {
+    setClipEdits(snapshot.clipEdits);
+    setSelectedClipId(snapshot.selectedClipId);
+    setHighlightHero(snapshot.highlightHero);
+    setHighlightRuleIds(snapshot.highlightRuleIds);
+    setSourceStoryId(snapshot.sourceStoryId);
+    setRenderSettings(snapshot.renderSettings);
+  }
+
+  function currentPlanSnapshot(): EditorPlanSnapshot {
+    return {
+      clipEdits,
+      selectedClipId,
+      highlightHero,
+      highlightRuleIds,
+      sourceStoryId,
+      renderSettings,
+    };
+  }
+
+  function switchEditorMode(nextMode: EditorPlanMode) {
+    if (nextMode === editorMode) {
+      return;
+    }
+    const nextWorkspace = {
+      ...planSlots,
+      [editorMode]: currentPlanSnapshot(),
+    };
+    setPlanSlots(nextWorkspace);
+    setEditorMode(nextMode);
+    applyPlanSnapshot(nextWorkspace[nextMode]);
+    setPlanFeedback("");
+    setRenderResult(null);
+    setRenderError("");
+  }
 
   const selectedClip = useMemo(
     () => clipEdits.find((clip) => clip.clipId === selectedClipId) ?? null,
@@ -666,10 +731,20 @@ function App() {
   }
 
   function selectHeroHighlights(hero: string) {
+    if (editorMode === "wtf") {
+      setHighlightHero(hero);
+      setPlanFeedback(
+        `正在查看 ${heroLabel(hero)} 的可用故事，现有 WTF 素材不会被覆盖。`,
+      );
+      return;
+    }
     applyHeroHighlightSelection(hero, highlightRuleIds, true);
   }
 
   function updateHighlightRules(ruleIds: HighlightRuleId[]) {
+    if (editorMode === "wtf") {
+      return;
+    }
     const normalizedRules = normalizeHighlightRuleIds(ruleIds);
     if (normalizedRules.length === 0) {
       return;
@@ -681,7 +756,7 @@ function App() {
   }
 
   function applyStoryPlan(storyId: string) {
-    if (!result) {
+    if (!result || editorMode !== "wtf") {
       return;
     }
     const story = result.stories.stories.find((item) => item.id === storyId);
@@ -690,6 +765,7 @@ function App() {
     }
     const next = createStoryClips(story);
     setHighlightHero(story.primary_hero);
+    setSourceStoryId(story.id);
     setClipEdits(next);
     setSelectedClipId(
       next.find((clip) => clip.includeInFinal)?.clipId ??
@@ -898,17 +974,21 @@ function App() {
     setSavingPlan(true);
     setPlanFeedback("");
     try {
+      const workspace = {
+        ...planSlots,
+        [editorMode]: currentPlanSnapshot(),
+      };
+      setPlanSlots(workspace);
       const saved = await invoke<SaveEditPlanResult>("save_edit_plan", {
         request: {
           jobId: result.job_id,
-          mode: "manual",
-          clips,
-          settings: renderSettings,
+          activeMode: editorMode,
+          plans: (["default", "wtf"] as const).map((mode) =>
+            toEditPlanSlot(mode, workspace[mode]),
+          ),
         },
       });
-      const message = `已保存 ${saved.selectedClipCount} 份源素材，默认成片 ${formatDuration(
-        saved.totalDurationSeconds,
-      )}`;
+      const message = `已保存${editorModeLabel(editorMode)}：${saved.selectedClipCount} 份源素材，成片 ${formatDuration(saved.totalDurationSeconds)}`;
       setPlanFeedback(message);
       if (showNotice) {
         setNotice({
@@ -1185,7 +1265,10 @@ function App() {
             selectedCandidate={selectedCandidate}
             highlightHero={highlightHero}
             highlightRuleIds={highlightRuleIds}
+            editorMode={editorMode}
+            sourceStoryId={sourceStoryId}
             renderSettings={renderSettings}
+            onChangeEditorMode={switchEditorMode}
             onSelectClip={setSelectedClipId}
             onUpdateClip={updateClipEdit}
             onSelectHighlightHero={selectHeroHighlights}
@@ -1250,6 +1333,7 @@ function App() {
         <MovieSetupDialog
           result={result}
           clipEdits={clipEdits}
+          editorMode={editorMode}
           capabilities={capabilities}
           renderSettings={renderSettings}
           saving={savingPlan}
@@ -2033,7 +2117,10 @@ interface ResultsViewProps {
   selectedCandidate: HighlightCandidate | null;
   highlightHero: string;
   highlightRuleIds: HighlightRuleId[];
+  editorMode: EditorPlanMode;
+  sourceStoryId: string | null;
   renderSettings: RenderSettings;
+  onChangeEditorMode: (mode: EditorPlanMode) => void;
   onSelectClip: (id: string) => void;
   onUpdateClip: (clipId: string, patch: Partial<ClipEditState>) => void;
   onSelectHighlightHero: (hero: string) => void;
@@ -2054,7 +2141,10 @@ function ResultsView({
   selectedCandidate,
   highlightHero,
   highlightRuleIds,
+  editorMode,
+  sourceStoryId,
   renderSettings,
+  onChangeEditorMode,
   onSelectClip,
   onUpdateClip,
   onSelectHighlightHero,
@@ -2067,7 +2157,7 @@ function ResultsView({
   onDeleteClip,
   onMoveClip,
 }: ResultsViewProps) {
-  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("story");
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("hero");
   const [storyCategory, setStoryCategory] = useState<
     StoryCategory | "all"
   >("all");
@@ -2137,6 +2227,10 @@ function ResultsView({
     setStoryCategory("all");
     setSelectedStoryId("");
   }, [result.job_id]);
+
+  useEffect(() => {
+    setInspectorTab(editorMode === "wtf" ? "story" : "hero");
+  }, [editorMode]);
 
   useEffect(() => {
     setSelectedStoryId((current) =>
@@ -2223,7 +2317,7 @@ function ResultsView({
         <div className="result-summary">
           <SummaryStat
             icon={<ListChecks />}
-            label="源素材"
+            label={editorMode === "wtf" ? "WTF 素材" : "默认素材"}
             value={`${clipEdits.length}`}
             tone="pink"
           />
@@ -2261,7 +2355,11 @@ function ResultsView({
         <div className="candidate-table-header">
           <div>
             <span className="eyebrow">
-              {highlightHero
+              {editorMode === "wtf"
+                ? sourceStoryId
+                  ? "WTF 导演方案 · 按场次排列"
+                  : "WTF 导演方案 · 尚未采用故事"
+                : highlightHero
                 ? `${heroLabel(highlightHero)} · ${selectedRuleLabel} · 按时间排列`
                 : "按导出顺序排列"}
             </span>
@@ -2318,7 +2416,7 @@ function ResultsView({
                     {formatTimecode(clip.startSeconds)} -{" "}
                     {formatTimecode(clip.endSeconds)} ·{" "}
                     {clip.takeRole === "alternate"
-                      ? "特写目标："
+                      ? "跟随目标："
                       : highlightHero
                         ? "主角："
                         : "视角："}
@@ -2384,20 +2482,30 @@ function ResultsView({
                 highlightHero ? "filtered" : ""
               }`}
             >
-              {highlightHero ? <SearchX /> : <Clapperboard />}
+              {editorMode === "wtf" ? (
+                <Sparkles />
+              ) : highlightHero ? (
+                <SearchX />
+              ) : (
+                <Clapperboard />
+              )}
               <strong>
-                {highlightHero
+                {editorMode === "wtf"
+                  ? "还没有采用 WTF 故事"
+                  : highlightHero
                   ? "本局没有符合筛选的片段"
                   : "还没有剪辑片段"}
               </strong>
               <span>
-                {highlightHero
+                {editorMode === "wtf"
+                  ? "在右侧故事页选择一个方案；默认剪辑仍会完整保留。"
+                  : highlightHero
                   ? `${heroLabel(
                       highlightHero,
                     )}没有检测到“${selectedRuleLabel}”高光。`
                   : "新增一段后即可设置时间和镜头。"}
               </span>
-              {!highlightHero && (
+              {editorMode === "default" && !highlightHero && (
                 <button className="primary-button" onClick={onAddClip}>
                   <Plus />
                   <span>新增片段</span>
@@ -2409,12 +2517,46 @@ function ResultsView({
       </section>
 
       <aside className="result-inspector">
-        <div className="inspector-tabs">
+        <div className="plan-mode-switch" aria-label="剪辑方案">
+          <span>
+            <small>当前方案</small>
+            <strong>{editorModeLabel(editorMode)}</strong>
+          </span>
+          <div>
+            <button
+              className={editorMode === "default" ? "active" : ""}
+              type="button"
+              aria-pressed={editorMode === "default"}
+              onClick={() => onChangeEditorMode("default")}
+            >
+              默认剪辑
+            </button>
+            <button
+              className={editorMode === "wtf" ? "active" : ""}
+              type="button"
+              aria-pressed={editorMode === "wtf"}
+              onClick={() => onChangeEditorMode("wtf")}
+            >
+              WTF 导演
+            </button>
+          </div>
+        </div>
+        <div
+          className={`inspector-tabs ${editorMode === "wtf" ? "four-tabs" : ""}`}
+        >
+          {editorMode === "wtf" && (
+            <button
+              className={inspectorTab === "story" ? "active" : ""}
+              onClick={() => setInspectorTab("story")}
+            >
+              故事
+            </button>
+          )}
           <button
-            className={inspectorTab === "story" ? "active" : ""}
-            onClick={() => setInspectorTab("story")}
+            className={inspectorTab === "hero" ? "active" : ""}
+            onClick={() => setInspectorTab("hero")}
           >
-            故事
+            主角
           </button>
           <button
             className={inspectorTab === "edit" ? "active" : ""}
@@ -2426,10 +2568,10 @@ function ResultsView({
             className={inspectorTab === "camera" ? "active" : ""}
             onClick={() => setInspectorTab("camera")}
           >
-            镜头
+            机位
           </button>
         </div>
-        {inspectorTab === "story" && (
+        {editorMode === "wtf" && inspectorTab === "story" && (
           <>
             <div className="inspector-section story-heading">
               <div className="section-row">
@@ -2549,12 +2691,22 @@ function ResultsView({
                         </span>
                       </div>
                       <button
-                        className="story-apply-button"
+                        className={`story-apply-button ${
+                          sourceStoryId === selectedStory.id ? "adopted" : ""
+                        }`}
                         type="button"
                         onClick={() => onApplyStory(selectedStory.id)}
                       >
-                        <Clapperboard />
-                        <span>采用导演素材方案</span>
+                        {sourceStoryId === selectedStory.id ? (
+                          <CheckCircle2 />
+                        ) : (
+                          <Clapperboard />
+                        )}
+                        <span>
+                          {sourceStoryId === selectedStory.id
+                            ? "当前 WTF 方案"
+                            : "使用此 WTF 方案"}
+                        </span>
                       </button>
                     </div>
 
@@ -2823,13 +2975,17 @@ function ResultsView({
             </div>
           </>
         )}
-        {inspectorTab === "camera" && (
+        {inspectorTab === "hero" && (
           <>
             <div className="inspector-section settings-heading">
-              <span className="eyebrow">英雄高光筛选</span>
-              <h2>选择高光主角</h2>
+              <span className="eyebrow">
+                {editorMode === "wtf" ? "故事主角筛选" : "英雄高光筛选"}
+              </span>
+              <h2>选择主角</h2>
               <p>
-                选择后，片段清单会重建为该英雄的击杀连续段与已验证技术互动。
+                {editorMode === "wtf"
+                  ? "选择后只筛选该英雄的故事，不会覆盖已经采用的 WTF 素材。"
+                  : "选择后，片段清单会重建为该英雄的击杀连续段与已验证技术互动。"}
               </p>
             </div>
             <div className="inspector-section">
@@ -2837,7 +2993,9 @@ function ResultsView({
                 <span className="section-title">整局英雄阵容</span>
                 <span className="section-note">
                   {highlightHero
-                    ? `${heroLabel(highlightHero)} · ${selectedRuleLabel}`
+                    ? editorMode === "wtf"
+                      ? heroLabel(highlightHero)
+                      : `${heroLabel(highlightHero)} · ${selectedRuleLabel}`
                     : `已识别 ${rosterPlayers.length}/10`}
                 </span>
               </div>
@@ -2863,7 +3021,8 @@ function ResultsView({
                 ))}
               </div>
             </div>
-            <div className="inspector-section highlight-filter-section">
+            {editorMode === "default" && (
+              <div className="inspector-section highlight-filter-section">
               <div className="section-row">
                 <span className="section-title">高光内容</span>
                 <button
@@ -2956,11 +3115,16 @@ function ResultsView({
                   <span>{highlightQueryFeedback.message}</span>
                 </div>
               )}
-            </div>
+              </div>
+            )}
+          </>
+        )}
+        {inspectorTab === "camera" && (
+          <>
             {selectedClip && (
               <div className="inspector-section">
                 <div className="section-row">
-                  <span className="section-title">当前片段镜头</span>
+                  <span className="section-title">当前片段机位</span>
                   <Camera />
                 </div>
                 <div className="choice-list camera-choice-list">
@@ -2997,8 +3161,8 @@ function ResultsView({
                   >
                     <UserRound />
                     <span>
-                      <strong>英雄近景</strong>
-                      <small>Hero Chase · 偶尔用于突出英雄动作</small>
+                      <strong>英雄跟随</strong>
+                      <small>Hero Chase · 跟随当前英雄，适合作为备用机位</small>
                     </span>
                     <Check />
                   </button>
@@ -3019,7 +3183,14 @@ function ResultsView({
           <div className="inspector-empty">
             <Clapperboard />
             <strong>选择或新增一个片段</strong>
-            <span>时间与镜头设置会显示在这里。</span>
+            <span>片段的精确入点与出点会显示在这里。</span>
+          </div>
+        )}
+        {!selectedClip && inspectorTab === "camera" && (
+          <div className="inspector-empty">
+            <Camera />
+            <strong>先选择一个片段</strong>
+            <span>每个片段都可以独立选择玩家视角或英雄跟随机位。</span>
           </div>
         )}
       </aside>
@@ -3466,6 +3637,7 @@ function SettingSwitch({
 function MovieSetupDialog({
   result,
   clipEdits,
+  editorMode,
   capabilities,
   renderSettings,
   saving,
@@ -3481,6 +3653,7 @@ function MovieSetupDialog({
 }: {
   result: AnalysisSummary;
   clipEdits: ClipEdits;
+  editorMode: EditorPlanMode;
   capabilities: Capabilities;
   renderSettings: RenderSettings;
   saving: boolean;
@@ -3559,7 +3732,7 @@ function MovieSetupDialog({
             <Film />
           </span>
           <span>
-            <small>精确剪辑方案</small>
+            <small>{editorModeLabel(editorMode)}</small>
             <h2 id="movie-dialog-title">导出视频</h2>
           </span>
           <button
@@ -3604,7 +3777,7 @@ function MovieSetupDialog({
           <div>
             <Clock3 />
             <span>
-              <small>默认成片</small>
+              <small>成片时长</small>
               <strong>{formatDuration(totalDuration)}</strong>
             </span>
           </div>
@@ -4003,11 +4176,89 @@ function teamLabel(team: number | null) {
   return "阵容";
 }
 
+function createEmptyPlanSnapshot(): EditorPlanSnapshot {
+  return {
+    clipEdits: [],
+    selectedClipId: "",
+    highlightHero: "",
+    highlightRuleIds: [...DEFAULT_HIGHLIGHT_RULE_IDS],
+    sourceStoryId: null,
+    renderSettings: defaultRenderSettings,
+  };
+}
+
+function createEmptyPlanWorkspace(): Record<EditorPlanMode, EditorPlanSnapshot> {
+  return {
+    default: createEmptyPlanSnapshot(),
+    wtf: createEmptyPlanSnapshot(),
+  };
+}
+
+function createSavedPlanWorkspace(
+  result: AnalysisSummary,
+  saved: LoadedEditPlan,
+  defaultFallback: EditorPlanSnapshot,
+): Record<EditorPlanMode, EditorPlanSnapshot> {
+  const workspace = createEmptyPlanWorkspace();
+  for (const mode of ["default", "wtf"] as const) {
+    const slot = saved.plans.find((plan) => plan.mode === mode);
+    if (!slot) {
+      workspace[mode] = mode === "default" ? defaultFallback : workspace[mode];
+      continue;
+    }
+    const clips = createClipEdits(result, slot);
+    const inferred = inferHighlightSelection(result.highlights.candidates, clips);
+    const savedRules = slot.highlightRuleIds.filter(isHighlightRuleId);
+    const selectedClipId =
+      slot.selectedClipId &&
+      clips.some((clip) => clip.clipId === slot.selectedClipId)
+        ? slot.selectedClipId
+        : (clips.find((clip) => clip.includeInFinal)?.clipId ??
+          clips[0]?.clipId ??
+          "");
+    workspace[mode] = {
+      clipEdits: clips,
+      selectedClipId,
+      highlightHero: slot.selectedHero ?? inferred.hero,
+      highlightRuleIds:
+        savedRules.length > 0
+          ? normalizeHighlightRuleIds(savedRules)
+          : inferred.ruleIds,
+      sourceStoryId: slot.sourceStoryId,
+      renderSettings: sanitizeRenderSettings(slot.settings),
+    };
+  }
+  return workspace;
+}
+
+function isHighlightRuleId(value: string): value is HighlightRuleId {
+  return HIGHLIGHT_RULES.some((rule) => rule.id === value);
+}
+
+function toEditPlanSlot(
+  mode: EditorPlanMode,
+  snapshot: EditorPlanSnapshot,
+): EditPlanSlot {
+  return {
+    mode,
+    selectedHero: snapshot.highlightHero || null,
+    highlightRuleIds: snapshot.highlightRuleIds,
+    selectedClipId: snapshot.selectedClipId || null,
+    sourceStoryId: snapshot.sourceStoryId,
+    clips: planClips(snapshot.clipEdits),
+    settings: snapshot.renderSettings,
+  };
+}
+
+function editorModeLabel(mode: EditorPlanMode) {
+  return mode === "wtf" ? "WTF 导演" : "默认剪辑";
+}
+
 function createClipEdits(
   result: AnalysisSummary,
-  savedPlan?: LoadedEditPlan,
+  savedPlan?: Pick<EditPlanSlot, "clips">,
 ): ClipEdits {
-  if (savedPlan?.clips.length) {
+  if (savedPlan) {
     return savedPlan.clips.map((clip, index) => ({
       clipId: clip.clipId || `clip-saved-${String(index + 1).padStart(2, "0")}`,
       candidateId: clip.candidateId,
@@ -4222,7 +4473,7 @@ function storyCameraModeLabel(
     case "player_perspective":
       return "玩家视角";
     case "hero_chase":
-      return "英雄近景";
+      return "英雄跟随";
     case "directed":
       return "导播视角";
   }
@@ -4432,7 +4683,7 @@ function cameraModeShortLabel(mode: ClipCameraMode) {
   const labels: Record<ClipCameraMode, string> = {
     directed: "玩家视角",
     free_camera: "玩家视角",
-    hero_chase: "英雄近景",
+    hero_chase: "英雄跟随",
     player_perspective: "玩家视角",
   };
   return labels[mode];

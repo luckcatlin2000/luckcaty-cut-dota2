@@ -18,8 +18,8 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
-const EDIT_PLAN_SCHEMA_VERSION: &str = "d2h.edit-plan/1.4";
-const LEGACY_EDIT_PLAN_SCHEMA_VERSION: &str = "d2h.edit-plan/1.3";
+const EDIT_PLAN_SCHEMA_VERSION: &str = "d2h.edit-plan/1.5";
+const LEGACY_EDIT_PLAN_SCHEMA_VERSIONS: [&str; 2] = ["d2h.edit-plan/1.4", "d2h.edit-plan/1.3"];
 
 const fn default_true() -> bool {
     true
@@ -108,7 +108,31 @@ struct ReplayLookupResult {
 #[serde(rename_all = "camelCase")]
 struct SaveEditPlanRequest {
     job_id: String,
-    mode: String,
+    active_mode: EditPlanMode,
+    plans: Vec<EditPlanSlotInput>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EditPlanMode {
+    #[default]
+    Default,
+    Wtf,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EditPlanSlotInput {
+    mode: EditPlanMode,
+    #[serde(default)]
+    selected_hero: Option<String>,
+    #[serde(default)]
+    highlight_rule_ids: Vec<String>,
+    #[serde(default)]
+    selected_clip_id: Option<String>,
+    #[serde(default)]
+    source_story_id: Option<String>,
+    #[serde(default)]
     clips: Vec<EditPlanClipInput>,
     #[serde(default)]
     settings: RenderSettings,
@@ -137,14 +161,20 @@ struct EditPlanDocument {
     schema_version: String,
     source_sha256: String,
     job_id: String,
+    #[serde(default)]
+    active_mode: EditPlanMode,
+    #[serde(default)]
+    plans: Vec<EditPlanSlot>,
+    #[serde(default)]
     mode: String,
     updated_unix_seconds: u64,
+    #[serde(default)]
     clips: Vec<EditPlanClip>,
     #[serde(default)]
     settings: RenderSettings,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct EditPlanClip {
     #[serde(default)]
     clip_id: String,
@@ -162,6 +192,23 @@ struct EditPlanClip {
     source_end_seconds: f32,
 }
 
+#[derive(Clone, Deserialize, Serialize)]
+struct EditPlanSlot {
+    mode: EditPlanMode,
+    #[serde(default)]
+    selected_hero: Option<String>,
+    #[serde(default)]
+    highlight_rule_ids: Vec<String>,
+    #[serde(default)]
+    selected_clip_id: Option<String>,
+    #[serde(default)]
+    source_story_id: Option<String>,
+    #[serde(default)]
+    clips: Vec<EditPlanClip>,
+    #[serde(default)]
+    settings: RenderSettings,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SaveEditPlanResult {
@@ -172,7 +219,18 @@ struct SaveEditPlanResult {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LoadedEditPlan {
-    mode: String,
+    active_mode: EditPlanMode,
+    plans: Vec<LoadedEditPlanSlot>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoadedEditPlanSlot {
+    mode: EditPlanMode,
+    selected_hero: Option<String>,
+    highlight_rule_ids: Vec<String>,
+    selected_clip_id: Option<String>,
+    source_story_id: Option<String>,
     clips: Vec<LoadedEditPlanClip>,
     settings: RenderSettings,
 }
@@ -350,11 +408,8 @@ fn save_edit_plan(
     if !valid_job_id(&request.job_id) {
         return Err("任务编号无效，请重新打开分析结果。".to_string());
     }
-    if request.mode != "manual" && request.mode != "automatic" && request.mode != "review" {
-        return Err("未知的剪辑模式。".to_string());
-    }
-    if request.clips.is_empty() {
-        return Err("请至少选择一个高光片段。".to_string());
+    if request.plans.len() != 2 {
+        return Err("剪辑方案必须同时包含默认剪辑和 WTF 导演。".to_string());
     }
 
     let job_dir = state.jobs_root.join(&request.job_id);
@@ -367,11 +422,96 @@ fn save_edit_plan(
         read_json::<TimelineDocument>(&job_dir.join("timeline").join("combat-events.json"))
             .map_err(|_| "回放阵容数据不完整，请重新分析录像。".to_string())?;
 
-    let mut seen = HashSet::new();
-    let mut clips = Vec::with_capacity(request.clips.len());
-    let mut total_duration_seconds = 0.0;
+    let mut has_default = false;
+    let mut has_wtf = false;
+    let mut plans = Vec::with_capacity(request.plans.len());
+    let mut active_duration_seconds = 0.0;
+    for input in request.plans {
+        match input.mode {
+            EditPlanMode::Default if has_default => {
+                return Err("剪辑方案包含重复的默认剪辑。".to_string());
+            }
+            EditPlanMode::Wtf if has_wtf => {
+                return Err("剪辑方案包含重复的 WTF 导演。".to_string());
+            }
+            EditPlanMode::Default => has_default = true,
+            EditPlanMode::Wtf => has_wtf = true,
+        }
+        let (plan, duration_seconds) = build_edit_plan_slot(input, &highlights, &timeline)?;
+        if plan.mode == request.active_mode {
+            active_duration_seconds = duration_seconds;
+        }
+        plans.push(plan);
+    }
+    if !has_default || !has_wtf {
+        return Err("剪辑方案必须同时包含默认剪辑和 WTF 导演。".to_string());
+    }
+    let active_plan = plans
+        .iter()
+        .find(|plan| plan.mode == request.active_mode)
+        .ok_or_else(|| "找不到当前剪辑方案。".to_string())?;
+    if active_plan.clips.is_empty() {
+        return Err("当前方案还没有片段，请先选择高光或采用 WTF 故事。".to_string());
+    }
+    let active_clips = active_plan.clips.clone();
+    let active_settings = active_plan.settings.clone();
+    let selected_clip_count = active_clips.len();
 
-    for clip in request.clips {
+    let document = EditPlanDocument {
+        schema_version: EDIT_PLAN_SCHEMA_VERSION.to_string(),
+        source_sha256: manifest.source.sha256,
+        job_id: request.job_id,
+        active_mode: request.active_mode,
+        plans,
+        mode: "dual".to_string(),
+        updated_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_secs(),
+        clips: active_clips,
+        settings: active_settings,
+    };
+    let director_dir = job_dir.join("director");
+    fs::create_dir_all(&director_dir).map_err(|error| error.to_string())?;
+    let output_path = director_dir.join("edit-plan.json");
+    let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
+    fs::write(output_path, bytes).map_err(|error| error.to_string())?;
+
+    Ok(SaveEditPlanResult {
+        selected_clip_count,
+        total_duration_seconds: active_duration_seconds,
+    })
+}
+
+fn build_edit_plan_slot(
+    input: EditPlanSlotInput,
+    highlights: &HighlightDocument,
+    timeline: &TimelineDocument,
+) -> Result<(EditPlanSlot, f32), String> {
+    if let Some(hero) = input.selected_hero.as_deref()
+        && !timeline.replay.players.is_empty()
+        && !timeline
+            .replay
+            .players
+            .iter()
+            .any(|player| player.hero_name == hero)
+    {
+        return Err("当前方案选择的主角不在本局阵容中。".to_string());
+    }
+    if input.highlight_rule_ids.iter().any(|rule_id| {
+        rule_id.is_empty()
+            || rule_id.len() > 64
+            || !rule_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }) {
+        return Err("当前方案包含无效的高光规则。".to_string());
+    }
+
+    let mut seen = HashSet::new();
+    let mut clips = Vec::with_capacity(input.clips.len());
+    let mut total_duration_seconds = 0.0;
+    for clip in input.clips {
         if !valid_clip_id(&clip.clip_id) {
             return Err("剪辑方案包含无效的片段编号。".to_string());
         }
@@ -434,30 +574,27 @@ fn save_edit_plan(
             source_end_seconds: clip.source_end_seconds,
         });
     }
-    validate_edit_plan_take_groups(&clips)?;
+    if !clips.is_empty() {
+        validate_edit_plan_take_groups(&clips)?;
+    }
+    if let Some(selected_clip_id) = input.selected_clip_id.as_deref()
+        && !clips.iter().any(|clip| clip.clip_id == selected_clip_id)
+    {
+        return Err("当前方案选中的片段已经不存在。".to_string());
+    }
 
-    let document = EditPlanDocument {
-        schema_version: EDIT_PLAN_SCHEMA_VERSION.to_string(),
-        source_sha256: manifest.source.sha256,
-        job_id: request.job_id,
-        mode: "manual".to_string(),
-        updated_unix_seconds: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_secs(),
-        clips,
-        settings: manual_render_settings(request.settings),
-    };
-    let director_dir = job_dir.join("director");
-    fs::create_dir_all(&director_dir).map_err(|error| error.to_string())?;
-    let output_path = director_dir.join("edit-plan.json");
-    let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
-    fs::write(output_path, bytes).map_err(|error| error.to_string())?;
-
-    Ok(SaveEditPlanResult {
-        selected_clip_count: document.clips.len(),
+    Ok((
+        EditPlanSlot {
+            mode: input.mode,
+            selected_hero: input.selected_hero,
+            highlight_rule_ids: input.highlight_rule_ids,
+            selected_clip_id: input.selected_clip_id,
+            source_story_id: input.source_story_id,
+            clips,
+            settings: manual_render_settings(input.settings),
+        },
         total_duration_seconds,
-    })
+    ))
 }
 
 fn validate_edit_plan_take_groups(clips: &[EditPlanClip]) -> Result<(), String> {
@@ -543,23 +680,78 @@ fn get_edit_plan(
 }
 
 fn load_edit_plan(document: EditPlanDocument) -> Option<LoadedEditPlan> {
-    if document.schema_version != EDIT_PLAN_SCHEMA_VERSION
-        && document.schema_version != LEGACY_EDIT_PLAN_SCHEMA_VERSION
-    {
+    if document.schema_version == EDIT_PLAN_SCHEMA_VERSION {
+        let has_default = document
+            .plans
+            .iter()
+            .any(|plan| plan.mode == EditPlanMode::Default);
+        let has_wtf = document
+            .plans
+            .iter()
+            .any(|plan| plan.mode == EditPlanMode::Wtf);
+        if !has_default || !has_wtf || document.plans.len() != 2 {
+            return None;
+        }
+        return Some(LoadedEditPlan {
+            active_mode: document.active_mode,
+            plans: document
+                .plans
+                .into_iter()
+                .map(load_edit_plan_slot)
+                .collect(),
+        });
+    }
+    if !LEGACY_EDIT_PLAN_SCHEMA_VERSIONS.contains(&document.schema_version.as_str()) {
         return None;
     }
+
+    let selected_clip_id = document.clips.first().map(|clip| legacy_clip_id(clip, 0));
     Some(LoadedEditPlan {
-        mode: document.mode,
-        clips: document
+        active_mode: EditPlanMode::Default,
+        plans: vec![
+            load_edit_plan_slot(EditPlanSlot {
+                mode: EditPlanMode::Default,
+                selected_hero: None,
+                highlight_rule_ids: Vec::new(),
+                selected_clip_id,
+                source_story_id: None,
+                clips: document.clips,
+                settings: document.settings,
+            }),
+            load_edit_plan_slot(EditPlanSlot {
+                mode: EditPlanMode::Wtf,
+                selected_hero: None,
+                highlight_rule_ids: Vec::new(),
+                selected_clip_id: None,
+                source_story_id: None,
+                clips: Vec::new(),
+                settings: RenderSettings::default(),
+            }),
+        ],
+    })
+}
+
+fn legacy_clip_id(clip: &EditPlanClip, index: usize) -> String {
+    if clip.clip_id.is_empty() {
+        format!("clip-saved-{:02}", index + 1)
+    } else {
+        clip.clip_id.clone()
+    }
+}
+
+fn load_edit_plan_slot(plan: EditPlanSlot) -> LoadedEditPlanSlot {
+    LoadedEditPlanSlot {
+        mode: plan.mode,
+        selected_hero: plan.selected_hero,
+        highlight_rule_ids: plan.highlight_rule_ids,
+        selected_clip_id: plan.selected_clip_id,
+        source_story_id: plan.source_story_id,
+        clips: plan
             .clips
             .into_iter()
             .enumerate()
             .map(|(index, clip)| LoadedEditPlanClip {
-                clip_id: if clip.clip_id.is_empty() {
-                    format!("clip-saved-{:02}", index + 1)
-                } else {
-                    clip.clip_id
-                },
+                clip_id: legacy_clip_id(&clip, index),
                 candidate_id: clip.candidate_id,
                 view_hero: clip.view_hero,
                 camera_mode: normalize_user_camera_mode(clip.camera_mode),
@@ -570,8 +762,8 @@ fn load_edit_plan(document: EditPlanDocument) -> Option<LoadedEditPlan> {
                 source_end_seconds: clip.source_end_seconds,
             })
             .collect(),
-        settings: document.settings,
-    })
+        settings: plan.settings,
+    }
 }
 
 #[tauri::command]
@@ -612,12 +804,18 @@ fn get_latest_render(
     let (fallback_segment_count, fallback_source_asset_count) =
         read_json::<EditPlanDocument>(&job_dir.join("director").join("edit-plan.json"))
             .map(|plan| {
-                (
-                    plan.clips
+                let clips = if plan.schema_version == EDIT_PLAN_SCHEMA_VERSION {
+                    plan.plans
                         .iter()
-                        .filter(|clip| clip.include_in_final)
-                        .count(),
-                    plan.clips.len(),
+                        .find(|slot| slot.mode == plan.active_mode)
+                        .map(|slot| slot.clips.as_slice())
+                        .unwrap_or_default()
+                } else {
+                    plan.clips.as_slice()
+                };
+                (
+                    clips.iter().filter(|clip| clip.include_in_final).count(),
+                    clips.len(),
                 )
             })
             .unwrap_or_default();
@@ -908,8 +1106,24 @@ fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest,
         return Err("任务数据版本不一致，请重新分析录像。".to_string());
     }
 
-    let mut clips = Vec::with_capacity(edit_plan.clips.len());
-    for clip in &edit_plan.clips {
+    let (edit_clips, edit_settings) = if edit_plan.schema_version == EDIT_PLAN_SCHEMA_VERSION {
+        let active_plan = edit_plan
+            .plans
+            .iter()
+            .find(|plan| plan.mode == edit_plan.active_mode)
+            .ok_or_else(|| "当前剪辑方案不存在，请重新保存。".to_string())?;
+        if active_plan.clips.is_empty() {
+            return Err("当前剪辑方案没有可导出的片段。".to_string());
+        }
+        (&active_plan.clips, &active_plan.settings)
+    } else if LEGACY_EDIT_PLAN_SCHEMA_VERSIONS.contains(&edit_plan.schema_version.as_str()) {
+        (&edit_plan.clips, &edit_plan.settings)
+    } else {
+        return Err("剪辑方案版本不受支持，请重新保存。".to_string());
+    };
+
+    let mut clips = Vec::with_capacity(edit_clips.len());
+    for clip in edit_clips {
         let candidate = highlights
             .candidates
             .iter()
@@ -958,7 +1172,7 @@ fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest,
             .ok_or_else(|| "未找到 FFprobe，请使用完整版目录或重新安装。".to_string())?,
         timeline,
         clips,
-        settings: manual_render_settings(edit_plan.settings),
+        settings: manual_render_settings(edit_settings.clone()),
     })
 }
 
@@ -1192,10 +1406,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        EditPlanClip, EditPlanDocument, load_edit_plan, manual_render_settings,
-        normalize_user_camera_mode, replay_directory_from_dota2, resolve_replay_by_id,
-        sanitize_update_notes, valid_clip_id, valid_job_id, valid_replay_id,
-        validate_edit_plan_take_groups,
+        EDIT_PLAN_SCHEMA_VERSION, EditPlanClip, EditPlanDocument, EditPlanMode, EditPlanSlot,
+        load_edit_plan, manual_render_settings, normalize_user_camera_mode,
+        replay_directory_from_dota2, resolve_replay_by_id, sanitize_update_notes, valid_clip_id,
+        valid_job_id, valid_replay_id, validate_edit_plan_take_groups,
     };
     use d2_highlights_renderer::{
         BgmMode, CameraStyle, ClipCameraMode, RenderSettings, RenderTakeRole,
@@ -1216,7 +1430,7 @@ mod tests {
     #[test]
     fn clip_ids_are_stable_and_path_safe() {
         assert!(valid_clip_id("clip-recommended-01"));
-        assert!(valid_clip_id("clip-example-uuid"));
+        assert!(valid_clip_id("clip-123e4567-e89b-12d3-a456-426614174000"));
         assert!(!valid_clip_id("../clip-01"));
         assert!(!valid_clip_id("hl-001"));
     }
@@ -1228,7 +1442,7 @@ mod tests {
         assert!(!valid_replay_id(""));
         assert!(!valid_replay_id("123456789.dem"));
         assert!(!valid_replay_id("../123456789"));
-        assert!(!valid_replay_id(&"1".repeat(21)));
+        assert!(!valid_replay_id("123456789012345678901"));
     }
 
     #[test]
@@ -1351,7 +1565,9 @@ mod tests {
         let stale = EditPlanDocument {
             schema_version: "d2h.edit-plan/1.2".to_string(),
             source_sha256: "source".to_string(),
-            job_id: "d2h-aaaaaaaaaaaaaaaa".to_string(),
+            job_id: "d2h-0000000000000000".to_string(),
+            active_mode: EditPlanMode::Default,
+            plans: Vec::new(),
             mode: "manual".to_string(),
             updated_unix_seconds: 0,
             clips: Vec::new(),
@@ -1359,6 +1575,93 @@ mod tests {
         };
 
         assert!(load_edit_plan(stale).is_none());
+    }
+
+    #[test]
+    fn legacy_edit_plan_migrates_into_default_slot() {
+        let legacy = EditPlanDocument {
+            schema_version: "d2h.edit-plan/1.4".to_string(),
+            source_sha256: "source".to_string(),
+            job_id: "d2h-0000000000000000".to_string(),
+            active_mode: EditPlanMode::Default,
+            plans: Vec::new(),
+            mode: "manual".to_string(),
+            updated_unix_seconds: 0,
+            clips: vec![paired_clip(
+                "clip-player",
+                RenderTakeRole::Primary,
+                true,
+                10.0,
+                20.0,
+            )],
+            settings: RenderSettings::default(),
+        };
+
+        let loaded = load_edit_plan(legacy).expect("legacy plan should migrate");
+
+        assert_eq!(loaded.active_mode, EditPlanMode::Default);
+        assert_eq!(loaded.plans.len(), 2);
+        assert_eq!(loaded.plans[0].mode, EditPlanMode::Default);
+        assert_eq!(loaded.plans[0].clips.len(), 1);
+        assert_eq!(loaded.plans[1].mode, EditPlanMode::Wtf);
+        assert!(loaded.plans[1].clips.is_empty());
+    }
+
+    #[test]
+    fn dual_edit_plan_preserves_active_mode_and_both_slots() {
+        let document = EditPlanDocument {
+            schema_version: EDIT_PLAN_SCHEMA_VERSION.to_string(),
+            source_sha256: "source".to_string(),
+            job_id: "d2h-0000000000000000".to_string(),
+            active_mode: EditPlanMode::Wtf,
+            plans: vec![
+                EditPlanSlot {
+                    mode: EditPlanMode::Default,
+                    selected_hero: Some("npc_dota_hero_mirana".to_string()),
+                    highlight_rule_ids: vec!["hero_kills".to_string()],
+                    selected_clip_id: Some("clip-default".to_string()),
+                    source_story_id: None,
+                    clips: vec![paired_clip(
+                        "clip-default",
+                        RenderTakeRole::Primary,
+                        true,
+                        10.0,
+                        20.0,
+                    )],
+                    settings: RenderSettings::default(),
+                },
+                EditPlanSlot {
+                    mode: EditPlanMode::Wtf,
+                    selected_hero: Some("npc_dota_hero_mirana".to_string()),
+                    highlight_rule_ids: Vec::new(),
+                    selected_clip_id: Some("clip-wtf".to_string()),
+                    source_story_id: Some("story-001".to_string()),
+                    clips: vec![paired_clip(
+                        "clip-wtf",
+                        RenderTakeRole::Primary,
+                        true,
+                        30.0,
+                        40.0,
+                    )],
+                    settings: RenderSettings::default(),
+                },
+            ],
+            mode: "dual".to_string(),
+            updated_unix_seconds: 0,
+            clips: Vec::new(),
+            settings: RenderSettings::default(),
+        };
+
+        let loaded = load_edit_plan(document).expect("dual plan should load");
+
+        assert_eq!(loaded.active_mode, EditPlanMode::Wtf);
+        assert_eq!(loaded.plans.len(), 2);
+        assert_eq!(loaded.plans[0].clips[0].clip_id, "clip-default");
+        assert_eq!(loaded.plans[1].clips[0].clip_id, "clip-wtf");
+        assert_eq!(
+            loaded.plans[1].source_story_id.as_deref(),
+            Some("story-001")
+        );
     }
 
     fn paired_clip(

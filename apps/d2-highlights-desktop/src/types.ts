@@ -304,11 +304,22 @@ export interface EditPlanClip {
   sourceEndSeconds: number;
 }
 
-export interface SaveEditPlanRequest {
-  jobId: string;
-  mode: "manual";
+export type EditorPlanMode = "default" | "wtf";
+
+export interface EditPlanSlot {
+  mode: EditorPlanMode;
+  selectedHero: string | null;
+  highlightRuleIds: string[];
+  selectedClipId: string | null;
+  sourceStoryId: string | null;
   clips: EditPlanClip[];
   settings: RenderSettings;
+}
+
+export interface SaveEditPlanRequest {
+  jobId: string;
+  activeMode: EditorPlanMode;
+  plans: EditPlanSlot[];
 }
 
 export interface SaveEditPlanResult {
@@ -317,9 +328,8 @@ export interface SaveEditPlanResult {
 }
 
 export interface LoadedEditPlan {
-  mode: "manual" | "automatic" | "review";
-  clips: EditPlanClip[];
-  settings: RenderSettings;
+  activeMode: EditorPlanMode;
+  plans: EditPlanSlot[];
 }
 
 export type ClipCameraMode =
