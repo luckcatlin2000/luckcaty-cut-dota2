@@ -114,7 +114,7 @@ fn real_dem_exports_synchronized_camera_assets_and_closes_dota() {
     );
     assert!(
         Path::new(&completed.source_assets_dir)
-            .join("S001-B_英雄近景.mp4")
+            .join("S001-B_英雄跟随.mp4")
             .is_file()
     );
     assert!(

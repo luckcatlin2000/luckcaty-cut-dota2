@@ -4,7 +4,7 @@
 
 官方仓库：<https://github.com/luckcatlin2000/luckcaty-cut-dota2>
 
-当前正式版：`1.9.0`。第一次了解本项目，可以先阅读[软件介绍](软件介绍.md)。
+当前正式版：`1.9.1`。第一次了解本项目，可以先阅读[软件介绍](软件介绍.md)。
 
 ```text
 导入 .dem
@@ -26,11 +26,11 @@
 
 普通用户请前往 [GitHub Releases](https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/latest) 下载：
 
-- `luckcaty-cut-dota2_1.9.0_x64-setup.exe`：推荐，双击后按提示安装。
+- `luckcaty-cut-dota2_1.9.1_x64-setup.exe`：推荐，双击后按提示安装。
 
 安装版启动后会静默检查官方 Release。发现新版本时只提示，是否下载和安装由用户决定；软件不会后台自动下载，也不会强制更新。`1.6.0` 用户需要先手动安装一次 1.7 或更高版本，之后才可使用应用内更新。
 
-官方 1.9.0 安装包包含已核验的 FFmpeg/FFprobe 参考构建，许可证和来源记录见 `tools/ffmpeg/`。Git 仓库不提交这些二进制；自行构建时需要按“开发”章节提供本地 FFmpeg。Release 说明会列出 SHA-256 供核对。
+官方 1.9.1 安装包包含已核验的 FFmpeg/FFprobe 参考构建，许可证和来源记录见 `tools/ffmpeg/`。Git 仓库不提交这些二进制；自行构建时需要按“开发”章节提供本地 FFmpeg。Release 说明会列出 SHA-256 供核对。
 
 安装包目前没有商业代码签名证书。Windows 如果显示 SmartScreen 提醒，请先核对下载地址属于本官方仓库，并核对 Release 中的 SHA-256；不要从第三方网盘、店铺或重新打包的网站下载。
 
@@ -50,6 +50,12 @@
 - “机位”页只设置当前片段：玩家视角为默认，`Hero Chase` 准确显示为“英雄跟随”。
 - 使用 Dota 2 原生 `startmovie/endmovie` 导出帧序列与 WAV，再由 FFmpeg 编码和质量检查。
 - 导出完成后可在应用内播放、外部播放或打开成片及源素材目录。
+
+## 1.9.1 简介
+
+- FFmpeg、FFprobe 与辅助命令改为 Windows 后台进程，录制和编码期间不再弹出黑色控制台窗口。
+- 抑制媒体子进程系统错误对话框；`0xc0000142` 只重试一次，仍失败时在软件内显示退出码并停止任务。
+- 统一导出素材中的“英雄跟随”命名。
 
 ## 1.9.0 简介
 

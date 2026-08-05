@@ -141,7 +141,7 @@ const developmentFixtureEnabled =
   import.meta.env.DEV &&
   new URLSearchParams(window.location.search).get("fixture") === "mirana";
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
-const fallbackAppVersion = "1.9.0";
+const fallbackAppVersion = "1.9.1";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,

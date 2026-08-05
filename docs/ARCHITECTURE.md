@@ -59,6 +59,8 @@ Tauri Desktop UI
 
 `d2-highlights-renderer` 按 `d2h.render/1.9` 为每个机位复制独立 H.264/AAC MP4，按 `S001-A_玩家视角.mp4`、`S001-B_英雄跟随.mp4` 命名并生成 `素材清单.json`。默认成片只按场次顺序拼接主机位，保留游戏原声；桌面后端强制禁用 BGM、旁白、音效、自动慢动作和重点回看。FFprobe、blackdetect、freezedetect 和 volumedetect 生成 QC JSON。
 
+Windows 上所有媒体和系统辅助命令统一以无控制台窗口的后台子进程启动，并继承禁止系统错误弹窗的进程错误模式。只有可识别的 `STATUS_DLL_INIT_FAILED (0xc0000142)` 会延迟 300 毫秒重试一次；其余错误及第二次失败直接回传用途、退出码和 stderr，不在桌面上生成命令窗口或阻塞式系统弹窗。
+
 每个片段以 DEM、时间窗、镜头和声音设置的指纹作为缓存键。失败或取消后重试可以复用已经完成的原生导出；设置变化时缓存自动失效。
 
 ### 9. Local App
@@ -99,4 +101,4 @@ jobs/<job-id>/
 - Dota 2 `startmovie/endmovie`：已验证的主离线素材输出路径。
 - FFmpeg/FFprobe：帧序列编码、编辑、媒体探测、黑屏和冻结 QC。
 
-Windows UI 使用 Tauri 2 + React/TypeScript。源码仓库不提交 FFmpeg/FFprobe 二进制；官方 1.8.0 安装包使用 `tools/ffmpeg/SOURCE.txt` 记录的参考构建，并随包提供许可证与来源说明。录像目录由用户输入或原生目录选择器提供并保存在本机，编号查找由 Rust 后端限制为纯数字并校验 Source 2 DEM 文件头。检测器生成连续击杀段和可验证的非击杀互动证据，故事层只引用这些版本化事实；旧候选、故事和剪辑方案按 schema、检测器名称和版本失效后重算。真实米拉娜同步双机位已验证独立 MP4、相同时间码、不同构图、默认单机位成片、原声、QC 和自动关闭。Windows 正式 EXE 还必须通过 PE GUI 子系统和冷启动门禁。
+Windows UI 使用 Tauri 2 + React/TypeScript。源码仓库不提交 FFmpeg/FFprobe 二进制；官方安装包使用 `tools/ffmpeg/SOURCE.txt` 记录的参考构建，并随包提供许可证与来源说明。录像目录由用户输入或原生目录选择器提供并保存在本机，编号查找由 Rust 后端限制为纯数字并校验 Source 2 DEM 文件头。检测器生成连续击杀段和可验证的非击杀互动证据，故事层只引用这些版本化事实；旧候选、故事和剪辑方案按 schema、检测器名称和版本失效后重算。真实米拉娜同步双机位已验证独立 MP4、相同时间码、不同构图、默认单机位成片、原声、QC 和自动关闭。Windows 正式 EXE 还必须通过 PE GUI 子系统和冷启动门禁。

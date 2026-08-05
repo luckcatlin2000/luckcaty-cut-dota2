@@ -6,10 +6,15 @@ use d2_highlights_replay_control::{ReplayControlError, execute_vconsole_commands
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+#[cfg(windows)]
+use std::sync::Once;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -17,11 +22,62 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX, SetErrorMode,
+};
 
 pub const RENDER_SCHEMA_VERSION: &str = "d2h.render/1.9";
 const FRAME_RATE: u32 = 30;
 const CAPTURE_PREROLL_SECONDS: f32 = 1.0;
 const VCONSOLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const STATUS_DLL_INIT_FAILED: i32 = 0xC000_0142_u32 as i32;
+
+fn background_command(program: impl AsRef<OsStr>) -> Command {
+    #[cfg(windows)]
+    configure_child_process_error_mode();
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(windows)]
+fn configure_child_process_error_mode() {
+    static CONFIGURE_ONCE: Once = Once::new();
+    CONFIGURE_ONCE.call_once(|| {
+        // Child processes inherit this mode, so loader failures return to the app instead of
+        // interrupting an unattended render with a Windows modal error dialog.
+        unsafe {
+            SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+        }
+    });
+}
+
+fn output_with_loader_retry(mut build: impl FnMut() -> Command) -> io::Result<Output> {
+    let first = build().output()?;
+    if is_dll_init_failure(first.status.code()) {
+        thread::sleep(Duration::from_millis(300));
+        build().output()
+    } else {
+        Ok(first)
+    }
+}
+
+fn is_dll_init_failure(exit_code: Option<i32>) -> bool {
+    #[cfg(windows)]
+    {
+        exit_code == Some(STATUS_DLL_INIT_FAILED)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = exit_code;
+        false
+    }
+}
 
 const fn default_true() -> bool {
     true
@@ -613,7 +669,7 @@ fn take_code(index: usize) -> String {
 fn camera_asset_label(mode: &ClipCameraMode) -> &'static str {
     match mode {
         ClipCameraMode::PlayerPerspective => "玩家视角",
-        ClipCameraMode::HeroChase => "英雄近景",
+        ClipCameraMode::HeroChase => "英雄跟随",
         ClipCameraMode::Directed => "导播视角",
         ClipCameraMode::FreeCamera => "自由视角",
     }
@@ -1110,8 +1166,9 @@ fn mix_final_audio(
 
 fn run_qc(ffmpeg: &Path, ffprobe: &Path, output: &Path) -> Result<QcReport, RenderError> {
     let media = probe_media(ffprobe, output)?;
-    let qc_output = Command::new(ffmpeg)
-        .args([
+    let qc_output = output_with_loader_retry(|| {
+        let mut command = background_command(ffmpeg);
+        command.args([
             "-hide_banner",
             "-i",
             &path_arg(output),
@@ -1122,9 +1179,10 @@ fn run_qc(ffmpeg: &Path, ffprobe: &Path, output: &Path) -> Result<QcReport, Rend
             "-f",
             "null",
             "NUL",
-        ])
-        .output()
-        .map_err(|error| RenderError::Media(format!("无法运行质量检查：{error}")))?;
+        ]);
+        command
+    })
+    .map_err(|error| RenderError::Media(format!("无法运行质量检查：{error}")))?;
     let stderr = String::from_utf8_lossy(&qc_output.stderr);
     let black_events = stderr.matches("black_start:").count();
     let freeze_events = stderr.matches("freeze_start:").count();
@@ -1175,8 +1233,9 @@ struct MediaInfo {
 }
 
 fn probe_media(ffprobe: &Path, path: &Path) -> Result<MediaInfo, RenderError> {
-    let output = Command::new(ffprobe)
-        .args([
+    let output = output_with_loader_retry(|| {
+        let mut command = background_command(ffprobe);
+        command.args([
             "-v",
             "error",
             "-show_entries",
@@ -1184,9 +1243,10 @@ fn probe_media(ffprobe: &Path, path: &Path) -> Result<MediaInfo, RenderError> {
             "-of",
             "json",
             &path_arg(path),
-        ])
-        .output()
-        .map_err(|error| RenderError::Media(format!("无法运行 FFprobe：{error}")))?;
+        ]);
+        command
+    })
+    .map_err(|error| RenderError::Media(format!("无法运行 FFprobe：{error}")))?;
     if !output.status.success() {
         return Err(RenderError::Media(format!(
             "FFprobe 无法读取 {}：{}",
@@ -1530,7 +1590,7 @@ fn shutdown_dota(child: &mut Child) -> Option<String> {
     let pid = child.id().to_string();
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        let _ = background_command("taskkill")
             .args(["/PID", &pid, "/T"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1553,7 +1613,7 @@ fn shutdown_dota(child: &mut Child) -> Option<String> {
 fn dota_is_running() -> Result<bool, RenderError> {
     #[cfg(windows)]
     {
-        let output = Command::new("tasklist")
+        let output = background_command("tasklist")
             .args(["/FI", "IMAGENAME eq dota2.exe", "/FO", "CSV", "/NH"])
             .output()?;
         Ok(String::from_utf8_lossy(&output.stdout)
@@ -1832,26 +1892,49 @@ fn check_command(path: &Path, args: &[&str], label: &str) -> Result<(), RenderEr
     if !path.is_file() && path.components().count() > 1 {
         return Err(RenderError::MissingTool(label.to_string()));
     }
-    let output = Command::new(path).args(args).output();
-    if output.is_ok_and(|output| output.status.success()) {
-        Ok(())
-    } else {
-        Err(RenderError::MissingTool(label.to_string()))
+    let output = output_with_loader_retry(|| {
+        let mut command = background_command(path);
+        command.args(args);
+        command
+    });
+    match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(RenderError::Media(format!(
+            "{label} 启动检查失败：{}",
+            command_failure_text(&output, 8)
+        ))),
+        Err(error) => Err(RenderError::Media(format!("{label} 无法启动：{error}"))),
     }
 }
 
 fn run_media_command(executable: &Path, args: &[String], purpose: &str) -> Result<(), RenderError> {
-    let output = Command::new(executable)
-        .args(args)
-        .output()
-        .map_err(|error| RenderError::Media(format!("{purpose}无法启动：{error}")))?;
+    let output = output_with_loader_retry(|| {
+        let mut command = background_command(executable);
+        command.args(args);
+        command
+    })
+    .map_err(|error| RenderError::Media(format!("{purpose}无法启动：{error}")))?;
     if output.status.success() {
         Ok(())
     } else {
         Err(RenderError::Media(format!(
             "{purpose}失败：{}",
-            tail_text(&output, 12)
+            command_failure_text(&output, 12)
         )))
+    }
+}
+
+fn command_failure_text(output: &Output, lines: usize) -> String {
+    let stderr = tail_text(output, lines);
+    let exit_code = output
+        .status
+        .code()
+        .map(|code| format!("0x{:08X}", code as u32))
+        .unwrap_or_else(|| "未知".to_string());
+    if stderr.is_empty() {
+        format!("进程退出码 {exit_code}")
+    } else {
+        format!("进程退出码 {exit_code}；{stderr}")
     }
 }
 
@@ -1899,7 +1982,7 @@ $speaker.SetOutputToWaveFile($env:D2H_NARRATION_PATH)
 $speaker.Speak($env:D2H_NARRATION_TEXT)
 $speaker.Dispose()
 "#;
-    let output = Command::new("powershell.exe")
+    let output = background_command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .env("D2H_NARRATION_PATH", path)
         .env("D2H_NARRATION_TEXT", text)
@@ -1983,11 +2066,43 @@ mod tests {
     use super::{
         BgmMode, CameraStyle, ClipCameraMode, RenderClip, RenderRequest, RenderSettings,
         RenderTakeRole, camera_commands_for_clip, clean_hud_commands, concat_segments,
-        export_source_assets, frame_count_for_duration, hero_slot_for_clip, mix_final_audio,
-        parse_db_value, probe_media, run_qc, select_final_segments, source_asset_numbering,
-        source_to_tick,
+        encode_frame_sequence, export_source_assets, frame_count_for_duration, hero_slot_for_clip,
+        mix_final_audio, parse_db_value, probe_media, run_qc, select_final_segments,
+        source_asset_numbering, source_to_tick,
     };
     use d2_highlights_core::{ParserIdentity, ReplayMetadata, ReplayPlayer, TimelineDocument};
+
+    #[cfg(windows)]
+    #[test]
+    fn only_windows_dll_initialization_failure_is_retried() {
+        assert!(super::is_dll_init_failure(Some(0xC000_0142_u32 as i32)));
+        assert!(!super::is_dll_init_failure(Some(1)));
+        assert!(!super::is_dll_init_failure(None));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_helper_process_has_no_console_or_error_dialog_mode() {
+        let script = r#"
+Add-Type -Namespace D2H -Name NativeConsole -MemberDefinition '[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();'
+if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else { exit 1 }
+"#;
+        let output = super::background_command("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "helper acquired a console window: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let expected = super::SEM_FAILCRITICALERRORS
+            | super::SEM_NOGPFAULTERRORBOX
+            | super::SEM_NOOPENFILEERRORBOX;
+        let actual = unsafe { windows_sys::Win32::System::Diagnostics::Debug::GetErrorMode() };
+        assert_eq!(actual & expected, expected);
+    }
 
     #[test]
     fn manual_seconds_map_relative_to_candidate_anchor() {
@@ -2108,7 +2223,7 @@ mod tests {
         assert_eq!(assets[0].asset_id, "S001-A");
         assert_eq!(assets[1].asset_id, "S001-B");
         assert!(output_dir.join("S001-A_玩家视角.mp4").is_file());
-        assert!(output_dir.join("S001-B_英雄近景.mp4").is_file());
+        assert!(output_dir.join("S001-B_英雄跟随.mp4").is_file());
         assert!(output_dir.join("素材清单.json").is_file());
     }
 
@@ -2271,5 +2386,43 @@ mod tests {
         assert!(qc.has_video);
         assert!(qc.has_audio);
         assert_eq!(qc.black_events, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local FFmpeg and a D2H_NATIVE_FRAME_DIR capture"]
+    fn native_frame_capture_encodes_without_reopening_dota() {
+        let raw_dir = std::path::PathBuf::from(
+            std::env::var_os("D2H_NATIVE_FRAME_DIR").expect("D2H_NATIVE_FRAME_DIR is required"),
+        );
+        let ffmpeg = std::path::PathBuf::from(
+            std::env::var_os("FFMPEG_EXE").unwrap_or_else(|| "ffmpeg.exe".into()),
+        );
+        let ffprobe = std::path::PathBuf::from(
+            std::env::var_os("FFPROBE_EXE").unwrap_or_else(|| "ffprobe.exe".into()),
+        );
+        let frame_count = std::fs::read_dir(&raw_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| super::is_jpeg(&entry.path()))
+            .count();
+        let expected_duration = frame_count as f32 / super::FRAME_RATE as f32;
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("native-frame-capture.mp4");
+
+        encode_frame_sequence(
+            &ffmpeg,
+            &raw_dir,
+            &raw_dir.join("game.wav"),
+            &output,
+            expected_duration,
+            super::CAPTURE_PREROLL_SECONDS,
+        )
+        .unwrap();
+        let media = probe_media(&ffprobe, &output).unwrap();
+
+        assert!((media.duration_seconds - expected_duration).abs() <= 0.1);
+        assert_eq!((media.width, media.height), (1920, 1080));
+        assert!(media.has_video);
+        assert!(media.has_audio);
     }
 }
