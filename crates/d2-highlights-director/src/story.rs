@@ -51,6 +51,9 @@ pub fn build_story_document(
     stories.extend(build_tree_counter_stories(timeline, highlights));
     stories.extend(build_kill_sequence_stories(highlights));
     stories.extend(build_buyback_dieback_stories(timeline, highlights));
+    for story in &mut stories {
+        sort_beats_by_replay_time(&mut story.beats);
+    }
     stories.sort_by(|left, right| {
         right
             .priority_score
@@ -323,11 +326,7 @@ fn build_tree_counter_story(
         });
     }
 
-    beats.sort_by(|left, right| {
-        left.source_start_seconds
-            .total_cmp(&right.source_start_seconds)
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    sort_beats_by_replay_time(&mut beats);
     let shots = finalize_shots(shot_drafts);
     let source_start_seconds = beats
         .first()
@@ -487,6 +486,7 @@ fn build_kill_sequence_story(candidate: &HighlightCandidate) -> Option<Highlight
         evidence_ids: vec![format!("{story_id}-e-kill-01-setup")],
     }];
     let mut kill_beat_ids = BTreeMap::new();
+    let mut previous_chain_start = candidate.start_seconds;
     for (group_index, group) in grouped.iter().enumerate() {
         let beat_id = format!("{story_id}-beat-chain-{:02}", group_index + 1);
         let is_final = group_index + 1 == grouped.len();
@@ -495,6 +495,13 @@ fn build_kill_sequence_story(candidate: &HighlightCandidate) -> Option<Highlight
             .map(|(_, kill)| kill.death_time_seconds)
             .max_by(f32::total_cmp)
             .unwrap_or(candidate.peak_seconds);
+        let source_start_seconds = group
+            .iter()
+            .map(|(_, kill)| kill.setup_time_seconds)
+            .min_by(f32::total_cmp)
+            .unwrap_or(previous_chain_start)
+            .max(previous_chain_start);
+        previous_chain_start = source_start_seconds;
         let mut evidence_ids = Vec::new();
         for (kill_index, _) in group {
             evidence_ids.push(format!("{story_id}-e-kill-{:02}-setup", kill_index + 1));
@@ -508,7 +515,7 @@ fn build_kill_sequence_story(candidate: &HighlightCandidate) -> Option<Highlight
             } else {
                 StoryArcBeatKind::Development
             },
-            source_start_seconds: group[0].1.setup_time_seconds,
+            source_start_seconds,
             source_end_seconds: (end + 1.25).min(candidate.end_seconds),
             summary: format!(
                 "Attributed action resolves into {} confirmed kill(s).",
@@ -517,6 +524,7 @@ fn build_kill_sequence_story(candidate: &HighlightCandidate) -> Option<Highlight
             evidence_ids,
         });
     }
+    sort_beats_by_replay_time(&mut beats);
 
     let take_group_id = format!("{story_id}-take-sequence");
     let mut shot_drafts = vec![ShotDraft {
@@ -951,6 +959,15 @@ fn finalize_shots(mut drafts: Vec<ShotDraft>) -> Vec<StoryShot> {
             fallback: draft.fallback,
         })
         .collect()
+}
+
+fn sort_beats_by_replay_time(beats: &mut [StoryArcBeat]) {
+    beats.sort_by(|left, right| {
+        left.source_start_seconds
+            .total_cmp(&right.source_start_seconds)
+            .then_with(|| left.source_end_seconds.total_cmp(&right.source_end_seconds))
+            .then_with(|| left.id.cmp(&right.id))
+    });
 }
 
 fn player_fallback(primary_hero: &str, reason: &str) -> StoryShotFallback {
@@ -1434,4 +1451,78 @@ fn validate_camera_target(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use d2_highlights_core::HeroKillSequenceEvidence;
+
+    fn kill_moment(
+        death_tick: u32,
+        death_time_seconds: f32,
+        setup_tick: u32,
+        setup_time_seconds: f32,
+    ) -> HeroKillMoment {
+        HeroKillMoment {
+            death_tick,
+            death_time_seconds,
+            target_hero: format!("npc_dota_hero_target_{death_tick}"),
+            inflictor: Some("mirana_starfall".to_string()),
+            setup_tick,
+            setup_time_seconds,
+            setup_action: Some("mirana_starfall".to_string()),
+        }
+    }
+
+    #[test]
+    fn kill_sequence_beats_stay_ordered_when_a_later_death_has_an_earlier_setup() {
+        let candidate = HighlightCandidate {
+            id: "hk-regressing-setup".to_string(),
+            rank: 1,
+            kind: "hero_kill_sequence".to_string(),
+            title: "Mirana kill sequence".to_string(),
+            score: 200.0,
+            start_seconds: 100.0,
+            peak_seconds: 130.0,
+            end_seconds: 132.5,
+            hero_deaths: 3,
+            anchor_tick: 1_300,
+            primary_hero: Some("npc_dota_hero_mirana".to_string()),
+            participants: vec!["npc_dota_hero_mirana".to_string()],
+            reasons: Vec::new(),
+            interaction: None,
+            kill_sequence: Some(HeroKillSequenceEvidence {
+                hero: "npc_dota_hero_mirana".to_string(),
+                sequence_index: 1,
+                sequence_count: 1,
+                total_kills: 3,
+                kills: vec![
+                    kill_moment(1_100, 110.0, 1_020, 102.0),
+                    kill_moment(1_200, 120.0, 1_150, 115.0),
+                    kill_moment(1_300, 130.0, 1_080, 108.0),
+                ],
+            }),
+        };
+
+        let story = build_kill_sequence_story(&candidate).expect("kill story");
+        assert!(story.beats.windows(2).all(|beats| {
+            beats[0].source_start_seconds <= beats[1].source_start_seconds + 0.001
+        }));
+
+        let chain_beats = story
+            .beats
+            .iter()
+            .filter(|beat| beat.id.contains("-beat-chain-"))
+            .collect::<Vec<_>>();
+        assert_eq!(chain_beats.len(), 3);
+        assert_eq!(
+            chain_beats
+                .iter()
+                .map(|beat| beat.source_start_seconds)
+                .collect::<Vec<_>>(),
+            vec![102.0, 115.0, 115.0]
+        );
+        assert_eq!(chain_beats[2].kind, StoryArcBeatKind::Payoff);
+    }
 }
