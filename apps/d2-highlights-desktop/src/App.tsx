@@ -21,6 +21,7 @@ import {
   FileVideo2,
   Film,
   FolderOpen,
+  Gamepad2,
   Library,
   ListFilter,
   ListChecks,
@@ -30,6 +31,7 @@ import {
   Play,
   Plus,
   RefreshCw,
+  RotateCcw,
   Search,
   SearchX,
   Settings2,
@@ -141,7 +143,7 @@ const developmentFixtureEnabled =
   import.meta.env.DEV &&
   new URLSearchParams(window.location.search).get("fixture") === "mirana";
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
-const fallbackAppVersion = "1.9.2";
+const fallbackAppVersion = "1.9.3";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,
@@ -152,6 +154,8 @@ const emptyCapabilities: Capabilities = {
   renderReason: null,
   jobsRoot: "",
   recommendedReplayDirectory: null,
+  dota2Path: null,
+  dota2PathSource: "missing",
 };
 
 const defaultRenderSettings: RenderSettings = {
@@ -1214,10 +1218,13 @@ function App() {
       <Titlebar
         notice={notice}
         completionNoticeEnabled={completionNoticeEnabled}
+        capabilities={capabilities}
         appVersion={appVersion}
         appUpdate={appUpdate}
         updateInstallationBlocked={busy || rendering}
+        configurationBlocked={busy || rendering}
         onCompletionNoticeChange={setCompletionNoticeEnabled}
+        onCapabilitiesChange={setCapabilities}
         onCheckForUpdate={() => void checkForAppUpdate()}
         onInstallUpdate={() => void installAppUpdate()}
         onClearNotice={() => setNotice(null)}
@@ -1359,10 +1366,13 @@ function App() {
 interface TitlebarProps {
   notice: AppNotice | null;
   completionNoticeEnabled: boolean;
+  capabilities: Capabilities;
   appVersion: string;
   appUpdate: AppUpdateState;
   updateInstallationBlocked: boolean;
+  configurationBlocked: boolean;
   onCompletionNoticeChange: (enabled: boolean) => void;
+  onCapabilitiesChange: (capabilities: Capabilities) => void;
   onCheckForUpdate: () => void;
   onInstallUpdate: () => void;
   onClearNotice: () => void;
@@ -1371,20 +1381,102 @@ interface TitlebarProps {
 function Titlebar({
   notice,
   completionNoticeEnabled,
+  capabilities,
   appVersion,
   appUpdate,
   updateInstallationBlocked,
+  configurationBlocked,
   onCompletionNoticeChange,
+  onCapabilitiesChange,
   onCheckForUpdate,
   onInstallUpdate,
   onClearNotice,
 }: TitlebarProps) {
   const [panel, setPanel] = useState<TitlebarPanel>(null);
+  const [dota2PathDraft, setDota2PathDraft] = useState(
+    capabilities.dota2Path ?? "",
+  );
+  const [dota2PathBusy, setDota2PathBusy] = useState(false);
+  const [dota2PathFeedback, setDota2PathFeedback] = useState("");
+  const [dota2PathError, setDota2PathError] = useState("");
   const actionsRef = useRef<HTMLDivElement>(null);
   const updateCopy = appUpdateCopy(
     appUpdate,
     updateInstallationBlocked,
   );
+
+  useEffect(() => {
+    setDota2PathDraft(capabilities.dota2Path ?? "");
+  }, [capabilities.dota2Path]);
+
+  async function saveDota2Path(path: string) {
+    const trimmed = path.trim();
+    if (!trimmed) {
+      setDota2PathError("请输入 dota2.exe 的完整路径，或使用浏览按钮选择。");
+      setDota2PathFeedback("");
+      return;
+    }
+    setDota2PathBusy(true);
+    setDota2PathError("");
+    setDota2PathFeedback("");
+    try {
+      const updated = await invoke<Capabilities>("set_dota2_executable", {
+        path: trimmed,
+      });
+      onCapabilitiesChange(updated);
+      setDota2PathDraft(updated.dota2Path ?? trimmed);
+      setDota2PathFeedback("路径已保存在这台电脑，成片能力已刷新。");
+    } catch (reason: unknown) {
+      setDota2PathError(toErrorMessage(reason));
+    } finally {
+      setDota2PathBusy(false);
+    }
+  }
+
+  async function chooseDota2Path() {
+    if (!isTauriRuntime) {
+      setDota2PathError("请从桌面应用中选择 Dota 2 程序。");
+      return;
+    }
+    setDota2PathError("");
+    try {
+      const selected = await open({
+        directory: false,
+        multiple: false,
+        title: "选择 Dota 2 程序",
+        defaultPath: dota2PathDraft || undefined,
+        filters: [{ name: "Dota 2 程序", extensions: ["exe"] }],
+      });
+      if (typeof selected === "string") {
+        setDota2PathDraft(selected);
+        await saveDota2Path(selected);
+      }
+    } catch (reason: unknown) {
+      setDota2PathError(toErrorMessage(reason));
+    }
+  }
+
+  async function resetDota2Path() {
+    setDota2PathBusy(true);
+    setDota2PathError("");
+    setDota2PathFeedback("");
+    try {
+      const updated = await invoke<Capabilities>("set_dota2_executable", {
+        path: null,
+      });
+      onCapabilitiesChange(updated);
+      setDota2PathDraft(updated.dota2Path ?? "");
+      setDota2PathFeedback(
+        updated.dota2Found
+          ? "已恢复自动检测，并找到 Dota 2。"
+          : "已恢复自动检测，当前没有找到 Dota 2。",
+      );
+    } catch (reason: unknown) {
+      setDota2PathError(toErrorMessage(reason));
+    } finally {
+      setDota2PathBusy(false);
+    }
+  }
 
   useEffect(() => {
     if (!panel) {
@@ -1506,6 +1598,82 @@ function Titlebar({
           >
             <div className="popover-heading">
               <strong>应用设置</strong>
+            </div>
+            <div className="dota-path-setting">
+              <div className="dota-path-heading">
+                <span>
+                  <Gamepad2 />
+                  <strong>Dota 2 程序路径</strong>
+                </span>
+                <small className={capabilities.dota2Found ? "ready" : "missing"}>
+                  {capabilities.dota2PathSource === "custom"
+                    ? "用户指定"
+                    : capabilities.dota2PathSource === "automatic"
+                      ? "自动检测"
+                      : "未找到"}
+                </small>
+              </div>
+              <small className="dota-path-help">
+                每台电脑单独保存。请选择游戏目录中的 dota2.exe。
+              </small>
+              <div className="dota-path-input-row">
+                <input
+                  type="text"
+                  value={dota2PathDraft}
+                  placeholder="例如 F:\\SteamLibrary\\...\\win64\\dota2.exe"
+                  title={dota2PathDraft}
+                  disabled={configurationBlocked || dota2PathBusy}
+                  onChange={(event) => {
+                    setDota2PathDraft(event.target.value);
+                    setDota2PathError("");
+                    setDota2PathFeedback("");
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      void saveDota2Path(dota2PathDraft);
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  title="浏览并选择 dota2.exe"
+                  aria-label="浏览并选择 dota2.exe"
+                  disabled={configurationBlocked || dota2PathBusy}
+                  onClick={() => void chooseDota2Path()}
+                >
+                  <FolderOpen />
+                </button>
+              </div>
+              <div className="dota-path-actions">
+                <button
+                  type="button"
+                  disabled={
+                    configurationBlocked ||
+                    dota2PathBusy ||
+                    !dota2PathDraft.trim()
+                  }
+                  onClick={() => void saveDota2Path(dota2PathDraft)}
+                >
+                  {dota2PathBusy ? <LoaderCircle className="spin" /> : <Check />}
+                  <span>应用路径</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={configurationBlocked || dota2PathBusy}
+                  onClick={() => void resetDota2Path()}
+                >
+                  <RotateCcw />
+                  <span>恢复自动检测</span>
+                </button>
+              </div>
+              {dota2PathFeedback && (
+                <small className="dota-path-feedback success">
+                  {dota2PathFeedback}
+                </small>
+              )}
+              {dota2PathError && (
+                <small className="dota-path-feedback error">{dota2PathError}</small>
+              )}
             </div>
             <label className="setting-row">
               <span>

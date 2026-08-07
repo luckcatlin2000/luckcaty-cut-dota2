@@ -20,6 +20,8 @@ use tauri_plugin_updater::{Update, UpdaterExt};
 
 const EDIT_PLAN_SCHEMA_VERSION: &str = "d2h.edit-plan/1.5";
 const LEGACY_EDIT_PLAN_SCHEMA_VERSIONS: [&str; 2] = ["d2h.edit-plan/1.4", "d2h.edit-plan/1.3"];
+const DOTA2_SETTINGS_SCHEMA_VERSION: &str = "d2h.dota2-path/1.0";
+const DOTA2_SETTINGS_FILE: &str = "dota2-path.json";
 
 const fn default_true() -> bool {
     true
@@ -28,10 +30,32 @@ const fn default_true() -> bool {
 #[derive(Clone)]
 struct AppState {
     jobs_root: PathBuf,
-    dota2_exe: Option<PathBuf>,
+    dota2_runtime: Arc<Mutex<Dota2Runtime>>,
+    dota2_settings_path: PathBuf,
     ffmpeg_exe: Option<PathBuf>,
     ffprobe_exe: Option<PathBuf>,
     render_runtime: Arc<Mutex<RenderRuntime>>,
+}
+
+#[derive(Clone)]
+struct Dota2Runtime {
+    executable: Option<PathBuf>,
+    source: Dota2PathSource,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum Dota2PathSource {
+    Automatic,
+    Custom,
+    Missing,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Dota2PathSettings {
+    schema_version: String,
+    executable_path: String,
 }
 
 #[derive(Default)]
@@ -82,6 +106,8 @@ struct Capabilities {
     render_reason: Option<String>,
     jobs_root: String,
     recommended_replay_directory: Option<String>,
+    dota2_path: Option<String>,
+    dota2_path_source: Dota2PathSource,
 }
 
 #[derive(Serialize)]
@@ -274,9 +300,44 @@ struct StoredQcReport {
 
 #[tauri::command]
 fn get_capabilities(state: State<'_, AppState>) -> Capabilities {
+    capabilities_for_state(&state)
+}
+
+#[tauri::command]
+fn set_dota2_executable(
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Capabilities, String> {
+    let runtime = match path {
+        Some(path) => {
+            let executable = validate_dota2_executable(Path::new(path.trim().trim_matches('"')))?;
+            persist_dota2_path(&state.dota2_settings_path, Some(&executable))?;
+            Dota2Runtime {
+                executable: Some(executable),
+                source: Dota2PathSource::Custom,
+            }
+        }
+        None => {
+            persist_dota2_path(&state.dota2_settings_path, None)?;
+            automatic_dota2_runtime()
+        }
+    };
+    *state
+        .dota2_runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime;
+    Ok(capabilities_for_state(&state))
+}
+
+fn capabilities_for_state(state: &AppState) -> Capabilities {
     let ffmpeg_found = state.ffmpeg_exe.is_some();
     let ffprobe_found = state.ffprobe_exe.is_some();
-    let dota2_found = state.dota2_exe.is_some();
+    let dota2_runtime = state
+        .dota2_runtime
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let dota2_found = dota2_runtime.executable.is_some();
     let render_ready = ffmpeg_found && ffprobe_found && dota2_found;
     let render_reason = if render_ready {
         None
@@ -295,11 +356,15 @@ fn get_capabilities(state: State<'_, AppState>) -> Capabilities {
         dota2_found,
         render_reason,
         jobs_root: state.jobs_root.display().to_string(),
-        recommended_replay_directory: state
-            .dota2_exe
+        recommended_replay_directory: dota2_runtime
+            .executable
             .as_deref()
             .and_then(replay_directory_from_dota2)
             .map(|path| path.display().to_string()),
+        dota2_path: dota2_runtime
+            .executable
+            .map(|path| path.display().to_string()),
+        dota2_path_source: dota2_runtime.source,
     }
 }
 
@@ -1174,7 +1239,10 @@ fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest,
         job_dir,
         source_replay: PathBuf::from(manifest.source.path),
         dota2_exe: state
-            .dota2_exe
+            .dota2_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .executable
             .clone()
             .ok_or_else(|| "未找到 Dota 2，当前只能分析录像。".to_string())?,
         ffmpeg_exe: state
@@ -1271,6 +1339,73 @@ fn source_name(path: &str) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or(path)
         .to_string()
+}
+
+fn validate_dota2_executable(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("请输入 dota2.exe 的完整路径，或使用浏览按钮选择。".to_string());
+    }
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("dota2.exe"));
+    if !valid_name {
+        return Err("请选择 Dota 2 的 dota2.exe 文件。".to_string());
+    }
+    if !path.is_file() {
+        return Err("这个 dota2.exe 不存在，请检查路径或重新选择。".to_string());
+    }
+    Ok(path.to_path_buf())
+}
+
+fn persist_dota2_path(settings_path: &Path, executable: Option<&Path>) -> Result<(), String> {
+    if let Some(executable) = executable {
+        if let Some(parent) = settings_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let settings = Dota2PathSettings {
+            schema_version: DOTA2_SETTINGS_SCHEMA_VERSION.to_string(),
+            executable_path: executable.display().to_string(),
+        };
+        let mut bytes = serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?;
+        bytes.push(b'\n');
+        fs::write(settings_path, bytes).map_err(|error| error.to_string())
+    } else {
+        match fs::remove_file(settings_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+fn configured_dota2_runtime(settings_path: &Path) -> Option<Dota2Runtime> {
+    let settings = read_json::<Dota2PathSettings>(settings_path).ok()?;
+    if settings.schema_version != DOTA2_SETTINGS_SCHEMA_VERSION {
+        return None;
+    }
+    let executable = validate_dota2_executable(Path::new(&settings.executable_path)).ok()?;
+    Some(Dota2Runtime {
+        executable: Some(executable),
+        source: Dota2PathSource::Custom,
+    })
+}
+
+fn automatic_dota2_runtime() -> Dota2Runtime {
+    match find_dota2() {
+        Some(executable) => Dota2Runtime {
+            executable: Some(executable),
+            source: Dota2PathSource::Automatic,
+        },
+        None => Dota2Runtime {
+            executable: None,
+            source: Dota2PathSource::Missing,
+        },
+    }
+}
+
+fn resolve_dota2_runtime(settings_path: &Path) -> Dota2Runtime {
+    configured_dota2_runtime(settings_path).unwrap_or_else(automatic_dota2_runtime)
 }
 
 fn find_dota2() -> Option<PathBuf> {
@@ -1382,6 +1517,7 @@ pub fn run() {
                 .and_then(|path| path.parent().map(Path::to_path_buf))
                 .unwrap_or_else(|| root.clone());
             let resource_dir = app.path().resource_dir()?;
+            let app_local_data_dir = app.path().app_local_data_dir()?;
             let jobs_root =
                 if let Some(configured_root) = env::var_os("D2H_PROJECT_ROOT").map(PathBuf::from) {
                     configured_root.join("jobs")
@@ -1392,9 +1528,10 @@ pub fn run() {
                 } else if cfg!(debug_assertions) {
                     root.join("jobs")
                 } else {
-                    app.path().app_local_data_dir()?.join("jobs")
+                    app_local_data_dir.join("jobs")
                 };
             fs::create_dir_all(&jobs_root)?;
+            fs::create_dir_all(&app_local_data_dir)?;
             app.asset_protocol_scope()
                 .allow_directory(&jobs_root, true)?;
             let ffmpeg_exe = find_media_tool(
@@ -1411,9 +1548,11 @@ pub fn run() {
                 &resource_dir,
                 &root,
             );
+            let dota2_settings_path = app_local_data_dir.join(DOTA2_SETTINGS_FILE);
             app.manage(AppState {
                 jobs_root,
-                dota2_exe: find_dota2(),
+                dota2_runtime: Arc::new(Mutex::new(resolve_dota2_runtime(&dota2_settings_path))),
+                dota2_settings_path,
                 ffmpeg_exe,
                 ffprobe_exe,
                 render_runtime: Arc::new(Mutex::new(RenderRuntime::default())),
@@ -1422,6 +1561,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_capabilities,
+            set_dota2_executable,
             resolve_replay_by_id,
             get_recent_jobs,
             analyze_dem,
@@ -1441,10 +1581,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
+        DOTA2_SETTINGS_FILE, DOTA2_SETTINGS_SCHEMA_VERSION, Dota2PathSettings, Dota2PathSource,
         EDIT_PLAN_SCHEMA_VERSION, EditPlanClip, EditPlanDocument, EditPlanMode, EditPlanSlot,
-        load_edit_plan, manual_render_settings, mark_job_recent, normalize_user_camera_mode,
-        replay_directory_from_dota2, resolve_replay_by_id, sanitize_update_notes, valid_clip_id,
-        valid_job_id, valid_replay_id, validate_edit_plan_take_groups,
+        configured_dota2_runtime, load_edit_plan, manual_render_settings, mark_job_recent,
+        normalize_user_camera_mode, persist_dota2_path, replay_directory_from_dota2,
+        resolve_replay_by_id, sanitize_update_notes, valid_clip_id, valid_job_id, valid_replay_id,
+        validate_dota2_executable, validate_edit_plan_take_groups,
     };
     use d2_highlights_renderer::{
         BgmMode, CameraStyle, ClipCameraMode, RenderSettings, RenderTakeRole,
@@ -1511,6 +1653,42 @@ mod tests {
             replay_directory_from_dota2(&path),
             Some(game_directory.join("dota").join("replays"))
         );
+    }
+
+    #[test]
+    fn custom_dota2_path_is_validated_and_persisted_per_machine() {
+        let local_data = tempdir().expect("create app local data");
+        let executable = local_data.path().join("custom-steam").join("dota2.exe");
+        fs::create_dir_all(executable.parent().expect("dota parent"))
+            .expect("create Dota directory");
+        fs::write(&executable, b"fixture").expect("create Dota executable fixture");
+        let settings_path = local_data.path().join(DOTA2_SETTINGS_FILE);
+
+        let validated = validate_dota2_executable(&executable).expect("validate Dota path");
+        persist_dota2_path(&settings_path, Some(&validated)).expect("persist Dota path");
+        let settings: Dota2PathSettings =
+            super::read_json(&settings_path).expect("read Dota path settings");
+        let runtime = configured_dota2_runtime(&settings_path).expect("load custom Dota path");
+
+        assert_eq!(settings.schema_version, DOTA2_SETTINGS_SCHEMA_VERSION);
+        assert_eq!(Path::new(&settings.executable_path), executable);
+        assert_eq!(runtime.executable.as_deref(), Some(executable.as_path()));
+        assert!(matches!(runtime.source, Dota2PathSource::Custom));
+    }
+
+    #[test]
+    fn custom_dota2_path_rejects_other_files_and_can_be_reset() {
+        let local_data = tempdir().expect("create app local data");
+        let wrong_executable = local_data.path().join("steam.exe");
+        fs::write(&wrong_executable, b"fixture").expect("create wrong executable fixture");
+        assert!(validate_dota2_executable(&wrong_executable).is_err());
+
+        let dota2_executable = local_data.path().join("dota2.exe");
+        fs::write(&dota2_executable, b"fixture").expect("create Dota executable fixture");
+        let settings_path = local_data.path().join(DOTA2_SETTINGS_FILE);
+        persist_dota2_path(&settings_path, Some(&dota2_executable)).expect("persist Dota path");
+        persist_dota2_path(&settings_path, None).expect("reset Dota path");
+        assert!(!settings_path.exists());
     }
 
     #[test]

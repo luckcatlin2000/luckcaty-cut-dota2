@@ -15,6 +15,8 @@ export interface Capabilities {
   renderReason: string | null;
   jobsRoot: string;
   recommendedReplayDirectory: string | null;
+  dota2Path: string | null;
+  dota2PathSource: "automatic" | "custom" | "missing";
 }
 
 export interface ReplayLookupResult {

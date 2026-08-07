@@ -235,6 +235,12 @@ svg {
   user-select: text;
 }
 
+.settings-popover {
+  width: min(420px, calc(100vw - 170px));
+  max-height: calc(100vh - 64px);
+  overflow-y: auto;
+}
+
 .popover-heading {
   display: flex;
   min-height: 43px;
@@ -306,6 +312,150 @@ svg {
 .popover-empty svg {
   width: 20px;
   height: 20px;
+}
+
+.dota-path-setting {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line-soft);
+  background: #fffafa;
+}
+
+.dota-path-heading,
+.dota-path-heading > span {
+  display: flex;
+  align-items: center;
+}
+
+.dota-path-heading {
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.dota-path-heading > span {
+  min-width: 0;
+  gap: 6px;
+}
+
+.dota-path-heading svg {
+  width: 15px;
+  height: 15px;
+  color: var(--pink-strong);
+}
+
+.dota-path-heading strong {
+  font-size: 12px;
+}
+
+.dota-path-heading > small {
+  flex: none;
+  padding: 3px 7px;
+  border: 1px solid #d8cbd1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.dota-path-heading > small.ready {
+  border-color: #b8e0ce;
+  background: #f0fbf6;
+  color: #38845f;
+}
+
+.dota-path-heading > small.missing {
+  border-color: #efc8d1;
+  background: #fff5f7;
+  color: #b45b70;
+}
+
+.dota-path-help {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 15px;
+}
+
+.dota-path-input-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  gap: 6px;
+}
+
+.dota-path-input-row input {
+  min-width: 0;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid #ddcfd5;
+  border-radius: 6px;
+  outline: none;
+  background: #ffffff;
+  color: var(--text);
+  font-size: 10px;
+}
+
+.dota-path-input-row input:focus {
+  border-color: var(--pink);
+  box-shadow: 0 0 0 2px rgb(239 118 151 / 12%);
+}
+
+.dota-path-input-row > button,
+.dota-path-actions button {
+  display: inline-flex;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border: 1px solid #e7a9b9;
+  border-radius: 6px;
+  background: #ffffff;
+  color: var(--pink-strong);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.dota-path-input-row > button:hover,
+.dota-path-actions button:hover {
+  border-color: var(--pink);
+  background: var(--pink-soft);
+}
+
+.dota-path-input-row > button:disabled,
+.dota-path-actions button:disabled,
+.dota-path-input-row input:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.dota-path-input-row svg,
+.dota-path-actions svg {
+  width: 14px;
+  height: 14px;
+}
+
+.dota-path-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.dota-path-feedback {
+  padding: 7px 8px;
+  border-radius: 6px;
+  font-size: 10px;
+  line-height: 15px;
+  overflow-wrap: anywhere;
+}
+
+.dota-path-feedback.success {
+  background: #effaf5;
+  color: #38845f;
+}
+
+.dota-path-feedback.error {
+  background: #fff1f4;
+  color: #b34b65;
 }
 
 .setting-row {
