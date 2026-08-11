@@ -150,13 +150,20 @@ interface EditorPlanSnapshot {
   renderSettings: RenderSettings;
 }
 
+interface ReanalysisReset {
+  hero: string;
+  ruleIds: HighlightRuleId[];
+  renderSettings: RenderSettings;
+  wtfPlan: EditorPlanSnapshot;
+}
+
 const isTauriRuntime = "__TAURI_INTERNALS__" in window;
 const appWindow = isTauriRuntime ? getCurrentWindow() : null;
 const developmentFixtureEnabled =
   import.meta.env.DEV &&
   new URLSearchParams(window.location.search).get("fixture") === "mirana";
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
-const fallbackAppVersion = "1.9.5";
+const fallbackAppVersion = "1.9.6";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,
@@ -251,6 +258,7 @@ function App() {
   const [replayId, setReplayId] = useState("");
   const [replayLookupBusy, setReplayLookupBusy] = useState(false);
   const [replayLookupError, setReplayLookupError] = useState("");
+  const reanalysisResetRef = useRef<ReanalysisReset | null>(null);
 
   useEffect(() => {
     if (!developmentFixtureEnabled) {
@@ -399,11 +407,18 @@ function App() {
     }
 
     let disposed = false;
-    const initialClips = createClipEdits(result);
-    const initialSelection = inferHighlightSelection(
-      result.highlights.candidates,
-      initialClips,
-    );
+    const reanalysisReset = reanalysisResetRef.current;
+    reanalysisResetRef.current = null;
+    const initialClips = reanalysisReset
+      ? createHeroHighlightClips(
+          result,
+          reanalysisReset.hero,
+          reanalysisReset.ruleIds,
+        )
+      : createClipEdits(result);
+    const initialSelection = reanalysisReset
+      ? { hero: reanalysisReset.hero, ruleIds: reanalysisReset.ruleIds }
+      : inferHighlightSelection(result.highlights.candidates, initialClips);
     const initialWorkspace: Record<EditorPlanMode, EditorPlanSnapshot> = {
       default: {
         clipEdits: initialClips,
@@ -411,9 +426,9 @@ function App() {
         highlightHero: initialSelection.hero,
         highlightRuleIds: initialSelection.ruleIds,
         sourceStoryId: null,
-        renderSettings: defaultRenderSettings,
+        renderSettings: reanalysisReset?.renderSettings ?? defaultRenderSettings,
       },
-      wtf: createEmptyPlanSnapshot(),
+      wtf: reanalysisReset?.wtfPlan ?? createEmptyPlanSnapshot(),
     };
     setPlanSlots(initialWorkspace);
     setEditorMode("default");
@@ -423,25 +438,53 @@ function App() {
     setRenderResult(null);
     setRenderError("");
     if (isTauriRuntime) {
-      void invoke<LoadedEditPlan | null>("get_edit_plan", {
-        jobId: result.job_id,
-      })
-        .then((saved) => {
-          if (!disposed && saved) {
-            const savedWorkspace = createSavedPlanWorkspace(
-              result,
-              saved,
-              initialWorkspace.default,
-            );
-            const activeMode = saved.activeMode;
-            setPlanSlots(savedWorkspace);
-            setEditorMode(activeMode);
-            applyPlanSnapshot(savedWorkspace[activeMode]);
-          }
+      if (reanalysisReset) {
+        void invoke<SaveEditPlanResult>("save_edit_plan", {
+          request: {
+            jobId: result.job_id,
+            activeMode: "default",
+            plans: (["default", "wtf"] as const).map((mode) =>
+              toEditPlanSlot(mode, initialWorkspace[mode]),
+            ),
+          },
         })
-        .catch(() => {
-          // A missing or stale optional edit plan must not block replay analysis.
-        });
+          .then((saved) => {
+            if (!disposed) {
+              const message = `已恢复${heroLabel(reanalysisReset.hero)}的 ${saved.selectedClipCount} 段完整高光，原剪辑方案已备份。`;
+              setPlanFeedback(message);
+              setNotice({
+                kind: "success",
+                title: "重新分析完成",
+                message,
+              });
+            }
+          })
+          .catch((reason: unknown) => {
+            if (!disposed) {
+              setPlanFeedback(toErrorMessage(reason));
+            }
+          });
+      } else {
+        void invoke<LoadedEditPlan | null>("get_edit_plan", {
+          jobId: result.job_id,
+        })
+          .then((saved) => {
+            if (!disposed && saved) {
+              const savedWorkspace = createSavedPlanWorkspace(
+                result,
+                saved,
+                initialWorkspace.default,
+              );
+              const activeMode = saved.activeMode;
+              setPlanSlots(savedWorkspace);
+              setEditorMode(activeMode);
+              applyPlanSnapshot(savedWorkspace[activeMode]);
+            }
+          })
+          .catch(() => {
+            // A missing or stale optional edit plan must not block replay analysis.
+          });
+      }
       void invoke<RenderResult | null>("get_latest_render", {
         jobId: result.job_id,
       })
@@ -603,9 +646,27 @@ function App() {
     }
   }
 
-  async function runAnalysis(path = selectedPath) {
+  async function runAnalysis(path = selectedPath, resetEditPlan = false) {
     if (!path || busy) {
       return;
+    }
+    if (resetEditPlan) {
+      const inferredHero = result
+        ? inferHighlightSelection(result.highlights.candidates, clipEdits).hero
+        : "";
+      reanalysisResetRef.current = {
+        hero:
+          highlightHero ||
+          inferredHero ||
+          result?.replay.players[0]?.hero_name ||
+          "",
+        ruleIds: normalizeHighlightRuleIds(highlightRuleIds),
+        renderSettings,
+        wtfPlan:
+          editorMode === "wtf" ? currentPlanSnapshot() : planSlots.wtf,
+      };
+    } else {
+      reanalysisResetRef.current = null;
     }
     setView("workbench");
     setBusy(true);
@@ -632,6 +693,7 @@ function App() {
       };
       const summary = await invoke<AnalysisSummary>("analyze_dem", {
         demPath: path,
+        resetEditPlan,
         onProgress: channel,
       });
       setResult(summary);
@@ -654,6 +716,7 @@ function App() {
         });
       }
     } catch (reason: unknown) {
+      reanalysisResetRef.current = null;
       const message = toErrorMessage(reason);
       setError(message);
       if (completionNoticeEnabled) {
@@ -670,6 +733,19 @@ function App() {
       });
     } finally {
       setBusy(false);
+    }
+  }
+
+  function confirmReanalysis() {
+    if (!result) {
+      void runAnalysis();
+      return;
+    }
+    const confirmed = window.confirm(
+      "重新分析会恢复当前主角的完整高光候选，并替换现在的删减方案。原剪辑方案会安全备份，是否继续？",
+    );
+    if (confirmed) {
+      void runAnalysis(selectedPath, true);
     }
   }
 
@@ -1303,7 +1379,7 @@ function App() {
           busy={busy}
           renderReady={capabilities.renderReady}
           onImport={openImportDialog}
-          onAnalyze={() => void runAnalysis()}
+          onAnalyze={confirmReanalysis}
           onOpenMovieSetup={() => setMovieSetupOpen(true)}
         />
 
@@ -3278,8 +3354,8 @@ function ResultsView({
                       player.game_team === 3 ? "dire" : ""
                     }`}
                     key={`${player.slot}-${player.hero_name}`}
-                    title={`${teamLabel(player.game_team)} · 玩家位 ${
-                      player.slot + 1
+                    title={`${teamLabel(player.game_team)} · ${
+                      player.player_name || `玩家位 ${player.slot + 1}`
                     }`}
                     onClick={() => onSelectHighlightHero(player.hero_name)}
                   >
@@ -4550,6 +4626,7 @@ function replayPlayers(result: AnalysisSummary): ReplayPlayer[] {
   ).map((hero_name, slot) => ({
     slot,
     hero_name,
+    player_name: null,
     game_team: null,
     is_fake_client: false,
   }));

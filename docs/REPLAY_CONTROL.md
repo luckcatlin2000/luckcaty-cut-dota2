@@ -5,6 +5,7 @@
 - 只连接 `127.0.0.1:29000`。
 - 只控制项目以 `-insecure -vconsole -console` 启动的离线 Dota 2。
 - 不修改游戏二进制、Steam 永久启动项或用户视频配置。
+- 不读取、复制、解析或修改 Steam/Dota 2 账户与用户配置，不启动、登录或控制 Steam。
 - 命令必须通过 Rust 白名单，禁止换行、NUL 和任意命令拼接。
 - 拒绝控制用户已经运行的 Dota 2。
 - 任务结束后只关闭本项目启动的 PID，并确认 TCP `29000` 不再监听。
@@ -63,7 +64,9 @@ pwsh -NoProfile -File .\scripts\camera-showcase.ps1 -DotaPid <app-owned-pid>
 
 ## 画面与声音
 
-- 干净画面使用 HUD、鼠标和 Panorama 隐藏命令。
+- 普通画面只发送 `dota_spectator_options_enabled 0` 收起右上角回放控制模块，不发送小地图位置、大小、HUD 翻转或其他用户偏好命令。
+- 普通画面使用 Dota 2 原生昵称和击杀栏，不用 ASS、`drawtext`、遮罩或其他后期图层替换。导出前用户需手动打开并登录 Steam，软件只检查 `steam.exe` 是否运行。
+- 干净画面在普通画面命令之上使用 HUD、鼠标和 Panorama 隐藏命令，且不需要昵称上下文。
 - 当前渲染器调用 Dota 2 原生 `startmovie/endmovie` 生成固定帧率 JPG 和 WAV。
 - FFmpeg 只负责编码、按顺序拼接、游戏原声处理和 QC。
 - 不添加 BGM、配音、音效、自动慢动作或结尾回看。

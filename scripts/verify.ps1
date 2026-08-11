@@ -25,6 +25,24 @@ try {
         throw 'CHANGELOG.md must not duplicate static author metadata from application settings.'
     }
 
+    $runtimeSourceRoots = @(
+        (Join-Path $projectRoot 'crates'),
+        (Join-Path $projectRoot 'apps\d2-highlights-desktop\src-tauri\src')
+    )
+    $runtimeSourceFiles = $runtimeSourceRoots |
+        ForEach-Object { Get-ChildItem -LiteralPath $_ -Recurse -File -Include '*.rs' }
+    $sensitiveSteamPattern = `
+        '(?i)(userdata|user_convars|loginusers(?:\.vdf)?|ssfn|steam_?id|webcookie|' +
+        'access_?token|refresh_?token|password|steamguard)'
+    $sensitiveSteamMatches = $runtimeSourceFiles |
+        Select-String -Pattern $sensitiveSteamPattern
+    if ($sensitiveSteamMatches) {
+        $locations = $sensitiveSteamMatches |
+            ForEach-Object { "$($_.Path):$($_.LineNumber)" } |
+            Sort-Object -Unique
+        throw "Runtime source must not read or retain Steam account data: $($locations -join ', ')"
+    }
+
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (
         Join-Path $projectRoot 'skills\dota2-replay-camera-director\scripts\validate-camera-plan.ps1'
     ) -SelfTest

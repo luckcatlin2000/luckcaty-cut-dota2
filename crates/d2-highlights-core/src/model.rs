@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
-pub const TIMELINE_SCHEMA_VERSION: &str = "1.2";
+pub const TIMELINE_SCHEMA_VERSION: &str = "1.3";
 pub const HIGHLIGHT_SCHEMA_VERSION: &str = "1.4";
 pub const DIRECTOR_SCHEMA_VERSION: &str = "1.4";
 pub const STORY_SCHEMA_VERSION: &str = "1.2";
@@ -52,6 +52,8 @@ pub struct ParserIdentity {
 pub struct ReplayPlayer {
     pub slot: u8,
     pub hero_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub player_name: Option<String>,
     pub game_team: Option<i32>,
     pub is_fake_client: bool,
 }
@@ -486,6 +488,7 @@ mod tests {
                 players: vec![ReplayPlayer {
                     slot: 0,
                     hero_name: "npc_dota_hero_mirana".to_string(),
+                    player_name: Some("Player A".to_string()),
                     game_team: Some(2),
                     is_fake_client: false,
                 }],
@@ -503,6 +506,23 @@ mod tests {
         assert_eq!(decoded.replay.game_winner, Some(2));
         assert_eq!(decoded.replay.players[0].slot, 0);
         assert_eq!(decoded.replay.players[0].hero_name, "npc_dota_hero_mirana");
+        assert_eq!(
+            decoded.replay.players[0].player_name.as_deref(),
+            Some("Player A")
+        );
+    }
+
+    #[test]
+    fn old_replay_player_without_player_name_remains_readable() {
+        let json = br#"{
+            "slot": 0,
+            "hero_name": "npc_dota_hero_mirana",
+            "game_team": 2,
+            "is_fake_client": false
+        }"#;
+        let decoded: ReplayPlayer = serde_json::from_slice(json).unwrap();
+
+        assert_eq!(decoded.player_name, None);
     }
 
     #[test]

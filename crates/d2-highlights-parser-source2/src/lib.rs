@@ -183,6 +183,7 @@ fn parse_combat_timeline_inner(
                     Some(ReplayPlayer {
                         slot: u8::try_from(slot).ok()?,
                         hero_name: hero_name.to_string(),
+                        player_name: decode_player_name(player.player_name.as_deref()),
                         game_team: player.game_team,
                         is_fake_client: player.is_fake_client.unwrap_or(false),
                     })
@@ -212,4 +213,38 @@ fn parse_combat_timeline_inner(
         temporary_trees,
         salutes,
     })
+}
+
+fn decode_player_name(bytes: Option<&[u8]>) -> Option<String> {
+    let decoded = String::from_utf8_lossy(bytes?);
+    let trimmed =
+        decoded.trim_matches(|character: char| character == '\0' || character.is_whitespace());
+    let cleaned = trimmed
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(64)
+        .collect::<String>();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_player_name;
+
+    #[test]
+    fn decodes_utf8_player_names_and_trims_demo_padding() {
+        assert_eq!(
+            decode_player_name(Some("  Player A\0\0".as_bytes())).as_deref(),
+            Some("Player A")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_names_and_removes_control_characters() {
+        assert_eq!(decode_player_name(Some(b" \0\r\n ")), None);
+        assert_eq!(
+            decode_player_name(Some(b"Luck\tCat")).as_deref(),
+            Some("LuckCat")
+        );
+    }
 }

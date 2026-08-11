@@ -29,7 +29,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 
 pub const RENDER_SCHEMA_VERSION: &str = "d2h.render/1.9";
 // Bump this whenever Dota capture commands or frame/audio encoding behavior changes.
-const CAPTURE_PIPELINE_VERSION: &str = "d2h.capture/1.9.5-hud-controls-1";
+const CAPTURE_PIPELINE_VERSION: &str = "d2h.capture/1.9.6-native-hud-12";
 const FRAME_RATE: u32 = 30;
 const CAPTURE_PREROLL_SECONDS: f32 = 1.0;
 const VCONSOLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -301,6 +301,10 @@ pub enum RenderError {
     Cancelled,
     #[error("Dota 2 已在运行。请先正常关闭客户端，再开始离线成片。")]
     DotaAlreadyRunning,
+    #[error(
+        "Steam 未运行。普通画面的 Dota 2 原生玩家昵称会显示为‘未知’。请手动打开并登录 Steam，等待连接稳定后再重试；本软件不会自动启动或登录 Steam。"
+    )]
+    SteamRequiredForNativeNames,
     #[error("找不到或无法运行 {0}。")]
     MissingTool(String),
     #[error("录像文件不存在：{0}")]
@@ -348,6 +352,9 @@ where
     check_command(&request.ffprobe_exe, &["-version"], "FFprobe")?;
     if dota_is_running()? {
         return Err(RenderError::DotaAlreadyRunning);
+    }
+    if native_player_names_require_steam(request.settings.clean_hud) && !steam_is_running()? {
+        return Err(RenderError::SteamRequiredForNativeNames);
     }
 
     let fingerprint = render_fingerprint(&request)?;
@@ -1543,13 +1550,17 @@ fn dota_game_dir(dota2_exe: &Path) -> Result<PathBuf, RenderError> {
 
 fn launch_dota(dota2_exe: &Path) -> Result<Child, RenderError> {
     Command::new(dota2_exe)
-        .args(["-insecure", "-vconsole", "-console", "-novid"])
+        .args(dota_launch_args())
         .current_dir(dota_game_dir(dota2_exe)?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map_err(|error| RenderError::Media(format!("无法启动 Dota 2：{error}")))
+}
+
+fn dota_launch_args() -> [&'static str; 4] {
+    ["-insecure", "-vconsole", "-console", "-novid"]
 }
 
 fn wait_for_vconsole(
@@ -1563,6 +1574,8 @@ fn wait_for_vconsole(
             return Err(RenderError::DotaExited);
         }
         if probe_vconsole(Duration::from_secs(2)).is_ok() {
+            // Dota can fatally race a second VConsole connection while the probe socket closes.
+            thread::sleep(Duration::from_secs(1));
             return Ok(());
         }
         thread::sleep(Duration::from_secs(1));
@@ -1649,17 +1662,43 @@ fn shutdown_dota(child: &mut Child) -> Option<String> {
 fn dota_is_running() -> Result<bool, RenderError> {
     #[cfg(windows)]
     {
-        let output = background_command("tasklist")
-            .args(["/FI", "IMAGENAME eq dota2.exe", "/FO", "CSV", "/NH"])
-            .output()?;
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .to_ascii_lowercase()
-            .contains("dota2.exe"))
+        windows_process_is_running("dota2.exe")
     }
     #[cfg(not(windows))]
     {
         Ok(false)
     }
+}
+
+fn native_player_names_require_steam(clean_hud: bool) -> bool {
+    !clean_hud
+}
+
+fn steam_is_running() -> Result<bool, RenderError> {
+    #[cfg(windows)]
+    {
+        windows_process_is_running("steam.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(true)
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_is_running(image_name: &str) -> Result<bool, RenderError> {
+    let output = background_command("tasklist")
+        .args([
+            "/FI",
+            &format!("IMAGENAME eq {image_name}"),
+            "/FO",
+            "CSV",
+            "/NH",
+        ])
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .to_ascii_lowercase()
+        .contains(&image_name.to_ascii_lowercase()))
 }
 
 fn collect_movie_files(root: &Path) -> Result<BTreeMap<PathBuf, u64>, RenderError> {
@@ -2358,6 +2397,7 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
                 players: vec![ReplayPlayer {
                     slot: 7,
                     hero_name: "npc_dota_hero_mirana".to_string(),
+                    player_name: Some("Player A".to_string()),
                     game_team: Some(3),
                     is_fake_client: false,
                 }],
@@ -2404,11 +2444,25 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
     }
 
     #[test]
+    fn dota_start_does_not_override_user_hud_preferences() {
+        assert_eq!(
+            super::dota_launch_args(),
+            ["-insecure", "-vconsole", "-console", "-novid"]
+        );
+    }
+
+    #[test]
     fn ordinary_feed_hides_only_replay_controls() {
         assert_eq!(
             hud_commands(false),
             vec!["dota_spectator_options_enabled 0".to_string()]
         );
+    }
+
+    #[test]
+    fn ordinary_feed_requires_steam_for_native_player_names() {
+        assert!(super::native_player_names_require_steam(false));
+        assert!(!super::native_player_names_require_steam(true));
     }
 
     #[test]

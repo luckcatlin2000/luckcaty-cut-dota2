@@ -494,6 +494,7 @@ fn get_recent_jobs(state: State<'_, AppState>) -> Result<Vec<RecentJob>, String>
 #[tauri::command]
 async fn analyze_dem(
     dem_path: String,
+    reset_edit_plan: bool,
     on_progress: Channel<AnalysisProgress>,
     state: State<'_, AppState>,
 ) -> Result<AnalysisSummary, String> {
@@ -504,11 +505,48 @@ async fn analyze_dem(
             let _ = on_progress.send(progress);
         })
         .map_err(|error| error.to_string())?;
+        if reset_edit_plan {
+            archive_edit_plan_for_reanalysis(&jobs_root, &summary.job_id)?;
+        }
         let _ = mark_job_recent(&jobs_root, &summary.job_id);
         Ok(summary)
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+fn archive_edit_plan_for_reanalysis(
+    jobs_root: &Path,
+    job_id: &str,
+) -> Result<Option<PathBuf>, String> {
+    if !valid_job_id(job_id) {
+        return Err("任务编号无效，请重新打开分析结果。".to_string());
+    }
+    let director_dir = jobs_root.join(job_id).join("director");
+    let source = director_dir.join("edit-plan.json");
+    if !source.is_file() {
+        return Ok(None);
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis();
+    let mut suffix = 0_u32;
+    let backup = loop {
+        let file_name = if suffix == 0 {
+            format!("edit-plan.before-reanalysis-{timestamp}.json")
+        } else {
+            format!("edit-plan.before-reanalysis-{timestamp}-{suffix}.json")
+        };
+        let candidate = director_dir.join(file_name);
+        if !candidate.exists() {
+            break candidate;
+        }
+        suffix += 1;
+    };
+    fs::rename(&source, &backup).map_err(|error| format!("备份当前剪辑方案失败：{error}"))?;
+    Ok(Some(backup))
 }
 
 #[tauri::command]
@@ -1667,8 +1705,8 @@ mod tests {
     use super::{
         ClipDurationMode, DOTA2_SETTINGS_FILE, DOTA2_SETTINGS_SCHEMA_VERSION, Dota2PathSettings,
         Dota2PathSource, EDIT_PLAN_SCHEMA_VERSION, EditPlanClip, EditPlanDocument, EditPlanMode,
-        EditPlanSlot, configured_dota2_runtime, load_edit_plan, manual_render_settings,
-        mark_job_recent, normalize_user_camera_mode, persist_dota2_path,
+        EditPlanSlot, archive_edit_plan_for_reanalysis, configured_dota2_runtime, load_edit_plan,
+        manual_render_settings, mark_job_recent, normalize_user_camera_mode, persist_dota2_path,
         replay_directory_from_dota2, resolve_replay_by_id, sanitize_update_notes, valid_clip_id,
         valid_job_id, valid_replay_id, validate_dota2_executable, validate_edit_plan_take_groups,
     };
@@ -1701,6 +1739,28 @@ mod tests {
 
         assert!(activity.last_opened_unix_seconds > 0);
         assert!(mark_job_recent(root.path(), "../outside").is_err());
+    }
+
+    #[test]
+    fn reanalysis_archives_the_existing_edit_plan_without_deleting_it() {
+        let root = tempdir().expect("create jobs root");
+        let job_id = "d2h-ff5145119d7415b3";
+        let director = root.path().join(job_id).join("director");
+        fs::create_dir_all(&director).expect("create director directory");
+        fs::write(director.join("edit-plan.json"), b"saved plan").expect("write edit plan");
+
+        let backup = archive_edit_plan_for_reanalysis(root.path(), job_id)
+            .expect("archive edit plan")
+            .expect("backup path");
+
+        assert!(!director.join("edit-plan.json").exists());
+        assert_eq!(fs::read(backup).expect("read backup"), b"saved plan");
+        assert!(
+            archive_edit_plan_for_reanalysis(root.path(), job_id)
+                .expect("archive absent plan")
+                .is_none()
+        );
+        assert!(archive_edit_plan_for_reanalysis(root.path(), "../outside").is_err());
     }
 
     #[test]

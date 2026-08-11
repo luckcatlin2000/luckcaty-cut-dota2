@@ -1067,6 +1067,7 @@ mod tests {
         replay.replay.players = vec![ReplayPlayer {
             slot: 0,
             hero_name: "npc_dota_hero_mirana".to_string(),
+            player_name: None,
             game_team: Some(3),
             is_fake_client: false,
         }];
@@ -1170,6 +1171,7 @@ mod tests {
         replay.replay.players = vec![ReplayPlayer {
             slot: 0,
             hero_name: "npc_dota_hero_mirana".to_string(),
+            player_name: None,
             game_team: Some(2),
             is_fake_client: false,
         }];
@@ -1456,12 +1458,14 @@ mod tests {
             ReplayPlayer {
                 slot: 0,
                 hero_name: "npc_dota_hero_windrunner".to_string(),
+                player_name: None,
                 game_team: Some(2),
                 is_fake_client: false,
             },
             ReplayPlayer {
                 slot: 5,
                 hero_name: "npc_dota_hero_hoodwink".to_string(),
+                player_name: None,
                 game_team: Some(3),
                 is_fake_client: false,
             },

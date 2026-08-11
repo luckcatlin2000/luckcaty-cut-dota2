@@ -46,6 +46,7 @@ export interface DemSource {
 export interface ReplayPlayer {
   slot: number;
   hero_name: string;
+  player_name?: string | null;
   game_team: number | null;
   is_fake_client: boolean;
 }

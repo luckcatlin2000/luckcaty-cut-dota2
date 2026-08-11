@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "猫猫的剪辑小助手",
-  "version": "1.9.5",
+  "version": "1.9.6",
   "identifier": "com.local.dota2.catcut",
   "build": {
     "beforeDevCommand": "npm run dev",
