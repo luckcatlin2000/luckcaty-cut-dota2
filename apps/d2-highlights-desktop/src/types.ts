@@ -295,6 +295,8 @@ export interface AnalysisSummary {
   reused_existing_job: boolean;
 }
 
+export type ClipDurationMode = "short" | "story";
+
 export interface EditPlanClip {
   clipId: string;
   candidateId: string;
@@ -303,6 +305,10 @@ export interface EditPlanClip {
   takeGroupId: string | null;
   takeRole: StoryTakeRole;
   includeInFinal: boolean;
+  durationMode: ClipDurationMode;
+  storyPreRollSeconds: number;
+  shortSourceStartSeconds: number;
+  shortSourceEndSeconds: number;
   sourceStartSeconds: number;
   sourceEndSeconds: number;
 }

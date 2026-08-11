@@ -9,6 +9,15 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> T {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
 
+fn ordinary_feed_requested() -> bool {
+    std::env::var("D2H_E2E_CLEAN_HUD")
+        .is_ok_and(|value| matches!(value.trim(), "0" | "false" | "False" | "FALSE"))
+}
+
+fn requested_hero() -> String {
+    std::env::var("D2H_E2E_HERO").unwrap_or_else(|_| "npc_dota_hero_mirana".to_string())
+}
+
 #[test]
 #[ignore = "launches an app-owned offline Dota 2 process"]
 fn real_dem_exports_synchronized_camera_assets_and_closes_dota() {
@@ -38,6 +47,7 @@ fn real_dem_exports_synchronized_camera_assets_and_closes_dota() {
     let source_start_seconds = candidate.peak_seconds - 2.5;
     let source_end_seconds = candidate.peak_seconds + 2.5;
     let take_group_id = Some("scene-e2e-01".to_string());
+    let view_hero = requested_hero();
     let request = RenderRequest {
         job_id: "d2h-render-e2e".to_string(),
         source_sha256: manifest.source.sha256,
@@ -51,7 +61,7 @@ fn real_dem_exports_synchronized_camera_assets_and_closes_dota() {
             RenderClip {
                 clip_id: "clip-e2e-player".to_string(),
                 candidate_id: candidate.id.clone(),
-                view_hero: Some("npc_dota_hero_mirana".to_string()),
+                view_hero: Some(view_hero.clone()),
                 camera_mode: ClipCameraMode::PlayerPerspective,
                 take_group_id: take_group_id.clone(),
                 take_role: RenderTakeRole::Primary,
@@ -65,7 +75,7 @@ fn real_dem_exports_synchronized_camera_assets_and_closes_dota() {
             RenderClip {
                 clip_id: "clip-e2e-close".to_string(),
                 candidate_id: candidate.id.clone(),
-                view_hero: Some("npc_dota_hero_mirana".to_string()),
+                view_hero: Some(view_hero),
                 camera_mode: ClipCameraMode::HeroChase,
                 take_group_id,
                 take_role: RenderTakeRole::Alternate,
@@ -79,7 +89,7 @@ fn real_dem_exports_synchronized_camera_assets_and_closes_dota() {
         ],
         settings: RenderSettings {
             camera_style: CameraStyle::AutoDirector,
-            clean_hud: true,
+            clean_hud: !ordinary_feed_requested(),
             slow_motion: false,
             replay_emphasis: false,
             bgm_mode: BgmMode::GameOnly,

@@ -38,6 +38,7 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "r_drawpanorama",
     "dota_spectator_hudhide",
     "dota_spectator_hudshow",
+    "dota_spectator_options_enabled",
     "dota_spectator_mode",
     "dota_spectator_hero_index",
     "dota_camera_center",
@@ -330,9 +331,6 @@ fn scheduled_command(
     }
 }
 
-// Source 2 VConsole2 wire framing was cross-checked against the MIT-licensed
-// references listed in THIRD_PARTY_NOTICES.md. This Rust implementation adds
-// project-specific validation and does not vendor either reference project.
 pub fn build_cmnd_packet(command: &str) -> Result<Vec<u8>, ReplayControlError> {
     validate_command(command)?;
     let command_bytes = command.as_bytes();
@@ -591,6 +589,7 @@ mod tests {
         for command in [
             "sv_cheats 1",
             "dota_spectator_hudhide",
+            "dota_spectator_options_enabled 0",
             "dota_hud_hide_mainhud 1",
             "dota_hud_hide_topbar 1",
             "dota_hud_hide_minimap 1",

@@ -28,6 +28,8 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 };
 
 pub const RENDER_SCHEMA_VERSION: &str = "d2h.render/1.9";
+// Bump this whenever Dota capture commands or frame/audio encoding behavior changes.
+const CAPTURE_PIPELINE_VERSION: &str = "d2h.capture/1.9.5-hud-controls-1";
 const FRAME_RATE: u32 = 30;
 const CAPTURE_PREROLL_SECONDS: f32 = 1.0;
 const VCONSOLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -851,11 +853,10 @@ where
     wait_for_seek(capture_start_tick, cancellation, child)?;
 
     let mut setup_commands = vec!["demo_timescale 1.000".to_string()];
-    if request.settings.clean_hud {
-        setup_commands.extend(clean_hud_commands());
-    }
     setup_commands.extend(camera_commands_for_clip(&request.timeline, clip));
+    setup_commands.extend(hud_commands(request.settings.clean_hud));
     send_commands(&setup_commands)?;
+    wait_with_cancel(Duration::from_millis(250), cancellation, child, |_| {})?;
 
     let before = collect_movie_files(movie_dir)?;
     let prefix = format!(
@@ -1342,9 +1343,9 @@ fn validate_request(request: &RenderRequest) -> Result<(), RenderError> {
             )));
         }
         let duration = clip.source_end_seconds - clip.source_start_seconds;
-        if !duration.is_finite() || !(1.0..=90.0).contains(&duration) {
+        if !duration.is_finite() || !(1.0..=100.0).contains(&duration) {
             return Err(RenderError::InvalidPlan(format!(
-                "{} 的时长必须在 1 到 90 秒之间",
+                "{} 的时长必须在 1 到 100 秒之间",
                 clip.clip_id
             )));
         }
@@ -1445,15 +1446,24 @@ fn validate_request(request: &RenderRequest) -> Result<(), RenderError> {
 }
 
 fn render_fingerprint(request: &RenderRequest) -> Result<String, RenderError> {
+    render_fingerprint_with_pipeline(request, CAPTURE_PIPELINE_VERSION)
+}
+
+fn render_fingerprint_with_pipeline(
+    request: &RenderRequest,
+    capture_pipeline: &str,
+) -> Result<String, RenderError> {
     #[derive(Serialize)]
     struct Fingerprint<'a> {
         schema: &'static str,
+        capture_pipeline: &'a str,
         source_sha256: &'a str,
         clips: &'a [RenderClip],
         settings: &'a RenderSettings,
     }
     let bytes = serde_json::to_vec(&Fingerprint {
         schema: RENDER_SCHEMA_VERSION,
+        capture_pipeline,
         source_sha256: &request.source_sha256,
         clips: &request.clips,
         settings: &request.settings,
@@ -1783,10 +1793,18 @@ fn camera_commands_for_clip(timeline: &TimelineDocument, clip: &RenderClip) -> V
     }
 }
 
+fn hud_commands(clean_hud: bool) -> Vec<String> {
+    let mut commands = vec!["dota_spectator_options_enabled 0".to_string()];
+    if clean_hud {
+        commands.push("dota_spectator_hudhide".to_string());
+        commands.extend(clean_hud_commands());
+    }
+    commands
+}
+
 fn clean_hud_commands() -> Vec<String> {
     [
         "sv_cheats 1",
-        "dota_spectator_hudhide",
         "dota_hud_hide_mainhud 1",
         "dota_hud_hide_topbar 1",
         "dota_hud_hide_minimap 1",
@@ -2091,10 +2109,10 @@ impl From<ReplayControlError> for RenderError {
 mod tests {
     use super::{
         BgmMode, CameraStyle, ClipCameraMode, RenderClip, RenderRequest, RenderSettings,
-        RenderTakeRole, available_output_stem, camera_commands_for_clip, clean_hud_commands,
-        concat_segments, encode_frame_sequence, export_source_assets, frame_count_for_duration,
-        hero_slot_for_clip, mix_final_audio, parse_db_value, probe_media, replay_output_stem,
-        run_qc, select_final_segments, source_asset_numbering, source_to_tick,
+        RenderTakeRole, available_output_stem, camera_commands_for_clip, concat_segments,
+        encode_frame_sequence, export_source_assets, frame_count_for_duration, hero_slot_for_clip,
+        hud_commands, mix_final_audio, parse_db_value, probe_media, replay_output_stem, run_qc,
+        select_final_segments, source_asset_numbering, source_to_tick,
     };
     use d2_highlights_core::{ParserIdentity, ReplayMetadata, ReplayPlayer, TimelineDocument};
 
@@ -2160,7 +2178,7 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
     #[test]
     fn output_names_follow_the_replay_and_never_replace_existing_files() {
         let temp = tempfile::tempdir().unwrap();
-        let replay = std::path::Path::new("fixtures/1234567890.dem");
+        let replay = std::path::Path::new(r"C:\replays\1234567890.dem");
         let stem = replay_output_stem(replay);
         assert_eq!(stem, "1234567890");
         assert_eq!(available_output_stem(temp.path(), &stem), "1234567890");
@@ -2370,9 +2388,10 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
 
     #[test]
     fn clean_feed_hides_each_dota_hud_layer() {
-        let commands = clean_hud_commands();
+        let commands = hud_commands(true);
 
         for expected in [
+            "dota_spectator_options_enabled 0",
             "dota_spectator_hudhide",
             "dota_hud_hide_mainhud 1",
             "dota_hud_hide_topbar 1",
@@ -2382,6 +2401,38 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
         ] {
             assert!(commands.iter().any(|command| command == expected));
         }
+    }
+
+    #[test]
+    fn ordinary_feed_hides_only_replay_controls() {
+        assert_eq!(
+            hud_commands(false),
+            vec!["dota_spectator_options_enabled 0".to_string()]
+        );
+    }
+
+    #[test]
+    fn capture_pipeline_revision_invalidates_segment_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = RenderRequest {
+            job_id: "d2h-cache-test".to_string(),
+            source_sha256: "fixture-sha256".to_string(),
+            job_dir: temp.path().to_path_buf(),
+            source_replay: temp.path().join("fixture.dem"),
+            dota2_exe: temp.path().join("dota2.exe"),
+            ffmpeg_exe: temp.path().join("ffmpeg.exe"),
+            ffprobe_exe: temp.path().join("ffprobe.exe"),
+            timeline: mirana_timeline(),
+            clips: vec![mirana_clip(ClipCameraMode::PlayerPerspective)],
+            settings: RenderSettings::default(),
+        };
+
+        let previous =
+            super::render_fingerprint_with_pipeline(&request, "d2h.capture/previous").unwrap();
+        let current =
+            super::render_fingerprint_with_pipeline(&request, "d2h.capture/current").unwrap();
+
+        assert_ne!(previous, current);
     }
 
     #[test]

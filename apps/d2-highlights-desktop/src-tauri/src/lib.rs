@@ -18,13 +18,18 @@ use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
-const EDIT_PLAN_SCHEMA_VERSION: &str = "d2h.edit-plan/1.5";
+const EDIT_PLAN_SCHEMA_VERSION: &str = "d2h.edit-plan/1.6";
+const DUAL_EDIT_PLAN_SCHEMA_VERSIONS: [&str; 1] = ["d2h.edit-plan/1.5"];
 const LEGACY_EDIT_PLAN_SCHEMA_VERSIONS: [&str; 2] = ["d2h.edit-plan/1.4", "d2h.edit-plan/1.3"];
 const DOTA2_SETTINGS_SCHEMA_VERSION: &str = "d2h.dota2-path/1.0";
 const DOTA2_SETTINGS_FILE: &str = "dota2-path.json";
 
 const fn default_true() -> bool {
     true
+}
+
+const fn default_story_pre_roll_seconds() -> f32 {
+    60.0
 }
 
 #[derive(Clone)]
@@ -152,6 +157,14 @@ enum EditPlanMode {
     Wtf,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ClipDurationMode {
+    #[default]
+    Short,
+    Story,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct EditPlanSlotInput {
@@ -184,6 +197,12 @@ struct EditPlanClipInput {
     take_role: RenderTakeRole,
     #[serde(default = "default_true")]
     include_in_final: bool,
+    #[serde(default)]
+    duration_mode: ClipDurationMode,
+    #[serde(default = "default_story_pre_roll_seconds")]
+    story_pre_roll_seconds: f32,
+    short_source_start_seconds: f32,
+    short_source_end_seconds: f32,
     source_start_seconds: f32,
     source_end_seconds: f32,
 }
@@ -220,6 +239,14 @@ struct EditPlanClip {
     take_role: RenderTakeRole,
     #[serde(default = "default_true")]
     include_in_final: bool,
+    #[serde(default)]
+    duration_mode: ClipDurationMode,
+    #[serde(default = "default_story_pre_roll_seconds")]
+    story_pre_roll_seconds: f32,
+    #[serde(default)]
+    short_source_start_seconds: Option<f32>,
+    #[serde(default)]
+    short_source_end_seconds: Option<f32>,
     source_start_seconds: f32,
     source_end_seconds: f32,
 }
@@ -277,6 +304,10 @@ struct LoadedEditPlanClip {
     take_group_id: Option<String>,
     take_role: RenderTakeRole,
     include_in_final: bool,
+    duration_mode: ClipDurationMode,
+    story_pre_roll_seconds: f32,
+    short_source_start_seconds: f32,
+    short_source_end_seconds: f32,
     source_start_seconds: f32,
     source_end_seconds: f32,
 }
@@ -614,11 +645,29 @@ fn build_edit_plan_slot(
             return Err(format!("候选 {} 的起止时间无效。", clip.candidate_id));
         }
         let duration = clip.source_end_seconds - clip.source_start_seconds;
-        if !(1.0..=90.0).contains(&duration) {
+        if !(1.0..=100.0).contains(&duration) {
             return Err(format!(
-                "片段 {} 的时长必须在 1 到 90 秒之间。",
+                "片段 {} 的时长必须在 1 到 100 秒之间。",
                 clip.clip_id
             ));
+        }
+        if !clip.story_pre_roll_seconds.is_finite()
+            || !(0.0..=90.0).contains(&clip.story_pre_roll_seconds)
+        {
+            return Err(format!(
+                "片段 {} 的剧情前置时长必须在 0 到 90 秒之间。",
+                clip.clip_id
+            ));
+        }
+        if !clip.short_source_start_seconds.is_finite()
+            || !clip.short_source_end_seconds.is_finite()
+            || clip.short_source_start_seconds < 0.0
+            || clip.short_source_end_seconds <= clip.short_source_start_seconds
+            || clip.short_source_end_seconds > timeline.replay.playback_time_seconds
+            || !(1.0..=100.0)
+                .contains(&(clip.short_source_end_seconds - clip.short_source_start_seconds))
+        {
+            return Err(format!("片段 {} 保存的短击杀时间无效。", clip.clip_id));
         }
         if let Some(hero) = clip.view_hero.as_deref() {
             let valid_hero = if timeline.replay.players.is_empty() {
@@ -650,6 +699,10 @@ fn build_edit_plan_slot(
             take_group_id: clip.take_group_id,
             take_role: clip.take_role,
             include_in_final: clip.include_in_final,
+            duration_mode: clip.duration_mode,
+            story_pre_roll_seconds: clip.story_pre_roll_seconds,
+            short_source_start_seconds: Some(clip.short_source_start_seconds),
+            short_source_end_seconds: Some(clip.short_source_end_seconds),
             source_start_seconds: clip.source_start_seconds,
             source_end_seconds: clip.source_end_seconds,
         });
@@ -728,6 +781,16 @@ fn validate_edit_plan_take_groups(clips: &[EditPlanClip]) -> Result<(), String> 
             if take.candidate_id != primary.candidate_id
                 || (take.source_start_seconds - primary.source_start_seconds).abs() > 0.001
                 || (take.source_end_seconds - primary.source_end_seconds).abs() > 0.001
+                || take.duration_mode != primary.duration_mode
+                || (take.story_pre_roll_seconds - primary.story_pre_roll_seconds).abs() > 0.001
+                || option_seconds_differ(
+                    take.short_source_start_seconds,
+                    primary.short_source_start_seconds,
+                )
+                || option_seconds_differ(
+                    take.short_source_end_seconds,
+                    primary.short_source_end_seconds,
+                )
             {
                 return Err(format!(
                     "素材场次 {group_id} 的所有机位必须对应同一事件和完全相同的时间段。"
@@ -736,6 +799,19 @@ fn validate_edit_plan_take_groups(clips: &[EditPlanClip]) -> Result<(), String> 
         }
     }
     Ok(())
+}
+
+fn option_seconds_differ(left: Option<f32>, right: Option<f32>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => (left - right).abs() > 0.001,
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+fn is_dual_edit_plan_schema(schema_version: &str) -> bool {
+    schema_version == EDIT_PLAN_SCHEMA_VERSION
+        || DUAL_EDIT_PLAN_SCHEMA_VERSIONS.contains(&schema_version)
 }
 
 #[tauri::command]
@@ -760,7 +836,7 @@ fn get_edit_plan(
 }
 
 fn load_edit_plan(document: EditPlanDocument) -> Option<LoadedEditPlan> {
-    if document.schema_version == EDIT_PLAN_SCHEMA_VERSION {
+    if is_dual_edit_plan_schema(&document.schema_version) {
         let has_default = document
             .plans
             .iter()
@@ -838,6 +914,14 @@ fn load_edit_plan_slot(plan: EditPlanSlot) -> LoadedEditPlanSlot {
                 take_group_id: clip.take_group_id,
                 take_role: clip.take_role,
                 include_in_final: clip.include_in_final,
+                duration_mode: clip.duration_mode,
+                story_pre_roll_seconds: clip.story_pre_roll_seconds,
+                short_source_start_seconds: clip
+                    .short_source_start_seconds
+                    .unwrap_or(clip.source_start_seconds),
+                short_source_end_seconds: clip
+                    .short_source_end_seconds
+                    .unwrap_or(clip.source_end_seconds),
                 source_start_seconds: clip.source_start_seconds,
                 source_end_seconds: clip.source_end_seconds,
             })
@@ -884,7 +968,7 @@ fn get_latest_render(
     let (fallback_segment_count, fallback_source_asset_count) =
         read_json::<EditPlanDocument>(&job_dir.join("director").join("edit-plan.json"))
             .map(|plan| {
-                let clips = if plan.schema_version == EDIT_PLAN_SCHEMA_VERSION {
+                let clips = if is_dual_edit_plan_schema(&plan.schema_version) {
                     plan.plans
                         .iter()
                         .find(|slot| slot.mode == plan.active_mode)
@@ -1186,7 +1270,7 @@ fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest,
         return Err("任务数据版本不一致，请重新分析录像。".to_string());
     }
 
-    let (edit_clips, edit_settings) = if edit_plan.schema_version == EDIT_PLAN_SCHEMA_VERSION {
+    let (edit_clips, edit_settings) = if is_dual_edit_plan_schema(&edit_plan.schema_version) {
         let active_plan = edit_plan
             .plans
             .iter()
@@ -1581,12 +1665,12 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        DOTA2_SETTINGS_FILE, DOTA2_SETTINGS_SCHEMA_VERSION, Dota2PathSettings, Dota2PathSource,
-        EDIT_PLAN_SCHEMA_VERSION, EditPlanClip, EditPlanDocument, EditPlanMode, EditPlanSlot,
-        configured_dota2_runtime, load_edit_plan, manual_render_settings, mark_job_recent,
-        normalize_user_camera_mode, persist_dota2_path, replay_directory_from_dota2,
-        resolve_replay_by_id, sanitize_update_notes, valid_clip_id, valid_job_id, valid_replay_id,
-        validate_dota2_executable, validate_edit_plan_take_groups,
+        ClipDurationMode, DOTA2_SETTINGS_FILE, DOTA2_SETTINGS_SCHEMA_VERSION, Dota2PathSettings,
+        Dota2PathSource, EDIT_PLAN_SCHEMA_VERSION, EditPlanClip, EditPlanDocument, EditPlanMode,
+        EditPlanSlot, configured_dota2_runtime, load_edit_plan, manual_render_settings,
+        mark_job_recent, normalize_user_camera_mode, persist_dota2_path,
+        replay_directory_from_dota2, resolve_replay_by_id, sanitize_update_notes, valid_clip_id,
+        valid_job_id, valid_replay_id, validate_dota2_executable, validate_edit_plan_take_groups,
     };
     use d2_highlights_renderer::{
         BgmMode, CameraStyle, ClipCameraMode, RenderSettings, RenderTakeRole,
@@ -1598,8 +1682,8 @@ mod tests {
 
     #[test]
     fn edit_plan_job_id_stays_inside_jobs_root() {
-        assert!(valid_job_id("d2h-0123456789abcdef"));
-        assert!(!valid_job_id("../d2h-0123456789abcdef"));
+        assert!(valid_job_id("d2h-ff5145119d7415b3"));
+        assert!(!valid_job_id("../d2h-ff5145119d7415b3"));
         assert!(!valid_job_id("d2h-.."));
         assert!(!valid_job_id("other-job"));
     }
@@ -1607,7 +1691,7 @@ mod tests {
     #[test]
     fn recent_job_activity_is_persisted_inside_the_job() {
         let root = tempdir().expect("create recent jobs root");
-        let job_id = "d2h-0123456789abcdef";
+        let job_id = "d2h-ff5145119d7415b3";
         fs::create_dir_all(root.path().join(job_id)).expect("create job directory");
 
         mark_job_recent(root.path(), job_id).expect("mark job recent");
@@ -1629,11 +1713,11 @@ mod tests {
 
     #[test]
     fn replay_ids_are_digits_only_and_path_safe() {
-        assert!(valid_replay_id("123456789"));
+        assert!(valid_replay_id("8918165123"));
         assert!(valid_replay_id("1"));
         assert!(!valid_replay_id(""));
-        assert!(!valid_replay_id("123456789.dem"));
-        assert!(!valid_replay_id("../123456789"));
+        assert!(!valid_replay_id("8918165123.dem"));
+        assert!(!valid_replay_id("../8918165123"));
         assert!(!valid_replay_id("123456789012345678901"));
     }
 
@@ -1694,17 +1778,17 @@ mod tests {
     #[test]
     fn replay_lookup_finds_a_valid_source2_dem() {
         let directory = tempdir().expect("create replay directory");
-        let replay_path = directory.path().join("123456789.dem");
+        let replay_path = directory.path().join("8918165123.dem");
         let mut replay = fs::File::create(&replay_path).expect("create replay");
         replay.write_all(b"PBDEMS2\0fixture").expect("write replay");
 
         let result = resolve_replay_by_id(
             directory.path().display().to_string(),
-            "123456789".to_string(),
+            "8918165123".to_string(),
         )
         .expect("resolve replay");
 
-        assert_eq!(result.replay_id, "123456789");
+        assert_eq!(result.replay_id, "8918165123");
         assert_eq!(Path::new(&result.path), replay_path);
     }
 
@@ -1713,10 +1797,10 @@ mod tests {
         let directory = tempdir().expect("create replay directory");
         let error = resolve_replay_by_id(
             directory.path().display().to_string(),
-            "987654321".to_string(),
+            "8916655598".to_string(),
         )
         .expect_err("missing replay must fail");
-        assert!(error.contains("987654321.dem"));
+        assert!(error.contains("8916655598.dem"));
     }
 
     #[test]
@@ -1836,6 +1920,44 @@ mod tests {
     }
 
     #[test]
+    fn version_1_5_dual_plan_loads_with_short_duration_defaults() {
+        let document: EditPlanDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": "d2h.edit-plan/1.5",
+            "source_sha256": "source",
+            "job_id": "d2h-0000000000000000",
+            "active_mode": "default",
+            "plans": [
+                {
+                    "mode": "default",
+                    "clips": [{
+                        "clip_id": "clip-player",
+                        "candidate_id": "hk-001",
+                        "view_hero": "npc_dota_hero_mirana",
+                        "camera_mode": "player_perspective",
+                        "take_group_id": "story-001",
+                        "take_role": "primary",
+                        "include_in_final": true,
+                        "source_start_seconds": 10.0,
+                        "source_end_seconds": 20.0
+                    }]
+                },
+                { "mode": "wtf", "clips": [] }
+            ],
+            "mode": "dual",
+            "updated_unix_seconds": 0
+        }))
+        .expect("deserialize 1.5 dual plan");
+
+        let loaded = load_edit_plan(document).expect("1.5 dual plan should load");
+        let clip = &loaded.plans[0].clips[0];
+
+        assert_eq!(clip.duration_mode, ClipDurationMode::Short);
+        assert_eq!(clip.story_pre_roll_seconds, 60.0);
+        assert_eq!(clip.short_source_start_seconds, 10.0);
+        assert_eq!(clip.short_source_end_seconds, 20.0);
+    }
+
+    #[test]
     fn dual_edit_plan_preserves_active_mode_and_both_slots() {
         let document = EditPlanDocument {
             schema_version: EDIT_PLAN_SCHEMA_VERSION.to_string(),
@@ -1911,6 +2033,10 @@ mod tests {
             take_group_id: Some("story-001".to_string()),
             take_role,
             include_in_final,
+            duration_mode: ClipDurationMode::Short,
+            story_pre_roll_seconds: 60.0,
+            short_source_start_seconds: Some(source_start_seconds),
+            short_source_end_seconds: Some(source_end_seconds),
             source_start_seconds,
             source_end_seconds,
         }

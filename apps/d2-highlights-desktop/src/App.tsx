@@ -81,11 +81,20 @@ import {
   parseHighlightRuleQuery,
 } from "./highlightRules";
 import type { HighlightRuleId } from "./highlightRules";
+import {
+  DEFAULT_STORY_PRE_ROLL_SECONDS,
+  MAX_CLIP_DURATION_SECONDS,
+  MAX_STORY_PRE_ROLL_SECONDS,
+  STORY_POST_ROLL_SECONDS,
+  killSequenceRange,
+  normalizeStoryDurationClips,
+} from "./storyDuration";
 import type {
   AnalysisProgress,
   AnalysisSummary,
   Capabilities,
   ClipCameraMode,
+  ClipDurationMode,
   EditPlanSlot,
   EditorPlanMode,
   EditPlanClip,
@@ -122,6 +131,10 @@ interface ClipEditState {
   takeGroupId: string | null;
   takeRole: StoryTakeRole;
   includeInFinal: boolean;
+  durationMode: ClipDurationMode;
+  storyPreRollSeconds: number;
+  shortStartSeconds: number;
+  shortEndSeconds: number;
   startSeconds: number;
   endSeconds: number;
 }
@@ -143,7 +156,7 @@ const developmentFixtureEnabled =
   import.meta.env.DEV &&
   new URLSearchParams(window.location.search).get("fixture") === "mirana";
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
-const fallbackAppVersion = "1.9.3";
+const fallbackAppVersion = "1.9.5";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,
@@ -668,12 +681,29 @@ function App() {
   function updateClipEdit(clipId: string, patch: Partial<ClipEditState>) {
     setClipEdits((current) => {
       const selected = current.find((clip) => clip.clipId === clipId);
+      if (!selected) {
+        return current;
+      }
+      const enrichedPatch: Partial<ClipEditState> = { ...patch };
+      if (selected.durationMode === "short") {
+        if (patch.startSeconds !== undefined) {
+          enrichedPatch.shortStartSeconds = patch.startSeconds;
+        }
+        if (patch.endSeconds !== undefined) {
+          enrichedPatch.shortEndSeconds = patch.endSeconds;
+        }
+      }
       const synchronizesTime =
         Boolean(selected?.takeGroupId) &&
-        ("startSeconds" in patch || "endSeconds" in patch);
-      return current.map((clip) => {
+        ("startSeconds" in enrichedPatch ||
+          "endSeconds" in enrichedPatch ||
+          "durationMode" in enrichedPatch ||
+          "storyPreRollSeconds" in enrichedPatch ||
+          "shortStartSeconds" in enrichedPatch ||
+          "shortEndSeconds" in enrichedPatch);
+      const updated = current.map((clip) => {
         if (clip.clipId === clipId) {
-          return { ...clip, ...patch };
+          return { ...clip, ...enrichedPatch };
         }
         if (
           synchronizesTime &&
@@ -681,16 +711,35 @@ function App() {
         ) {
           return {
             ...clip,
-            ...(patch.startSeconds === undefined
+            ...(enrichedPatch.startSeconds === undefined
               ? {}
-              : { startSeconds: patch.startSeconds }),
-            ...(patch.endSeconds === undefined
+              : { startSeconds: enrichedPatch.startSeconds }),
+            ...(enrichedPatch.endSeconds === undefined
               ? {}
-              : { endSeconds: patch.endSeconds }),
+              : { endSeconds: enrichedPatch.endSeconds }),
+            ...(enrichedPatch.durationMode === undefined
+              ? {}
+              : { durationMode: enrichedPatch.durationMode }),
+            ...(enrichedPatch.storyPreRollSeconds === undefined
+              ? {}
+              : { storyPreRollSeconds: enrichedPatch.storyPreRollSeconds }),
+            ...(enrichedPatch.shortStartSeconds === undefined
+              ? {}
+              : { shortStartSeconds: enrichedPatch.shortStartSeconds }),
+            ...(enrichedPatch.shortEndSeconds === undefined
+              ? {}
+              : { shortEndSeconds: enrichedPatch.shortEndSeconds }),
           };
         }
         return clip;
       });
+      return result
+        ? normalizeStoryDurationClips(
+            updated,
+            result.highlights.candidates,
+            result.replay.playback_time_seconds,
+          )
+        : updated;
     });
     setPlanFeedback("");
   }
@@ -822,6 +871,10 @@ function App() {
       takeGroupId: null,
       takeRole: "primary",
       includeInFinal: true,
+      durationMode: "short",
+      storyPreRollSeconds: DEFAULT_STORY_PRE_ROLL_SECONDS,
+      shortStartSeconds: roundFrame(baseStart),
+      shortEndSeconds: roundFrame(Math.min(replayDuration, baseStart + 12)),
       startSeconds: roundFrame(baseStart),
       endSeconds: roundFrame(Math.min(replayDuration, baseStart + 12)),
     };
@@ -881,6 +934,10 @@ function App() {
       takeGroupId: null,
       takeRole: "primary",
       includeInFinal: true,
+      durationMode: "short",
+      storyPreRollSeconds: DEFAULT_STORY_PRE_ROLL_SECONDS,
+      shortStartSeconds: startSeconds,
+      shortEndSeconds: endSeconds,
       startSeconds,
       endSeconds,
     };
@@ -2173,7 +2230,7 @@ function ReplayImportDialog({
                     event.target.value.replace(/\D/g, "").slice(0, 20),
                   )
                 }
-                placeholder="例如 1234567890"
+                placeholder="例如 8918165123"
                 inputMode="numeric"
                 autoComplete="off"
                 autoFocus
@@ -3128,12 +3185,27 @@ function ResultsView({
                 </div>
               )}
 
-            <PrecisionTimeEditor
-              clip={selectedClip}
-              replayDuration={result.replay.playback_time_seconds}
-              peakSeconds={selectedCandidate?.peak_seconds ?? null}
-              onUpdate={(patch) => onUpdateClip(selectedClip.clipId, patch)}
-            />
+            {selectedCandidate?.kind === "hero_kill_sequence" &&
+              selectedCandidate.kill_sequence && (
+                <KillDurationEditor
+                  clip={selectedClip}
+                  candidate={selectedCandidate}
+                  replayDuration={result.replay.playback_time_seconds}
+                  onUpdate={(patch) =>
+                    onUpdateClip(selectedClip.clipId, patch)
+                  }
+                />
+              )}
+
+            {(selectedCandidate?.kind !== "hero_kill_sequence" ||
+              selectedClip.durationMode === "short") && (
+              <PrecisionTimeEditor
+                clip={selectedClip}
+                replayDuration={result.replay.playback_time_seconds}
+                peakSeconds={selectedCandidate?.peak_seconds ?? null}
+                onUpdate={(patch) => onUpdateClip(selectedClip.clipId, patch)}
+              />
+            )}
 
             <div className="inspector-section source-anchor">
               <div className="section-row">
@@ -3695,6 +3767,118 @@ function PrecisionTimeEditor({
   );
 }
 
+function KillDurationEditor({
+  clip,
+  candidate,
+  replayDuration,
+  onUpdate,
+}: {
+  clip: ClipEditState;
+  candidate: HighlightCandidate;
+  replayDuration: number;
+  onUpdate: (patch: Partial<ClipEditState>) => void;
+}) {
+  const storyRange = killSequenceRange(
+    candidate,
+    clip.storyPreRollSeconds,
+    replayDuration,
+  );
+  const firstKillSeconds =
+    candidate.kill_sequence?.kills
+      .map((kill) => kill.death_time_seconds)
+      .sort((left, right) => left - right)[0] ?? candidate.peak_seconds;
+  const actualPreRoll = Math.max(0, firstKillSeconds - clip.startSeconds);
+  const wasTrimmed =
+    clip.durationMode === "story" &&
+    actualPreRoll + 1 / 30 < clip.storyPreRollSeconds;
+
+  function selectShortMode() {
+    onUpdate({
+      durationMode: "short",
+      startSeconds: clip.shortStartSeconds,
+      endSeconds: clip.shortEndSeconds,
+    });
+  }
+
+  function selectStoryMode() {
+    onUpdate({
+      durationMode: "story",
+      storyPreRollSeconds: clip.storyPreRollSeconds,
+    });
+  }
+
+  function setPreRoll(value: number) {
+    onUpdate({
+      durationMode: "story",
+      storyPreRollSeconds: Math.round(
+        clamp(value, 0, MAX_STORY_PRE_ROLL_SECONDS),
+      ),
+    });
+  }
+
+  return (
+    <div className="inspector-section duration-editor">
+      <div className="section-row">
+        <span className="section-title">片段时长</span>
+        <span className="section-note">逐段设置</span>
+      </div>
+      <div className="duration-mode-control" role="group" aria-label="片段时长模式">
+        <button
+          className={clip.durationMode === "short" ? "selected" : ""}
+          onClick={selectShortMode}
+        >
+          短击杀（默认）
+        </button>
+        <button
+          className={clip.durationMode === "story" ? "selected" : ""}
+          onClick={selectStoryMode}
+        >
+          剧情时长
+        </button>
+      </div>
+
+      {clip.durationMode === "story" && storyRange && (
+        <div className="story-duration-controls">
+          <label className="story-preroll-field">
+            <span>击杀前保留</span>
+            <input
+              type="range"
+              min={0}
+              max={MAX_STORY_PRE_ROLL_SECONDS}
+              step={5}
+              value={clip.storyPreRollSeconds}
+              onChange={(event) => setPreRoll(Number(event.target.value))}
+            />
+            <span className="story-preroll-value">
+              <input
+                type="number"
+                min={0}
+                max={MAX_STORY_PRE_ROLL_SECONDS}
+                step={5}
+                value={clip.storyPreRollSeconds}
+                onChange={(event) => setPreRoll(Number(event.target.value))}
+              />
+              秒
+            </span>
+          </label>
+          <div className="story-duration-summary">
+            <span>
+              {formatTimecode(clip.startSeconds)} - {formatTimecode(clip.endSeconds)}
+            </span>
+            <strong>{formatDuration(clip.endSeconds - clip.startSeconds)}</strong>
+          </div>
+          <small>
+            最后一次击杀后固定保留 {STORY_POST_ROLL_SECONDS} 秒。
+            {wasTrimmed
+              ? ` 为避开录像边界或相邻片段重复，实际前置 ${formatDuration(actualPreRoll)}。`
+              : " 连续击杀会保留在同一段内。"}
+          </small>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TimecodeField({
   label,
   value,
@@ -3882,7 +4066,8 @@ function MovieSetupDialog({
       clip.sourceEndSeconds <= clip.sourceStartSeconds ||
       clip.sourceEndSeconds > result.replay.playback_time_seconds ||
       clip.sourceEndSeconds - clip.sourceStartSeconds < 1 ||
-      clip.sourceEndSeconds - clip.sourceStartSeconds > 90,
+      clip.sourceEndSeconds - clip.sourceStartSeconds >
+        MAX_CLIP_DURATION_SECONDS,
   );
   const active = saving || rendering;
   const previewSource =
@@ -4100,7 +4285,9 @@ function MovieSetupDialog({
         {hasInvalidClip && (
           <div className="dialog-feedback error">
             <CircleAlert />
-            <span>片段必须位于录像内，且单段时长为 1 到 90 秒。</span>
+            <span>
+              片段必须位于录像内，且单段时长为 1 到 {MAX_CLIP_DURATION_SECONDS} 秒。
+            </span>
           </div>
         )}
         {renderError && (
@@ -4461,7 +4648,7 @@ function createClipEdits(
   savedPlan?: Pick<EditPlanSlot, "clips">,
 ): ClipEdits {
   if (savedPlan) {
-    return savedPlan.clips.map((clip, index) => ({
+    const clips = savedPlan.clips.map((clip, index) => ({
       clipId: clip.clipId || `clip-saved-${String(index + 1).padStart(2, "0")}`,
       candidateId: clip.candidateId,
       viewHero:
@@ -4472,9 +4659,23 @@ function createClipEdits(
       takeGroupId: clip.takeGroupId ?? null,
       takeRole: clip.takeRole ?? "primary",
       includeInFinal: clip.includeInFinal ?? true,
+      durationMode: clip.durationMode ?? "short",
+      storyPreRollSeconds:
+        clip.storyPreRollSeconds ?? DEFAULT_STORY_PRE_ROLL_SECONDS,
+      shortStartSeconds: roundFrame(
+        clip.shortSourceStartSeconds ?? clip.sourceStartSeconds,
+      ),
+      shortEndSeconds: roundFrame(
+        clip.shortSourceEndSeconds ?? clip.sourceEndSeconds,
+      ),
       startSeconds: roundFrame(clip.sourceStartSeconds),
       endSeconds: roundFrame(clip.sourceEndSeconds),
     }));
+    return normalizeStoryDurationClips(
+      clips,
+      result.highlights.candidates,
+      result.replay.playback_time_seconds,
+    );
   }
 
   const segments = new Map(
@@ -4514,6 +4715,7 @@ function createClipEdits(
       takeGroupId: null,
       takeRole: "primary",
       includeInFinal: true,
+      ...shortDurationState(start, end),
       startSeconds: roundFrame(start),
       endSeconds: roundFrame(end),
     };
@@ -4546,6 +4748,7 @@ function createHeroHighlightClips(
       takeGroupId: null,
       takeRole: "primary",
       includeInFinal: true,
+      ...shortDurationState(candidate.start_seconds, candidate.end_seconds),
       startSeconds: roundFrame(candidate.start_seconds),
       endSeconds: roundFrame(candidate.end_seconds),
     }),
@@ -4566,6 +4769,10 @@ function createStoryClips(story: HighlightStory): ClipEdits {
       takeGroupId: shot.take_group_id,
       takeRole: shot.take_role,
       includeInFinal: shot.include_in_default_cut,
+      ...shortDurationState(
+        shot.source_start_seconds,
+        shot.source_end_seconds,
+      ),
       startSeconds: roundFrame(shot.source_start_seconds),
       endSeconds: roundFrame(shot.source_end_seconds),
     }));
@@ -4857,9 +5064,22 @@ function planClips(clipEdits: ClipEdits): EditPlanClip[] {
     takeGroupId: clip.takeGroupId,
     takeRole: clip.takeRole,
     includeInFinal: clip.includeInFinal,
+    durationMode: clip.durationMode,
+    storyPreRollSeconds: clip.storyPreRollSeconds,
+    shortSourceStartSeconds: roundFrame(clip.shortStartSeconds),
+    shortSourceEndSeconds: roundFrame(clip.shortEndSeconds),
     sourceStartSeconds: roundFrame(clip.startSeconds),
     sourceEndSeconds: roundFrame(clip.endSeconds),
   }));
+}
+
+function shortDurationState(startSeconds: number, endSeconds: number) {
+  return {
+    durationMode: "short" as const,
+    storyPreRollSeconds: DEFAULT_STORY_PRE_ROLL_SECONDS,
+    shortStartSeconds: roundFrame(startSeconds),
+    shortEndSeconds: roundFrame(endSeconds),
+  };
 }
 
 function sanitizeRenderSettings(
