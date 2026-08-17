@@ -14,6 +14,7 @@ export interface Capabilities {
   dota2Found: boolean;
   renderReason: string | null;
   jobsRoot: string;
+  recommendedAnalysisExportDirectory: string;
   recommendedReplayDirectory: string | null;
   dota2Path: string | null;
   dota2PathSource: "automatic" | "custom" | "missing";
@@ -294,6 +295,14 @@ export interface AnalysisSummary {
   stories: StoryDocument;
   director: DirectorDocument;
   reused_existing_job: boolean;
+}
+
+export interface AnalysisPackageExportResult {
+  packagePath: string;
+  evidencePath: string;
+  reportPath: string;
+  eventCount: number;
+  incidentCount: number;
 }
 
 export type ClipDurationMode = "short" | "story";

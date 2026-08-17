@@ -91,6 +91,7 @@ import {
 } from "./storyDuration";
 import type {
   AnalysisProgress,
+  AnalysisPackageExportResult,
   AnalysisSummary,
   Capabilities,
   ClipCameraMode,
@@ -112,6 +113,7 @@ import type {
   StoryCategory,
   StoryTakeRole,
 } from "./types";
+import { preferredAnalysisExportDirectory } from "./analysisExportDirectory";
 
 type View = "workbench" | "library";
 type TitlebarPanel = "notifications" | "settings" | null;
@@ -163,7 +165,8 @@ const developmentFixtureEnabled =
   import.meta.env.DEV &&
   new URLSearchParams(window.location.search).get("fixture") === "mirana";
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
-const fallbackAppVersion = "1.9.6";
+const analysisExportDirectoryStorageKey = "cat-cut-analysis-export-directory";
+const fallbackAppVersion = "1.9.8";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,
@@ -173,6 +176,7 @@ const emptyCapabilities: Capabilities = {
   dota2Found: false,
   renderReason: null,
   jobsRoot: "",
+  recommendedAnalysisExportDirectory: "",
   recommendedReplayDirectory: null,
   dota2Path: null,
   dota2PathSource: "missing",
@@ -219,6 +223,7 @@ function App() {
   const [progress, setProgress] = useState<AnalysisProgress | null>(null);
   const [completedStages, setCompletedStages] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  const [exportingAnalysis, setExportingAnalysis] = useState(false);
   const [error, setError] = useState("");
   const [dragActive, setDragActive] = useState(false);
   const [notice, setNotice] = useState<AppNotice | null>(null);
@@ -254,6 +259,9 @@ function App() {
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [replayDirectory, setReplayDirectory] = useState(
     () => localStorage.getItem(replayDirectoryStorageKey) ?? "",
+  );
+  const [analysisExportDirectory, setAnalysisExportDirectory] = useState(
+    () => localStorage.getItem(analysisExportDirectoryStorageKey) ?? "",
   );
   const [replayId, setReplayId] = useState("");
   const [replayLookupBusy, setReplayLookupBusy] = useState(false);
@@ -295,6 +303,13 @@ function App() {
             capabilityResult.recommendedReplayDirectory ||
             "",
         );
+        setAnalysisExportDirectory(
+          (current) =>
+            preferredAnalysisExportDirectory(
+              current,
+              capabilityResult.recommendedAnalysisExportDirectory,
+            ) ?? "",
+        );
       })
       .catch((reason: unknown) => setError(toErrorMessage(reason)));
   }, []);
@@ -324,6 +339,15 @@ function App() {
       localStorage.removeItem(replayDirectoryStorageKey);
     }
   }, [replayDirectory]);
+
+  useEffect(() => {
+    const directory = analysisExportDirectory.trim();
+    if (directory) {
+      localStorage.setItem(analysisExportDirectoryStorageKey, directory);
+    } else {
+      localStorage.removeItem(analysisExportDirectoryStorageKey);
+    }
+  }, [analysisExportDirectory]);
 
   useEffect(() => {
     if (!isTauriRuntime) {
@@ -752,6 +776,56 @@ function App() {
   async function openRecent(job: RecentJob) {
     setSelectedPath(job.sourcePath);
     await runAnalysis(job.sourcePath);
+  }
+
+  async function exportAnalysisPackage() {
+    if (!isTauriRuntime || !result || !highlightHero || exportingAnalysis) {
+      return;
+    }
+    setError("");
+    try {
+      const destination = await open({
+        multiple: false,
+        directory: true,
+        title: "选择分析包保存位置",
+        defaultPath: preferredAnalysisExportDirectory(
+          analysisExportDirectory,
+          capabilities.recommendedAnalysisExportDirectory,
+        ),
+      });
+      if (typeof destination !== "string") {
+        return;
+      }
+      setAnalysisExportDirectory(destination);
+      setExportingAnalysis(true);
+      const exported = await invoke<AnalysisPackageExportResult>(
+        "export_replay_analysis_package",
+        {
+          request: {
+            jobId: result.job_id,
+            protagonistHero: highlightHero,
+            protagonistLabel: heroLabel(highlightHero),
+            destinationDirectory: destination,
+          },
+        },
+      );
+      setNotice({
+        kind: "success",
+        title: "分析包已导出",
+        message: `${heroLabel(highlightHero)} · ${exported.eventCount} 条事实事件 · ${exported.incidentCount} 个候选`,
+      });
+      await invoke("open_local_path", { path: exported.packagePath });
+    } catch (reason: unknown) {
+      const message = toErrorMessage(reason);
+      setError(message);
+      setNotice({
+        kind: "error",
+        title: "分析包导出失败",
+        message,
+      });
+    } finally {
+      setExportingAnalysis(false);
+    }
   }
 
   function updateClipEdit(clipId: string, patch: Partial<ClipEditState>) {
@@ -1377,9 +1451,12 @@ function App() {
           selectedPath={selectedPath}
           result={result}
           busy={busy}
+          exportingAnalysis={exportingAnalysis}
+          analysisExportReady={Boolean(result && highlightHero)}
           renderReady={capabilities.renderReady}
           onImport={openImportDialog}
           onAnalyze={confirmReanalysis}
+          onExportAnalysis={() => void exportAnalysisPackage()}
           onOpenMovieSetup={() => setMovieSetupOpen(true)}
         />
 
@@ -2039,9 +2116,12 @@ interface ProjectHeaderProps {
   selectedPath: string;
   result: AnalysisSummary | null;
   busy: boolean;
+  exportingAnalysis: boolean;
+  analysisExportReady: boolean;
   renderReady: boolean;
   onImport: () => void;
   onAnalyze: () => void;
+  onExportAnalysis: () => void;
   onOpenMovieSetup: () => void;
 }
 
@@ -2049,9 +2129,12 @@ function ProjectHeader({
   selectedPath,
   result,
   busy,
+  exportingAnalysis,
+  analysisExportReady,
   renderReady,
   onImport,
   onAnalyze,
+  onExportAnalysis,
   onOpenMovieSetup,
 }: ProjectHeaderProps) {
   const sourceName = selectedPath ? fileName(selectedPath) : "等待导入录像";
@@ -2098,6 +2181,25 @@ function ProjectHeader({
             <span>选择录像</span>
           </button>
         )}
+        <button
+          className="secondary-button"
+          disabled={!analysisExportReady || exportingAnalysis}
+          title={
+            analysisExportReady
+              ? "导出当前所选主角的 evidence.json 和 report.md"
+              : result
+                ? "请先选择高光主角"
+                : "请先分析一份录像"
+          }
+          onClick={onExportAnalysis}
+        >
+          {exportingAnalysis ? (
+            <LoaderCircle className="spinning" />
+          ) : (
+            <Download />
+          )}
+          <span>{exportingAnalysis ? "正在导出" : "导出分析包"}</span>
+        </button>
         <button
           className="primary-button"
           disabled={!result}

@@ -1,3 +1,8 @@
+mod analysis_export;
+
+use analysis_export::{
+    AnalysisPackageExportRequest, AnalysisPackageExportResult, export_analysis_package,
+};
 use d2_highlights_core::{DirectorDocument, HighlightDocument, JobManifest, TimelineDocument};
 use d2_highlights_pipeline::{AnalysisProgress, AnalysisSummary, analyze_dem_with_progress};
 use d2_highlights_renderer::{
@@ -35,6 +40,7 @@ const fn default_story_pre_roll_seconds() -> f32 {
 #[derive(Clone)]
 struct AppState {
     jobs_root: PathBuf,
+    analysis_export_directory: PathBuf,
     dota2_runtime: Arc<Mutex<Dota2Runtime>>,
     dota2_settings_path: PathBuf,
     ffmpeg_exe: Option<PathBuf>,
@@ -110,6 +116,7 @@ struct Capabilities {
     dota2_found: bool,
     render_reason: Option<String>,
     jobs_root: String,
+    recommended_analysis_export_directory: String,
     recommended_replay_directory: Option<String>,
     dota2_path: Option<String>,
     dota2_path_source: Dota2PathSource,
@@ -387,6 +394,10 @@ fn capabilities_for_state(state: &AppState) -> Capabilities {
         dota2_found,
         render_reason,
         jobs_root: state.jobs_root.display().to_string(),
+        recommended_analysis_export_directory: state
+            .analysis_export_directory
+            .display()
+            .to_string(),
         recommended_replay_directory: dota2_runtime
             .executable
             .as_deref()
@@ -438,6 +449,17 @@ fn resolve_replay_by_id(
         replay_id: replay_id.to_string(),
         path: replay_path.display().to_string(),
     })
+}
+
+#[tauri::command]
+fn export_replay_analysis_package(
+    request: AnalysisPackageExportRequest,
+    state: State<'_, AppState>,
+) -> Result<AnalysisPackageExportResult, String> {
+    if !valid_job_id(&request.job_id) {
+        return Err("任务编号无效，请重新打开分析结果。".to_string());
+    }
+    export_analysis_package(&state.jobs_root, request)
 }
 
 #[tauri::command]
@@ -1626,6 +1648,25 @@ fn project_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn resolve_analysis_export_directory(executable_dir: &Path) -> PathBuf {
+    let portable_root = executable_dir.ancestors().find(|candidate| {
+        candidate.join("jobs").is_dir()
+            && (candidate.join("Cargo.toml").is_file() || candidate.join("release").is_dir())
+    });
+    let app_root = portable_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| executable_dir.to_path_buf());
+
+    if let Some(parent) = app_root.parent() {
+        let video_project_inbox = parent.join("dota2视频剪辑").join("assets").join("incoming");
+        if video_project_inbox.is_dir() {
+            return video_project_inbox;
+        }
+    }
+
+    app_root
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1654,6 +1695,7 @@ pub fn run() {
                 };
             fs::create_dir_all(&jobs_root)?;
             fs::create_dir_all(&app_local_data_dir)?;
+            let analysis_export_directory = resolve_analysis_export_directory(&executable_dir);
             app.asset_protocol_scope()
                 .allow_directory(&jobs_root, true)?;
             let ffmpeg_exe = find_media_tool(
@@ -1673,6 +1715,7 @@ pub fn run() {
             let dota2_settings_path = app_local_data_dir.join(DOTA2_SETTINGS_FILE);
             app.manage(AppState {
                 jobs_root,
+                analysis_export_directory,
                 dota2_runtime: Arc::new(Mutex::new(resolve_dota2_runtime(&dota2_settings_path))),
                 dota2_settings_path,
                 ffmpeg_exe,
@@ -1687,6 +1730,7 @@ pub fn run() {
             resolve_replay_by_id,
             get_recent_jobs,
             analyze_dem,
+            export_replay_analysis_package,
             save_edit_plan,
             get_edit_plan,
             get_latest_render,
@@ -1707,8 +1751,9 @@ mod tests {
         Dota2PathSource, EDIT_PLAN_SCHEMA_VERSION, EditPlanClip, EditPlanDocument, EditPlanMode,
         EditPlanSlot, archive_edit_plan_for_reanalysis, configured_dota2_runtime, load_edit_plan,
         manual_render_settings, mark_job_recent, normalize_user_camera_mode, persist_dota2_path,
-        replay_directory_from_dota2, resolve_replay_by_id, sanitize_update_notes, valid_clip_id,
-        valid_job_id, valid_replay_id, validate_dota2_executable, validate_edit_plan_take_groups,
+        replay_directory_from_dota2, resolve_analysis_export_directory, resolve_replay_by_id,
+        sanitize_update_notes, valid_clip_id, valid_job_id, valid_replay_id,
+        validate_dota2_executable, validate_edit_plan_take_groups,
     };
     use d2_highlights_renderer::{
         BgmMode, CameraStyle, ClipCameraMode, RenderSettings, RenderTakeRole,
@@ -1796,6 +1841,40 @@ mod tests {
         assert_eq!(
             replay_directory_from_dota2(&path),
             Some(game_directory.join("dota").join("replays"))
+        );
+    }
+
+    #[test]
+    fn analysis_export_prefers_video_project_then_highlight_root() {
+        let workspace = tempdir().expect("create workspace");
+        let highlight_root = workspace.path().join("dota2高光时刻");
+        let candidate_dir = highlight_root
+            .join("release")
+            .join("candidate")
+            .join("1.9.8");
+        let jobs_root = highlight_root.join("jobs");
+        fs::create_dir_all(&candidate_dir).expect("create candidate directory");
+        fs::create_dir_all(&jobs_root).expect("create jobs directory");
+
+        assert_eq!(
+            resolve_analysis_export_directory(&candidate_dir),
+            highlight_root
+        );
+
+        let incoming = workspace
+            .path()
+            .join("dota2视频剪辑")
+            .join("assets")
+            .join("incoming");
+        fs::create_dir_all(&incoming).expect("create video project inbox");
+        assert_eq!(resolve_analysis_export_directory(&candidate_dir), incoming);
+
+        let installed_workspace = tempdir().expect("create installed workspace");
+        let installed_dir = installed_workspace.path().join("installed-app");
+        fs::create_dir_all(&installed_dir).expect("create installed app directory");
+        assert_eq!(
+            resolve_analysis_export_directory(&installed_dir),
+            installed_dir
         );
     }
 

@@ -12,6 +12,7 @@ apps/d2-highlights-desktop/src-tauri/gen/
 # Runtime jobs and user media
 jobs/
 jobs-*/
+analysis-exports/
 *.dem
 *.mp4
 *.mkv
