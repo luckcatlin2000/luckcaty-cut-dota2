@@ -156,3 +156,25 @@ test("different heroes keep independent story ranges", () => {
   assert.equal(normalized[0]?.startSeconds, 40);
   assert.equal(normalized[1]?.startSeconds, 45);
 });
+
+test("explicit copies of one story keep their full range regardless of clip ID order", () => {
+  const first = killCandidate("previous", "mirana", [80]);
+  const candidate = killCandidate("repeat", "mirana", [100]);
+  for (const ids of [["clip-a", "clip-z"], ["clip-z", "clip-a"]]) {
+    const normalized = normalizeStoryDurationClips([
+      storyClip("clip-previous", first.id, "mirana"),
+      storyClip(ids[0]!, candidate.id, "mirana"),
+      storyClip(ids[1]!, candidate.id, "mirana"),
+    ], [first, candidate], 600);
+    assert.deepEqual(normalized.map(c => [c.startSeconds, c.endSeconds]),
+      [[20, 90], [90, 110], [90, 110]]);
+    assert.deepEqual(normalizeStoryDurationClips(normalized, [first, candidate], 600), normalized,
+      "reloading or changing camera must not truncate the repeated event");
+  }
+});
+
+test("a story at a nonaligned replay end never rounds beyond the replay", () => {
+  const candidate = killCandidate("ending", "mirana", [595]);
+  const range = killSequenceRange(candidate, 60, 600.025)!;
+  assert.equal(range.endSeconds, 600);
+});

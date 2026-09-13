@@ -1,5 +1,8 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { DraftWriter, EditorOperationGate } from "./editorSession";
+import { frameRangeWithinReplay, isValidClipTimeRange, replayEndFrame, roundFrame } from "./frameTime";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -152,6 +155,12 @@ interface EditorPlanSnapshot {
   renderSettings: RenderSettings;
 }
 
+interface EditPlanWorkspaceRequest {
+  jobId: string;
+  activeMode: EditorPlanMode;
+  plans: EditPlanSlot[];
+}
+
 interface ReanalysisReset {
   hero: string;
   ruleIds: HighlightRuleId[];
@@ -166,7 +175,7 @@ const developmentFixtureEnabled =
   new URLSearchParams(window.location.search).get("fixture") === "mirana";
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
 const analysisExportDirectoryStorageKey = "cat-cut-analysis-export-directory";
-const fallbackAppVersion = "1.9.8";
+const fallbackAppVersion = "1.9.10";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,
@@ -248,6 +257,7 @@ function App() {
     Record<EditorPlanMode, EditorPlanSnapshot>
   >(() => createEmptyPlanWorkspace());
   const [rendering, setRendering] = useState(false);
+  const renderCancelRequested = useRef(false);
   const [renderProgress, setRenderProgress] = useState<RenderProgress | null>(
     null,
   );
@@ -266,7 +276,70 @@ function App() {
   const [replayId, setReplayId] = useState("");
   const [replayLookupBusy, setReplayLookupBusy] = useState(false);
   const [replayLookupError, setReplayLookupError] = useState("");
-  const reanalysisResetRef = useRef<ReanalysisReset | null>(null);
+  const [planReady, setPlanReady] = useState(false);
+  const [planConflict, setPlanConflict] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const operationGate = useRef(new EditorOperationGate());
+  const closePending = useRef(false);
+  const activeJobRef = useRef<string | null>(null);
+  activeJobRef.current = result?.job_id ?? null;
+  const updating = appUpdate.phase === "downloading" || appUpdate.phase === "installing";
+  const interactionBlocked = busy || rendering || updating || closing || exportingAnalysis;
+  const draftWriter = useRef(new DraftWriter<EditPlanWorkspaceRequest, SaveEditPlanResult>(
+    (request) => invoke<SaveEditPlanResult>("save_edit_plan", { request }),
+  ));
+  const draftRequest = useMemo<EditPlanWorkspaceRequest | null>(() => {
+    if (!result || !planReady) return null;
+    const workspace = { ...planSlots, [editorMode]: {
+      clipEdits, selectedClipId, highlightHero, highlightRuleIds, sourceStoryId, renderSettings,
+    } };
+    return { jobId: result.job_id, activeMode: editorMode,
+      plans: (["default", "wtf"] as const).map((mode) => toEditPlanSlot(mode, workspace[mode])) };
+  }, [result, planReady, planSlots, editorMode, clipEdits, selectedClipId,
+    highlightHero, highlightRuleIds, sourceStoryId, renderSettings]);
+  const latestDraftRef = useRef(draftRequest);
+  latestDraftRef.current = draftRequest;
+  const autoSaveTimerRef = useRef<number | null>(null);
+  const closeHandlerRef = useRef(requestAppClose);
+  closeHandlerRef.current = requestAppClose;
+
+  useEffect(() => {
+    if (!isTauriRuntime || !draftRequest) return;
+    const snapshot = draftRequest;
+    const timer = window.setTimeout(() => {
+      autoSaveTimerRef.current = null;
+      void draftWriter.current.persist(snapshot).then(() => {
+        if (latestDraftRef.current === snapshot) setPlanFeedback("剪辑草稿已自动保存。");
+      }).catch((reason: unknown) => {
+        if (latestDraftRef.current === snapshot) {
+          const message = `草稿未保存：${toErrorMessage(reason)}`;
+          setPlanFeedback(message);
+          setNotice({ kind: "error", title: "剪辑草稿保存失败", message });
+        }
+      });
+    }, 400);
+    autoSaveTimerRef.current = timer;
+    return () => {
+      window.clearTimeout(timer);
+      if (autoSaveTimerRef.current === timer) autoSaveTimerRef.current = null;
+    };
+  }, [draftRequest]);
+
+  useEffect(() => {
+    if (!appWindow) return;
+    let disposed = false;
+    const stops: Array<() => void> = [];
+    const register = (promise: Promise<() => void>) => {
+      void promise.then((stop) => disposed ? stop() : stops.push(stop))
+        .catch((reason: unknown) => setError(toErrorMessage(reason)));
+    };
+    register(appWindow.onCloseRequested((event) => {
+      event.preventDefault();
+      void closeHandlerRef.current();
+    }));
+    register(listen("app-close-requested", () => void closeHandlerRef.current()));
+    return () => { disposed = true; stops.forEach((stop) => stop()); };
+  }, []);
 
   useEffect(() => {
     if (!developmentFixtureEnabled) {
@@ -275,8 +348,9 @@ function App() {
     let disposed = false;
     void import("./devFixture").then(({ miranaDevelopmentSummary }) => {
       if (!disposed) {
-        setSelectedPath(miranaDevelopmentSummary.source.path);
-        setResult(miranaDevelopmentSummary);
+        void restoreAnalysisWorkspace(miranaDevelopmentSummary, null).then(() => {
+          if (!disposed) setSelectedPath(miranaDevelopmentSummary.source.path);
+        });
       }
     });
     return () => {
@@ -375,14 +449,11 @@ function App() {
           setError("一次请拖入一个 Dota 2 .dem 录像文件。");
           return;
         }
-        if (busy) {
-          setError("当前录像仍在分析，请完成后再导入下一份。");
+        if (operationGate.current.blocked) {
+          setError("当前任务尚未结束，请完成后再导入下一份。");
           return;
         }
 
-        setSelectedPath(path);
-        rememberReplayPath(path);
-        setImportDialogOpen(false);
         void runAnalysis(path);
       })
       .then((stopListening) => {
@@ -398,7 +469,7 @@ function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [busy]);
+  }, [interactionBlocked]);
 
   useEffect(() => {
     const first = clipEdits[0];
@@ -413,119 +484,86 @@ function App() {
     }
   }, [clipEdits]);
 
-  useEffect(() => {
-    if (!result) {
-      setClipEdits([]);
-      setHighlightHero("");
-      setHighlightRuleIds([...DEFAULT_HIGHLIGHT_RULE_IDS]);
-      setEditorMode("default");
-      setSourceStoryId(null);
-      setPlanSlots(createEmptyPlanWorkspace());
-      setMovieSetupOpen(false);
-      setPlanFeedback("");
-      setRenderSettings(defaultRenderSettings);
-      setRenderProgress(null);
-      setRenderResult(null);
-      setRenderError("");
-      return;
-    }
-
-    let disposed = false;
-    const reanalysisReset = reanalysisResetRef.current;
-    reanalysisResetRef.current = null;
-    const initialClips = reanalysisReset
-      ? createHeroHighlightClips(
-          result,
-          reanalysisReset.hero,
-          reanalysisReset.ruleIds,
-        )
-      : createClipEdits(result);
-    const initialSelection = reanalysisReset
-      ? { hero: reanalysisReset.hero, ruleIds: reanalysisReset.ruleIds }
-      : inferHighlightSelection(result.highlights.candidates, initialClips);
+  async function restoreAnalysisWorkspace(summary: AnalysisSummary, reset: ReanalysisReset | null) {
+    const initialClips = reset
+      ? createHeroHighlightClips(summary, reset.hero, reset.ruleIds)
+      : createClipEdits(summary);
+    const selection = reset ? { hero: reset.hero, ruleIds: reset.ruleIds }
+      : inferHighlightSelection(summary.highlights.candidates, initialClips);
     const initialWorkspace: Record<EditorPlanMode, EditorPlanSnapshot> = {
-      default: {
-        clipEdits: initialClips,
-        selectedClipId: initialClips[0]?.clipId ?? "",
-        highlightHero: initialSelection.hero,
-        highlightRuleIds: initialSelection.ruleIds,
-        sourceStoryId: null,
-        renderSettings: reanalysisReset?.renderSettings ?? defaultRenderSettings,
-      },
-      wtf: reanalysisReset?.wtfPlan ?? createEmptyPlanSnapshot(),
+      default: { clipEdits: initialClips, selectedClipId: initialClips[0]?.clipId ?? "",
+        highlightHero: selection.hero, highlightRuleIds: selection.ruleIds,
+        sourceStoryId: null, renderSettings: reset?.renderSettings ?? defaultRenderSettings },
+      wtf: reset?.wtfPlan ?? createEmptyPlanSnapshot(),
     };
-    setPlanSlots(initialWorkspace);
-    setEditorMode("default");
-    applyPlanSnapshot(initialWorkspace.default);
-    setPlanFeedback("");
-    setRenderProgress(null);
-    setRenderResult(null);
-    setRenderError("");
+    let workspace = initialWorkspace;
+    let mode: EditorPlanMode = "default";
+    let latest: RenderResult | null = null;
+    let conflictingCandidates: string[] = [];
     if (isTauriRuntime) {
-      if (reanalysisReset) {
-        void invoke<SaveEditPlanResult>("save_edit_plan", {
-          request: {
-            jobId: result.job_id,
-            activeMode: "default",
-            plans: (["default", "wtf"] as const).map((mode) =>
-              toEditPlanSlot(mode, initialWorkspace[mode]),
-            ),
-          },
-        })
-          .then((saved) => {
-            if (!disposed) {
-              const message = `已恢复${heroLabel(reanalysisReset.hero)}的 ${saved.selectedClipCount} 段完整高光，原剪辑方案已备份。`;
-              setPlanFeedback(message);
-              setNotice({
-                kind: "success",
-                title: "重新分析完成",
-                message,
-              });
-            }
-          })
-          .catch((reason: unknown) => {
-            if (!disposed) {
-              setPlanFeedback(toErrorMessage(reason));
-            }
-          });
-      } else {
-        void invoke<LoadedEditPlan | null>("get_edit_plan", {
-          jobId: result.job_id,
-        })
-          .then((saved) => {
-            if (!disposed && saved) {
-              const savedWorkspace = createSavedPlanWorkspace(
-                result,
-                saved,
-                initialWorkspace.default,
-              );
-              const activeMode = saved.activeMode;
-              setPlanSlots(savedWorkspace);
-              setEditorMode(activeMode);
-              applyPlanSnapshot(savedWorkspace[activeMode]);
-            }
-          })
-          .catch(() => {
-            // A missing or stale optional edit plan must not block replay analysis.
-          });
+      const [saved, previousRender] = await Promise.all([
+        reset ? Promise.resolve(null) : invoke<LoadedEditPlan | null>("get_edit_plan", { jobId: summary.job_id }),
+        invoke<RenderResult | null>("get_latest_render", { jobId: summary.job_id }).catch(() => null),
+      ]);
+      if (saved) {
+        workspace = createSavedPlanWorkspace(summary, saved, initialWorkspace.default);
+        mode = saved.activeMode;
+        const candidateIds = new Set(summary.highlights.candidates.map((candidate) => candidate.id));
+        conflictingCandidates = [...new Set(saved.plans.flatMap((plan) => plan.clips)
+          .filter((clip) => !candidateIds.has(clip.candidateId)).map((clip) => clip.candidateId))];
       }
-      void invoke<RenderResult | null>("get_latest_render", {
-        jobId: result.job_id,
-      })
-        .then((latestRender) => {
-          if (!disposed) {
-            setRenderResult(latestRender);
-          }
-        })
-        .catch(() => {
-          // An optional previous render must not block editing or a new render.
-        });
+      latest = reset ? null : previousRender;
+      if (reset) {
+        // The backend archived edit-plan.json; a matching cached signature must
+        // not suppress recreating the active file after reanalysis.
+        draftWriter.current.invalidateSavedSnapshot();
+        await draftWriter.current.persist({ jobId: summary.job_id, activeMode: mode,
+          plans: (["default", "wtf"] as const).map((slot) => toEditPlanSlot(slot, workspace[slot])) });
+      }
     }
+    if (closePending.current) return;
+    setResult(summary);
+    setPlanSlots(workspace);
+    setEditorMode(mode);
+    applyPlanSnapshot(workspace[mode]);
+    setMovieSetupOpen(false);
+    const conflict = conflictingCandidates.length > 0;
+    setPlanReady(!conflict);
+    setPlanConflict(conflict);
+    setPlanFeedback(conflict ? "候选事件已变化，旧草稿保持原样。请点击重新分析，确认备份后重建。" :
+      reset ? "已恢复当前主角的完整高光，重新分析前的剪辑草稿已备份。" : "");
+    if (conflict) setNotice({ kind: "error", title: "剪辑草稿需要重新确认",
+      message: `${conflictingCandidates.length} 个旧候选无法对应。已保留完整旧草稿并暂停编辑和自动保存；请点击重新分析，确认备份后重建。` });
+    setRenderProgress(null);
+    setRenderResult(latest);
+    setRenderError("");
+    return !conflict;
+  }
 
-    return () => {
-      disposed = true;
-    };
-  }, [result]);
+  async function flushCurrentDraft() {
+    if (!isTauriRuntime) return null;
+    if (autoSaveTimerRef.current !== null) {
+      window.clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+    return draftWriter.current.flush(latestDraftRef.current);
+  }
+
+  async function requestAppClose() {
+    if (closePending.current) return;
+    closePending.current = true;
+    operationGate.current.setClosing(true);
+    setClosing(true);
+    try {
+      await flushCurrentDraft();
+      await invoke("close_app_after_cleanup");
+    } catch (reason: unknown) {
+      setNotice({ kind: "error", title: "暂时无法关闭", message: toErrorMessage(reason) });
+      closePending.current = false;
+      operationGate.current.setClosing(false);
+      setClosing(false);
+    }
+  }
 
   function applyPlanSnapshot(snapshot: EditorPlanSnapshot) {
     setClipEdits(snapshot.clipEdits);
@@ -548,6 +586,7 @@ function App() {
   }
 
   function switchEditorMode(nextMode: EditorPlanMode) {
+    if (!planReady || operationGate.current.blocked) return;
     if (nextMode === editorMode) {
       return;
     }
@@ -577,9 +616,7 @@ function App() {
   );
 
   function openImportDialog() {
-    if (busy) {
-      return;
-    }
+    if (operationGate.current.blocked) return;
     setError("");
     setReplayLookupError("");
     setImportDialogOpen(true);
@@ -615,6 +652,7 @@ function App() {
   }
 
   async function chooseReplayFile() {
+    if (operationGate.current.blocked) return;
     setReplayLookupError("");
     if (!isTauriRuntime) {
       setReplayLookupError("请从桌面应用中选择录像文件。");
@@ -629,9 +667,6 @@ function App() {
         filters: [{ name: "Dota 2 录像", extensions: ["dem"] }],
       });
       if (typeof picked === "string") {
-        rememberReplayPath(picked);
-        setSelectedPath(picked);
-        setImportDialogOpen(false);
         await runAnalysis(picked);
       }
     } catch (reason: unknown) {
@@ -640,7 +675,7 @@ function App() {
   }
 
   async function loadReplayById() {
-    if (busy || replayLookupBusy) {
+    if (operationGate.current.blocked || replayLookupBusy) {
       return;
     }
     if (!isTauriRuntime) {
@@ -658,10 +693,6 @@ function App() {
           replayId,
         },
       );
-      setReplayDirectory(resolved.replayDirectory);
-      setReplayId(resolved.replayId);
-      setSelectedPath(resolved.path);
-      setImportDialogOpen(false);
       await runAnalysis(resolved.path);
     } catch (reason: unknown) {
       setReplayLookupError(toErrorMessage(reason));
@@ -671,91 +702,67 @@ function App() {
   }
 
   async function runAnalysis(path = selectedPath, resetEditPlan = false) {
-    if (!path || busy) {
-      return;
+    if (!path) return;
+    const token = operationGate.current.begin("analysis");
+    if (!token) return;
+    const reset: ReanalysisReset | null = resetEditPlan ? {
+      hero: highlightHero || (result ? inferHighlightSelection(result.highlights.candidates, clipEdits).hero : "") ||
+        result?.replay.players[0]?.hero_name || "",
+      ruleIds: normalizeHighlightRuleIds(highlightRuleIds), renderSettings,
+      wtfPlan: editorMode === "wtf" ? currentPlanSnapshot() : planSlots.wtf,
+    } : null;
+    if (reset && planConflict && result) {
+      const ids = new Set(result.highlights.candidates.map((candidate) => candidate.id));
+      if (reset.wtfPlan.clipEdits.some((clip) => !ids.has(clip.candidateId))) {
+        reset.wtfPlan = createEmptyPlanSnapshot();
+      }
     }
-    if (resetEditPlan) {
-      const inferredHero = result
-        ? inferHighlightSelection(result.highlights.candidates, clipEdits).hero
-        : "";
-      reanalysisResetRef.current = {
-        hero:
-          highlightHero ||
-          inferredHero ||
-          result?.replay.players[0]?.hero_name ||
-          "",
-        ruleIds: normalizeHighlightRuleIds(highlightRuleIds),
-        renderSettings,
-        wtfPlan:
-          editorMode === "wtf" ? currentPlanSnapshot() : planSlots.wtf,
-      };
-    } else {
-      reanalysisResetRef.current = null;
-    }
-    setView("workbench");
     setBusy(true);
     setError("");
-    setResult(null);
-    setCompletedStages([]);
-    setProgress({
-      stage: "ingest",
-      status: "running",
-      message: "正在准备分析",
-    });
-
     try {
+      // Flush the current in-memory plan before changing paths or archiving it.
+      await flushCurrentDraft();
+      if (!operationGate.current.current(token)) return;
+      setSelectedPath(path);
+      rememberReplayPath(path);
+      setImportDialogOpen(false);
+      setView("workbench");
+      setPlanReady(false);
+      setResult(null);
+      setMovieSetupOpen(false);
+      setCompletedStages([]);
+      setProgress({ stage: "ingest", status: "running", message: "正在准备分析" });
       const channel = new Channel<AnalysisProgress>();
       channel.onmessage = (message) => {
+        if (!operationGate.current.current(token)) return;
         setProgress(message);
-        if (message.status === "complete") {
-          setCompletedStages((current) =>
-            current.includes(message.stage)
-              ? current
-              : [...current, message.stage],
-          );
-        }
+        if (message.status === "complete") setCompletedStages((current) =>
+          current.includes(message.stage) ? current : [...current, message.stage]);
       };
       const summary = await invoke<AnalysisSummary>("analyze_dem", {
-        demPath: path,
-        resetEditPlan,
-        onProgress: channel,
+        demPath: path, resetEditPlan, onProgress: channel,
       });
-      setResult(summary);
-      setProgress({
-        stage: "complete",
-        status: "complete",
-        message: summary.reused_existing_job
-          ? "已载入之前的分析结果"
-          : "录像分析完成",
-      });
-      setRecentJobs(await invoke<RecentJob[]>("get_recent_jobs"));
-      if (completionNoticeEnabled) {
-        const heroSequences = summary.highlights.candidates.filter(
-          (candidate) => candidate.kind === "hero_kill_sequence",
-        ).length;
-        setNotice({
-          kind: "success",
-          title: "录像分析完成",
-          message: `${fileName(path)} · ${heroSequences} 段英雄击杀 · 可按英雄筛选`,
-        });
-      }
+      if (!operationGate.current.current(token)) return;
+      const restored = await restoreAnalysisWorkspace(summary, reset);
+      if (!operationGate.current.current(token)) return;
+      setProgress({ stage: "complete", status: "complete",
+        message: summary.reused_existing_job ? "已载入之前的分析结果" : "录像分析完成" });
+      const jobs = await invoke<RecentJob[]>("get_recent_jobs").catch(() => null);
+      if (!operationGate.current.current(token)) return;
+      if (jobs) setRecentJobs(jobs);
+      if (completionNoticeEnabled && restored) setNotice({ kind: "success", title: reset ? "重新分析完成" : "录像分析完成",
+        message: reset ? "完整高光已恢复，重新分析前的剪辑草稿已备份。" :
+          `${fileName(path)} · ${summary.highlights.candidates.filter((candidate) => candidate.kind === "hero_kill_sequence").length} 段英雄击杀 · 可按英雄筛选` });
     } catch (reason: unknown) {
-      reanalysisResetRef.current = null;
-      const message = toErrorMessage(reason);
-      setError(message);
-      if (completionNoticeEnabled) {
-        setNotice({
-          kind: "error",
-          title: "录像分析失败",
-          message,
-        });
+      if (operationGate.current.current(token)) {
+        const message = toErrorMessage(reason);
+        setError(message);
+        setNotice({ kind: "error", title: "任务未能打开", message });
+        // A failed pre-switch save keeps the previous editable workspace intact.
+        if (!latestDraftRef.current) setProgress({ stage: "parse", status: "failed", message });
       }
-      setProgress({
-        stage: progress?.stage ?? "parse",
-        status: "failed",
-        message: "分析没有完成",
-      });
     } finally {
+      operationGate.current.finish(token);
       setBusy(false);
     }
   }
@@ -766,7 +773,9 @@ function App() {
       return;
     }
     const confirmed = window.confirm(
-      "重新分析会恢复当前主角的完整高光候选，并替换现在的删减方案。原剪辑方案会安全备份，是否继续？",
+      planConflict
+        ? "旧候选事件已变化。将先备份两套完整旧草稿，再重建默认高光；包含失效候选的 WTF 方案会清空，无冲突的 WTF 方案保留。是否继续？"
+        : "重新分析会先保存并备份当前两套剪辑草稿，再恢复当前主角的完整高光候选并替换默认删减方案。是否继续？",
     );
     if (confirmed) {
       void runAnalysis(selectedPath, true);
@@ -774,16 +783,17 @@ function App() {
   }
 
   async function openRecent(job: RecentJob) {
-    setSelectedPath(job.sourcePath);
     await runAnalysis(job.sourcePath);
   }
 
   async function exportAnalysisPackage() {
-    if (!isTauriRuntime || !result || !highlightHero || exportingAnalysis) {
-      return;
-    }
+    if (!isTauriRuntime || !result || !highlightHero || exportingAnalysis) return;
+    const token = operationGate.current.begin("analysis");
+    if (!token) return;
+    setExportingAnalysis(true);
     setError("");
     try {
+      await flushCurrentDraft();
       const destination = await open({
         multiple: false,
         directory: true,
@@ -814,7 +824,12 @@ function App() {
         title: "分析包已导出",
         message: `${heroLabel(highlightHero)} · ${exported.eventCount} 条事实事件 · ${exported.incidentCount} 个候选`,
       });
-      await invoke("open_local_path", { path: exported.packagePath });
+      try {
+        await invoke("open_exported_analysis_package", { path: exported.packagePath });
+      } catch (reason: unknown) {
+        setNotice({ kind: "success", title: "分析包已导出",
+          message: `已保存至 ${exported.packagePath}；自动打开未完成：${toErrorMessage(reason)}` });
+      }
     } catch (reason: unknown) {
       const message = toErrorMessage(reason);
       setError(message);
@@ -824,11 +839,13 @@ function App() {
         message,
       });
     } finally {
+      operationGate.current.finish(token);
       setExportingAnalysis(false);
     }
   }
 
   function updateClipEdit(clipId: string, patch: Partial<ClipEditState>) {
+    if (!planReady || operationGate.current.blocked) return;
     setClipEdits((current) => {
       const selected = current.find((clip) => clip.clipId === clipId);
       if (!selected) {
@@ -899,6 +916,7 @@ function App() {
     ruleIds: readonly HighlightRuleId[],
     announce: boolean,
   ) {
+    if (!planReady || operationGate.current.blocked) return;
     if (!result) {
       return;
     }
@@ -934,6 +952,7 @@ function App() {
   }
 
   function selectHeroHighlights(hero: string) {
+    if (!planReady || operationGate.current.blocked) return;
     if (editorMode === "wtf") {
       setHighlightHero(hero);
       setPlanFeedback(
@@ -945,6 +964,7 @@ function App() {
   }
 
   function updateHighlightRules(ruleIds: HighlightRuleId[]) {
+    if (!planReady || operationGate.current.blocked) return;
     if (editorMode === "wtf") {
       return;
     }
@@ -959,6 +979,7 @@ function App() {
   }
 
   function applyStoryPlan(storyId: string) {
+    if (!planReady || operationGate.current.blocked) return;
     if (!result || editorMode !== "wtf") {
       return;
     }
@@ -966,7 +987,7 @@ function App() {
     if (!story) {
       return;
     }
-    const next = createStoryClips(story);
+    const next = createStoryClips(story, result.replay.playback_time_seconds);
     setHighlightHero(story.primary_hero);
     setSourceStoryId(story.id);
     setClipEdits(next);
@@ -991,6 +1012,7 @@ function App() {
   }
 
   function addClip() {
+    if (!planReady || operationGate.current.blocked) return;
     if (!result) {
       return;
     }
@@ -999,7 +1021,7 @@ function App() {
     if (!selected && !fallbackCandidate) {
       return;
     }
-    const replayDuration = result.replay.playback_time_seconds;
+    const replayDuration = replayEndFrame(result.replay.playback_time_seconds);
     const baseStart = selected
       ? Math.min(
           Math.max(0, selected.endSeconds),
@@ -1034,6 +1056,7 @@ function App() {
   }
 
   function activateTimelineCandidate(candidateId: string) {
+    if (!planReady || operationGate.current.blocked) return;
     if (!result) {
       return;
     }
@@ -1053,7 +1076,7 @@ function App() {
       return;
     }
 
-    const replayDuration = result.replay.playback_time_seconds;
+    const replayDuration = replayEndFrame(result.replay.playback_time_seconds);
     const startSeconds = roundFrame(
       clamp(
         candidate.start_seconds,
@@ -1107,6 +1130,7 @@ function App() {
   }
 
   function duplicateClip(clipId: string) {
+    if (!planReady || operationGate.current.blocked) return;
     const index = clipEdits.findIndex((clip) => clip.clipId === clipId);
     const source = clipEdits[index];
     if (!source) {
@@ -1127,6 +1151,7 @@ function App() {
   }
 
   function deleteClip(clipId: string) {
+    if (!planReady || operationGate.current.blocked) return;
     const index = clipEdits.findIndex((clip) => clip.clipId === clipId);
     if (index < 0) {
       return;
@@ -1149,6 +1174,7 @@ function App() {
   }
 
   function moveClip(clipId: string, direction: -1 | 1) {
+    if (!planReady || operationGate.current.blocked) return;
     setClipEdits((current) => {
       const index = current.findIndex((clip) => clip.clipId === clipId);
       const target = index + direction;
@@ -1163,60 +1189,26 @@ function App() {
   }
 
   function updateRenderSettings(patch: Partial<RenderSettings>) {
+    if (!planReady || operationGate.current.blocked) return;
     setRenderSettings((current) => ({ ...current, ...patch }));
     setPlanFeedback("");
     setRenderError("");
   }
 
   async function saveEditPlan(showNotice = true) {
-    if (!result || savingPlan) {
-      return null;
-    }
-    const clips = planClips(clipEdits);
-    if (clips.length === 0) {
-      setPlanFeedback("请至少启用一个高光片段。");
-      return null;
-    }
-    if (!clips.some((clip) => clip.includeInFinal)) {
-      setPlanFeedback("请至少保留一个默认入片的主机位素材。");
-      return null;
-    }
-
     setSavingPlan(true);
-    setPlanFeedback("");
     try {
-      const workspace = {
-        ...planSlots,
-        [editorMode]: currentPlanSnapshot(),
-      };
-      setPlanSlots(workspace);
-      const saved = await invoke<SaveEditPlanResult>("save_edit_plan", {
-        request: {
-          jobId: result.job_id,
-          activeMode: editorMode,
-          plans: (["default", "wtf"] as const).map((mode) =>
-            toEditPlanSlot(mode, workspace[mode]),
-          ),
-        },
-      });
-      const message = `已保存${editorModeLabel(editorMode)}：${saved.selectedClipCount} 份源素材，成片 ${formatDuration(saved.totalDurationSeconds)}`;
-      setPlanFeedback(message);
-      if (showNotice) {
-        setNotice({
-          kind: "success",
-          title: "剪辑方案已保存",
-          message,
-        });
+      const saved = await flushCurrentDraft();
+      if (saved) {
+        const message = `剪辑草稿已保存：${saved.selectedClipCount} 份源素材，成片 ${formatDuration(saved.totalDurationSeconds)}`;
+        setPlanFeedback(message);
+        if (showNotice) setNotice({ kind: "success", title: "剪辑方案已保存", message });
       }
       return saved;
     } catch (reason: unknown) {
       const message = toErrorMessage(reason);
       setPlanFeedback(message);
-      setNotice({
-        kind: "error",
-        title: "剪辑方案保存失败",
-        message,
-      });
+      setNotice({ kind: "error", title: "剪辑方案保存失败", message });
       return null;
     } finally {
       setSavingPlan(false);
@@ -1224,74 +1216,58 @@ function App() {
   }
 
   async function startMovieRender() {
-    if (!result || rendering) {
-      return;
-    }
+    if (!result || !planReady) return;
     if (!capabilities.renderReady) {
-      setRenderError(
-        capabilities.renderReason ?? "当前成片环境不完整，请检查 Dota 2 和媒体工具。",
-      );
+      setRenderError(capabilities.renderReason ?? "当前成片环境不完整，请检查 Dota 2 和媒体工具。");
       return;
     }
-
+    if (!clipEdits.some((clip) => clip.includeInFinal) || clipEdits.some((clip) =>
+      !isValidClipTimeRange(clip.startSeconds, clip.endSeconds, result.replay.playback_time_seconds))) {
+      setRenderError("请检查片段起止时间，并至少保留一个默认入片素材。");
+      return;
+    }
+    const token = operationGate.current.begin("render");
+    if (!token) return;
+    renderCancelRequested.current = false;
+    const jobId = result.job_id;
+    const current = () => operationGate.current.current(token) && activeJobRef.current === jobId;
+    setRendering(true);
     setRenderError("");
     setRenderResult(null);
-    setRenderProgress({
-      stage: "preflight",
-      status: "running",
-      message: "正在保存方案并准备成片",
-      percent: 1,
-      currentClip: 0,
-      totalClips: 0,
-    });
-    const saved = await saveEditPlan(false);
-    if (!saved) {
-      return;
-    }
-
-    setRendering(true);
+    setRenderProgress({ stage: "preflight", status: "running", message: "正在保存方案并准备成片",
+      percent: 1, currentClip: 0, totalClips: 0 });
     try {
+      const saved = await saveEditPlan(false);
+      if (!saved || !current() || renderCancelRequested.current) {
+        setRenderProgress(null);
+        if (renderCancelRequested.current) setPlanFeedback("已取消导出准备。");
+        return;
+      }
       const channel = new Channel<RenderProgress>();
       channel.onmessage = (message) => {
+        if (!current()) return;
         setRenderProgress(message);
-        if (message.status === "failed") {
-          setRenderError(message.message);
-        }
+        if (message.status === "failed") setRenderError(message.message);
       };
-      const completed = await invoke<RenderResult>("start_render", {
-        jobId: result.job_id,
-        onProgress: channel,
-      });
+      const completed = await invoke<RenderResult>("start_render", { jobId, onProgress: channel });
+      if (!current()) return;
       setRenderResult(completed);
-      setRenderProgress({
-        stage: "complete",
-        status: "complete",
-        message: "成片已完成，Dota 2 已关闭",
-        percent: 100,
-        currentClip: completed.segmentCount,
-        totalClips: completed.segmentCount,
-      });
-      setNotice({
-        kind: "success",
-        title: "高光成片已完成",
-        message: `${formatDuration(completed.durationSeconds)} · ${completed.width}x${completed.height}`,
-      });
+      setRenderProgress({ stage: "complete", status: "complete", message: "成片已完成，Dota 2 已关闭",
+        percent: 100, currentClip: completed.segmentCount, totalClips: completed.segmentCount });
+      setNotice({ kind: "success", title: "高光成片已完成",
+        message: `${formatDuration(completed.durationSeconds)} · ${completed.width}x${completed.height}` });
     } catch (reason: unknown) {
-      const message = toErrorMessage(reason);
-      setRenderError(message);
-      setNotice({
-        kind: "error",
-        title: "成片任务没有完成",
-        message,
-      });
-    } finally {
-      setRendering(false);
-      const refreshed = await invoke<Capabilities>("get_capabilities").catch(
-        () => null,
-      );
-      if (refreshed) {
-        setCapabilities(refreshed);
+      if (current()) {
+        const message = toErrorMessage(reason);
+        setRenderError(message);
+        setRenderProgress(null);
+        setNotice({ kind: "error", title: "成片任务没有完成", message });
       }
+    } finally {
+      operationGate.current.finish(token);
+      setRendering(false);
+      const refreshed = await invoke<Capabilities>("get_capabilities").catch(() => null);
+      if (refreshed) setCapabilities(refreshed);
     }
   }
 
@@ -1299,6 +1275,7 @@ function App() {
     if (!rendering) {
       return;
     }
+    renderCancelRequested.current = true;
     setPlanFeedback("正在安全停止导出并关闭 Dota 2...");
     try {
       await invoke<boolean>("cancel_render");
@@ -1316,6 +1293,7 @@ function App() {
   }
 
   async function checkForAppUpdate(showResultNotice = true) {
+    if (operationGate.current.updating || closePending.current) return;
     if (!isTauriRuntime) {
       setAppUpdate({ phase: "unavailable" });
       return;
@@ -1327,6 +1305,7 @@ function App() {
         await invoke<Extract<AppUpdateState, { phase: "available" }>["metadata"] | null>(
           "check_for_app_update",
         );
+      if (operationGate.current.updating || closePending.current) return;
       if (metadata) {
         setAppUpdate({ phase: "available", metadata });
         setNotice({
@@ -1346,6 +1325,7 @@ function App() {
       }
     } catch (reason: unknown) {
       const message = toErrorMessage(reason);
+      if (operationGate.current.updating || closePending.current) return;
       setAppUpdate({ phase: "error", message });
       if (showResultNotice) {
         setNotice({
@@ -1361,7 +1341,8 @@ function App() {
     if (appUpdate.phase !== "available") {
       return;
     }
-    if (busy || rendering) {
+    const token = operationGate.current.begin("update");
+    if (!token) {
       setNotice({
         kind: "error",
         title: "当前任务尚未完成",
@@ -1373,9 +1354,9 @@ function App() {
     const metadata = appUpdate.metadata;
     let downloadedBytes = 0;
     let totalBytes: number | null = null;
-    let downloadFinished = false;
     const channel = new Channel<AppUpdateEvent>();
     channel.onmessage = (event) => {
+      if (!operationGate.current.current(token)) return;
       if (event.event === "started") {
         totalBytes = event.data.contentLength;
         setAppUpdate({
@@ -1393,7 +1374,6 @@ function App() {
           totalBytes,
         });
       } else {
-        downloadFinished = true;
         setAppUpdate({ phase: "installing", metadata });
       }
     };
@@ -1405,11 +1385,10 @@ function App() {
     });
 
     try {
+      await flushCurrentDraft();
+      if (!operationGate.current.current(token)) return;
       await invoke("install_app_update", { onEvent: channel });
     } catch (reason: unknown) {
-      if (downloadFinished) {
-        return;
-      }
       const message = toErrorMessage(reason);
       setAppUpdate({ phase: "error", message });
       setNotice({
@@ -1417,6 +1396,8 @@ function App() {
         title: "更新没有完成",
         message,
       });
+    } finally {
+      operationGate.current.finish(token);
     }
   }
 
@@ -1428,8 +1409,8 @@ function App() {
         capabilities={capabilities}
         appVersion={appVersion}
         appUpdate={appUpdate}
-        updateInstallationBlocked={busy || rendering}
-        configurationBlocked={busy || rendering}
+        updateInstallationBlocked={interactionBlocked}
+        configurationBlocked={interactionBlocked}
         onCompletionNoticeChange={setCompletionNoticeEnabled}
         onCapabilitiesChange={setCapabilities}
         onCheckForUpdate={() => void checkForAppUpdate()}
@@ -1440,7 +1421,7 @@ function App() {
         activeView={view}
         capabilities={capabilities}
         recentJobs={recentJobs}
-        busy={busy}
+        busy={interactionBlocked}
         onImport={openImportDialog}
         onViewChange={setView}
         onOpenRecent={(job) => void openRecent(job)}
@@ -1450,19 +1431,20 @@ function App() {
         <ProjectHeader
           selectedPath={selectedPath}
           result={result}
-          busy={busy}
+          busy={interactionBlocked}
           exportingAnalysis={exportingAnalysis}
           analysisExportReady={Boolean(result && highlightHero)}
           renderReady={capabilities.renderReady}
           onImport={openImportDialog}
           onAnalyze={confirmReanalysis}
           onExportAnalysis={() => void exportAnalysisPackage()}
-          onOpenMovieSetup={() => setMovieSetupOpen(true)}
+          onOpenMovieSetup={() => { if (!interactionBlocked) setMovieSetupOpen(true); }}
         />
 
         {view === "library" ? (
           <LibraryView
             jobs={recentJobs}
+            busy={interactionBlocked}
             onOpen={(job) => void openRecent(job)}
             onImport={openImportDialog}
           />
@@ -2183,7 +2165,7 @@ function ProjectHeader({
         )}
         <button
           className="secondary-button"
-          disabled={!analysisExportReady || exportingAnalysis}
+          disabled={busy || !analysisExportReady || exportingAnalysis}
           title={
             analysisExportReady
               ? "导出当前所选主角的 evidence.json 和 report.md"
@@ -2202,7 +2184,7 @@ function ProjectHeader({
         </button>
         <button
           className="primary-button"
-          disabled={!result}
+          disabled={!result || busy}
           title={
             result
               ? renderReady
@@ -2408,7 +2390,7 @@ function ReplayImportDialog({
                     event.target.value.replace(/\D/g, "").slice(0, 20),
                   )
                 }
-                placeholder="例如 8918165123"
+                placeholder="例如 1000000001"
                 inputMode="numeric"
                 autoComplete="off"
                 autoFocus
@@ -3816,7 +3798,7 @@ function ReplayEventTimeline({
 
 function PrecisionTimeEditor({
   clip,
-  replayDuration,
+  replayDuration: rawReplayDuration,
   peakSeconds,
   onUpdate,
 }: {
@@ -3825,6 +3807,7 @@ function PrecisionTimeEditor({
   peakSeconds: number | null;
   onUpdate: (patch: Partial<ClipEditState>) => void;
 }) {
+  const replayDuration = replayEndFrame(rawReplayDuration);
   const frame = 1 / 30;
   const minDuration = 1;
 
@@ -4236,17 +4219,10 @@ function MovieSetupDialog({
   const sceneCount = new Set(
     clips.map((clip) => clip.takeGroupId ?? `standalone:${clip.clipId}`),
   ).size;
-  const hasInvalidClip = clips.some(
-    (clip) =>
-      !Number.isFinite(clip.sourceStartSeconds) ||
-      !Number.isFinite(clip.sourceEndSeconds) ||
-      clip.sourceStartSeconds < 0 ||
-      clip.sourceEndSeconds <= clip.sourceStartSeconds ||
-      clip.sourceEndSeconds > result.replay.playback_time_seconds ||
-      clip.sourceEndSeconds - clip.sourceStartSeconds < 1 ||
-      clip.sourceEndSeconds - clip.sourceStartSeconds >
-        MAX_CLIP_DURATION_SECONDS,
+  const hasInvalidClip = clips.some((clip) =>
+    !isValidClipTimeRange(clip.sourceStartSeconds, clip.sourceEndSeconds, result.replay.playback_time_seconds),
   );
+
   const active = saving || rendering;
   const previewSource =
     renderResult && isTauriRuntime
@@ -4588,10 +4564,12 @@ function SummaryStat({
 
 function LibraryView({
   jobs,
+  busy,
   onOpen,
   onImport,
 }: {
   jobs: RecentJob[];
+  busy: boolean;
   onOpen: (job: RecentJob) => void;
   onImport: () => void;
 }) {
@@ -4618,6 +4596,7 @@ function LibraryView({
         {jobs.map((job) => (
           <button
             className="library-row"
+            disabled={busy}
             key={job.jobId}
             onClick={() => onOpen(job)}
           >
@@ -4709,10 +4688,6 @@ function parentPath(path: string) {
 
 function isDemPath(path: string) {
   return path.toLocaleLowerCase("en-US").endsWith(".dem");
-}
-
-function roundFrame(value: number) {
-  return Math.round(value * 30) / 30;
 }
 
 function replayPlayers(result: AnalysisSummary): ReplayPlayer[] {
@@ -4827,7 +4802,14 @@ function createClipEdits(
   savedPlan?: Pick<EditPlanSlot, "clips">,
 ): ClipEdits {
   if (savedPlan) {
-    const clips = savedPlan.clips.map((clip, index) => ({
+    const clips = savedPlan.clips.map((clip, index) => {
+      const range = frameRangeWithinReplay(clip.sourceStartSeconds, clip.sourceEndSeconds,
+        result.replay.playback_time_seconds);
+      const shortRange = frameRangeWithinReplay(
+        clip.shortSourceStartSeconds ?? clip.sourceStartSeconds,
+        clip.shortSourceEndSeconds ?? clip.sourceEndSeconds,
+        result.replay.playback_time_seconds);
+      return {
       clipId: clip.clipId || `clip-saved-${String(index + 1).padStart(2, "0")}`,
       candidateId: clip.candidateId,
       viewHero:
@@ -4841,15 +4823,11 @@ function createClipEdits(
       durationMode: clip.durationMode ?? "short",
       storyPreRollSeconds:
         clip.storyPreRollSeconds ?? DEFAULT_STORY_PRE_ROLL_SECONDS,
-      shortStartSeconds: roundFrame(
-        clip.shortSourceStartSeconds ?? clip.sourceStartSeconds,
-      ),
-      shortEndSeconds: roundFrame(
-        clip.shortSourceEndSeconds ?? clip.sourceEndSeconds,
-      ),
-      startSeconds: roundFrame(clip.sourceStartSeconds),
-      endSeconds: roundFrame(clip.sourceEndSeconds),
-    }));
+      shortStartSeconds: shortRange.startSeconds,
+      shortEndSeconds: shortRange.endSeconds,
+      ...range,
+      };
+    });
     return normalizeStoryDurationClips(
       clips,
       result.highlights.candidates,
@@ -4878,7 +4856,7 @@ function createClipEdits(
     const start = segment?.source_start_seconds ?? candidate.start_seconds;
     const unclampedEnd = segment?.source_end_seconds ?? candidate.end_seconds;
     const end = Math.min(
-      result.replay.playback_time_seconds,
+      replayEndFrame(result.replay.playback_time_seconds),
       start + Math.min(90, Math.max(1, unclampedEnd - start)),
     );
     return {
@@ -4918,8 +4896,10 @@ function createHeroHighlightClips(
   hero: string,
   ruleIds: readonly HighlightRuleId[] = DEFAULT_HIGHLIGHT_RULE_IDS,
 ): ClipEdits {
-  return heroHighlightCandidates(result, hero, ruleIds).map(
-    (candidate, index) => ({
+  return heroHighlightCandidates(result, hero, ruleIds).map((candidate, index) => {
+    const range = frameRangeWithinReplay(candidate.start_seconds, candidate.end_seconds,
+      result.replay.playback_time_seconds);
+    return {
       clipId: `clip-hero-${String(index + 1).padStart(2, "0")}`,
       candidateId: candidate.id,
       viewHero: hero,
@@ -4927,34 +4907,29 @@ function createHeroHighlightClips(
       takeGroupId: null,
       takeRole: "primary",
       includeInFinal: true,
-      ...shortDurationState(candidate.start_seconds, candidate.end_seconds),
-      startSeconds: roundFrame(candidate.start_seconds),
-      endSeconds: roundFrame(candidate.end_seconds),
-    }),
-  );
+      ...shortDurationState(range.startSeconds, range.endSeconds),
+      ...range,
+    };
+  });
 }
 
-function createStoryClips(story: HighlightStory): ClipEdits {
+function createStoryClips(story: HighlightStory, replayDuration: number): ClipEdits {
   return [...story.shots]
     .sort((left, right) => left.order - right.order)
-    .map((shot) => ({
-      clipId: `clip-${shot.id}`,
-      candidateId: shot.candidate_id,
-      viewHero: shot.target_hero ?? story.primary_hero,
-      cameraMode:
-        shot.camera_mode === "hero_chase"
-          ? "hero_chase"
-          : "player_perspective",
-      takeGroupId: shot.take_group_id,
-      takeRole: shot.take_role,
-      includeInFinal: shot.include_in_default_cut,
-      ...shortDurationState(
-        shot.source_start_seconds,
-        shot.source_end_seconds,
-      ),
-      startSeconds: roundFrame(shot.source_start_seconds),
-      endSeconds: roundFrame(shot.source_end_seconds),
-    }));
+    .map((shot) => {
+      const range = frameRangeWithinReplay(shot.source_start_seconds, shot.source_end_seconds, replayDuration);
+      return {
+        clipId: `clip-${shot.id}`,
+        candidateId: shot.candidate_id,
+        viewHero: shot.target_hero ?? story.primary_hero,
+        cameraMode: shot.camera_mode === "hero_chase" ? "hero_chase" : "player_perspective",
+        takeGroupId: shot.take_group_id,
+        takeRole: shot.take_role,
+        includeInFinal: shot.include_in_default_cut,
+        ...shortDurationState(range.startSeconds, range.endSeconds),
+        ...range,
+      };
+    });
 }
 
 function storyDefaultDuration(story: HighlightStory) {

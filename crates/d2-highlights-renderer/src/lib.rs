@@ -1,14 +1,17 @@
 mod audio;
+mod execution;
 
 use audio::write_original_bgm;
 use d2_highlights_core::TimelineDocument;
-use d2_highlights_replay_control::{ReplayControlError, execute_vconsole_commands, probe_vconsole};
+use d2_highlights_replay_control::{
+    ReplayControlError, VConsoleExecutionReport, execute_vconsole_commands, probe_vconsole,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -29,7 +32,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 
 pub const RENDER_SCHEMA_VERSION: &str = "d2h.render/1.9";
 // Bump this whenever Dota capture commands or frame/audio encoding behavior changes.
-const CAPTURE_PIPELINE_VERSION: &str = "d2h.capture/1.9.6-native-hud-12";
+const CAPTURE_PIPELINE_VERSION: &str = "d2h.capture/1.9.10-validated-capture-13";
 const FRAME_RATE: u32 = 30;
 const CAPTURE_PREROLL_SECONDS: f32 = 1.0;
 const VCONSOLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,10 +63,10 @@ fn configure_child_process_error_mode() {
 }
 
 fn output_with_loader_retry(mut build: impl FnMut() -> Command) -> io::Result<Output> {
-    let first = build().output()?;
+    let first = execution::output(build())?;
     if is_dll_init_failure(first.status.code()) {
         thread::sleep(Duration::from_millis(300));
-        build().output()
+        execution::output(build())
     } else {
         Ok(first)
     }
@@ -235,6 +238,31 @@ struct SegmentState {
     output_path: String,
     duration_seconds: f32,
     status: String,
+    #[serde(default)]
+    capture_pipeline: String,
+    #[serde(default)]
+    content_sha256: String,
+    #[serde(default)]
+    quality_checked: bool,
+    #[serde(default)]
+    camera_target_verified: bool,
+    #[serde(default)]
+    expected_duration_seconds: f32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CaptureDiagnostics {
+    clip_id: String,
+    requested_camera: ClipCameraMode,
+    requested_hero: Option<String>,
+    requested_slot: Option<u8>,
+    requested_tick: u32,
+    observed_tick: u32,
+    observed_look_at: [f32; 3],
+    camera_target_verified: bool,
+    verification_status: String,
+    expected_frames: usize,
+    captured_frames: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -332,6 +360,40 @@ pub enum RenderError {
 pub fn render<F>(
     request: RenderRequest,
     cancellation: CancellationToken,
+    on_progress: F,
+) -> Result<RenderResult, RenderError>
+where
+    F: FnMut(RenderProgress),
+{
+    let log_path = request
+        .job_dir
+        .join("render")
+        .join("logs")
+        .join(format!("render-{}.jsonl", unique_stamp()));
+    let _scope = execution::Scope::enter(cancellation.clone(), log_path.clone())?;
+    execution::record(
+        "render_start",
+        serde_json::json!({
+            "jobId": request.job_id, "capturePipeline": CAPTURE_PIPELINE_VERSION,
+            "clips": request.clips, "diagnostics": log_path,
+        }),
+    )?;
+    let mut result = render_inner(request, cancellation.clone(), on_progress);
+    if cancellation.is_cancelled() {
+        result = Err(RenderError::Cancelled);
+    }
+    execution::record(
+        "render_finished",
+        serde_json::json!({
+            "success": result.is_ok(), "error": result.as_ref().err().map(ToString::to_string),
+        }),
+    )?;
+    result
+}
+
+fn render_inner<F>(
+    request: RenderRequest,
+    cancellation: CancellationToken,
     mut on_progress: F,
 ) -> Result<RenderResult, RenderError>
 where
@@ -380,7 +442,7 @@ where
         &request.source_replay,
         &replay_dir,
         &request.job_id,
-        &fingerprint,
+        &request.source_sha256,
     )?;
 
     emit(
@@ -392,27 +454,44 @@ where
         0,
         request.clips.len(),
     );
-    let mut child = launch_dota(&request.dota2_exe)?;
-    let session_result = run_dota_session(
-        &request,
-        &prepared_replay.replay_reference,
-        &movie_dir,
-        &segment_root,
-        &state_path,
-        &mut state,
-        &cancellation,
-        &mut child,
-        &mut on_progress,
-    );
-    let shutdown_warning = shutdown_dota(&mut child);
-    if prepared_replay.created_by_app {
-        let _ = fs::remove_file(&prepared_replay.path);
-    }
+    let mut owned_dota = OwnedDota(launch_dota(&request.dota2_exe)?);
+    // From successful spawn until verified shutdown there is no early return,
+    // including a diagnostic-write failure or a cancelled capture session.
+    let session_result = (|| {
+        execution::record(
+            "dota_started",
+            serde_json::json!({"pid": owned_dota.0.id()}),
+        )?;
+        run_dota_session(
+            &request,
+            &prepared_replay.replay_reference,
+            &movie_dir,
+            &segment_root,
+            &state_path,
+            &mut state,
+            &cancellation,
+            &mut owned_dota.0,
+            &mut on_progress,
+        )
+    })();
+    finish_dota_session(&mut owned_dota.0, request.clips.len(), &mut on_progress);
 
     let segments = session_result?;
     let mut warnings = Vec::new();
-    if let Some(warning) = shutdown_warning {
-        warnings.push(warning);
+    let unverified_count = request
+        .clips
+        .iter()
+        .filter(|clip| {
+            state
+                .segments
+                .get(&clip.clip_id)
+                .is_none_or(|segment| !segment.camera_target_verified)
+        })
+        .count();
+    if unverified_count > 0 {
+        warnings.push(format!(
+            "{unverified_count} 段素材已检查回放 tick、镜头位置和媒体完整性，但尚未核验画面中的目标英雄/事件；请查看各段诊断并确认画面。未核验目标镜头的素材不会自动复用。"
+        ));
     }
     check_cancelled(&cancellation)?;
 
@@ -494,13 +573,16 @@ where
         BgmMode::GameOnly => None,
     };
 
+    check_cancelled(&cancellation)?;
     let final_path = output_dir.join(format!("{output_stem}.mp4"));
+    let pending_final_path =
+        output_dir.join(format!("{output_stem}.partial-{}.mp4", unique_stamp()));
     mix_final_audio(
         &request.ffmpeg_exe,
         &joined_path,
         bgm_path.as_deref(),
         narration_path.as_deref(),
-        &final_path,
+        &pending_final_path,
         joined_duration,
         &request.settings,
     )?;
@@ -514,7 +596,15 @@ where
         request.clips.len(),
         request.clips.len(),
     );
-    let mut qc = run_qc(&request.ffmpeg_exe, &request.ffprobe_exe, &final_path)?;
+    check_cancelled(&cancellation)?;
+    let mut qc = run_qc(
+        &request.ffmpeg_exe,
+        &request.ffprobe_exe,
+        &pending_final_path,
+    )?;
+    check_cancelled(&cancellation)?;
+    fs::rename(&pending_final_path, &final_path)?;
+    qc.output_path = final_path.display().to_string();
     warnings.append(&mut qc.warnings);
     qc.final_segment_count = final_segments.len();
     qc.source_assets_dir = source_assets_dir.display().to_string();
@@ -619,7 +709,7 @@ fn export_source_assets(
             asset_id,
             camera_asset_label(&clip.camera_mode)
         ));
-        fs::copy(segment, &output_path)?;
+        copy_file(segment, &output_path)?;
         assets.push(RenderSourceAsset {
             asset_id,
             scene_number,
@@ -734,31 +824,40 @@ where
     let mut rendered_segments = Vec::with_capacity(total);
     for (index, clip) in request.clips.iter().enumerate() {
         check_cancelled(cancellation)?;
-        let output_path = segment_root.join(format!("{:02}-{}.mp4", index + 1, clip.clip_id));
-        if segment_cache_is_valid(&request.ffprobe_exe, &output_path) {
-            let duration = probe_media(&request.ffprobe_exe, &output_path)?.duration_seconds;
-            state.segments.insert(
-                clip.clip_id.clone(),
-                SegmentState {
-                    candidate_id: clip.clip_id.clone(),
-                    output_path: output_path.display().to_string(),
-                    duration_seconds: duration,
-                    status: "complete".to_string(),
-                },
-            );
-            write_json(state_path, state)?;
-            rendered_segments.push(output_path);
+        let cached = state
+            .segments
+            .get(&clip.clip_id)
+            .filter(|cached| Path::new(&cached.output_path).parent() == Some(segment_root));
+        if let Some(cached) = cached.filter(|cached| segment_cache_is_valid(request, clip, cached))
+        {
+            rendered_segments.push(PathBuf::from(&cached.output_path));
+            execution::record("cache_hit", serde_json::json!({"clipId": clip.clip_id}))?;
             emit(
                 on_progress,
                 "capture",
                 "running",
-                &format!("已恢复片段 {} 的缓存", index + 1),
+                &format!("已恢复片段 {} 的已验收缓存", index + 1),
                 clip_percent(index + 1, total),
                 index + 1,
                 total,
             );
             continue;
         }
+        execution::record(
+            "capture_begin",
+            serde_json::json!({
+                "clipId": clip.clip_id, "sourceStart": clip.source_start_seconds,
+                "sourceEnd": clip.source_end_seconds, "camera": clip.camera_mode,
+                "hero": clip.view_hero, "cacheDecision": "missing_or_not_verified",
+            }),
+        )?;
+        let output_path = segment_root.join(format!(
+            "{:02}-{}-{}.mp4",
+            index + 1,
+            clip.clip_id,
+            unique_stamp()
+        ));
+        let pending_output = output_path.with_extension("partial.mp4");
 
         emit(
             on_progress,
@@ -769,10 +868,15 @@ where
             index + 1,
             total,
         );
-        let clip_dir = segment_root.join(format!("{:02}-{}", index + 1, clip.clip_id));
+        let clip_dir = segment_root.join(format!(
+            "{:02}-{}-{}",
+            index + 1,
+            clip.clip_id,
+            unique_stamp()
+        ));
         fs::create_dir_all(&clip_dir)?;
         let base_path = clip_dir.join("base.mp4");
-        capture_clip(
+        let diagnostics = capture_clip(
             request,
             clip,
             index,
@@ -803,20 +907,40 @@ where
             &request.ffmpeg_exe,
             &request.ffprobe_exe,
             &base_path,
-            &output_path,
+            &pending_output,
             clip,
             request.settings.replay_emphasis,
         )?;
-        let duration = probe_media(&request.ffprobe_exe, &output_path)?.duration_seconds;
+        check_cancelled(cancellation)?;
+        let media = probe_media(&request.ffprobe_exe, &pending_output)?;
+        let expected_duration = expected_clip_duration(clip, &request.settings);
+        validate_segment_media(&media, expected_duration)?;
+        let segment_qc = run_qc(&request.ffmpeg_exe, &request.ffprobe_exe, &pending_output)?;
+        write_json(&clip_dir.join("quality.json"), &segment_qc)?;
+        let content_sha256 = file_sha256(&pending_output)?;
+        check_cancelled(cancellation)?;
+        fs::rename(&pending_output, &output_path)?;
+        let quality_checked = segment_qc.warnings.is_empty();
         state.segments.insert(
             clip.clip_id.clone(),
             SegmentState {
-                candidate_id: clip.clip_id.clone(),
+                candidate_id: clip.candidate_id.clone(),
                 output_path: output_path.display().to_string(),
-                duration_seconds: duration,
-                status: "complete".to_string(),
+                duration_seconds: media.duration_seconds,
+                status: if diagnostics.camera_target_verified && quality_checked {
+                    "complete"
+                } else {
+                    "camera_target_unverified"
+                }
+                .to_string(),
+                capture_pipeline: CAPTURE_PIPELINE_VERSION.to_string(),
+                content_sha256,
+                quality_checked,
+                camera_target_verified: diagnostics.camera_target_verified,
+                expected_duration_seconds: expected_duration,
             },
         );
+
         state.updated_unix_seconds = unix_seconds()?;
         write_json(state_path, state)?;
         rendered_segments.push(output_path);
@@ -835,7 +959,7 @@ fn capture_clip<P>(
     cancellation: &CancellationToken,
     child: &mut Child,
     mut on_tick: P,
-) -> Result<(), RenderError>
+) -> Result<CaptureDiagnostics, RenderError>
 where
     P: FnMut(f32, f32),
 {
@@ -857,13 +981,41 @@ where
     send_commands(&["demo_resume".to_string()])?;
     thread::sleep(Duration::from_millis(350));
     send_commands(&[format!("demo_goto {capture_start_tick} absolute pause")])?;
-    wait_for_seek(capture_start_tick, cancellation, child)?;
+    let observed_tick = wait_for_seek(capture_start_tick, cancellation, child)?;
 
     let mut setup_commands = vec!["demo_timescale 1.000".to_string()];
     setup_commands.extend(camera_commands_for_clip(&request.timeline, clip));
     setup_commands.extend(hud_commands(request.settings.clean_hud));
     send_commands(&setup_commands)?;
     wait_with_cancel(Duration::from_millis(250), cancellation, child, |_| {})?;
+    let camera_report = execute_logged_commands(&["dota_camera_get_lookatpos".to_string()])?;
+    let observed_look_at = camera_report
+        .console_excerpt
+        .iter()
+        .find_map(|line| parse_camera_look_at(line))
+        .ok_or_else(|| {
+            RenderError::ReplayControl(
+                "镜头位置反馈不可识别，已停止录制；请保留控制日志以校准当前客户端。".to_string(),
+            )
+        })?;
+    // A real position response proves only that the camera answered. It does
+    // not prove the requested hero/mode is active. Never upgrade this to a
+    // target-verified cache without a separately validated feedback contract.
+    wait_for_seek(capture_start_tick, cancellation, child)?;
+    let mut diagnostics = CaptureDiagnostics {
+        clip_id: clip.clip_id.clone(),
+        requested_camera: clip.camera_mode.clone(),
+        requested_hero: clip.view_hero.clone(),
+        requested_slot: hero_slot_for_clip(&request.timeline, clip),
+        requested_tick: capture_start_tick,
+        observed_tick,
+        observed_look_at,
+        camera_target_verified: false,
+        verification_status: "camera_target_unverified".to_string(),
+        expected_frames: 0,
+        captured_frames: 0,
+    };
+    write_json(&clip_dir.join("capture-diagnostics.json"), &diagnostics)?;
 
     let before = collect_movie_files(movie_dir)?;
     let prefix = format!(
@@ -936,12 +1088,15 @@ where
         child,
         &mut on_tick,
     )?;
-    let _ = send_commands(&["endmovie".to_string(), "demo_pause".to_string()]);
+    send_commands(&["endmovie".to_string(), "demo_pause".to_string()])?;
 
     let raw_dir = clip_dir.join("raw");
     fs::create_dir_all(&raw_dir)?;
     let captured = wait_for_movie_files(movie_dir, &before, &prefix, cancellation)?;
     let captured_frame_count = captured.iter().filter(|path| is_jpeg(path)).count();
+    diagnostics.expected_frames = capture_frame_count;
+    diagnostics.captured_frames = captured_frame_count;
+    write_json(&clip_dir.join("capture-diagnostics.json"), &diagnostics)?;
     if captured_frame_count < capture_frame_count {
         return Err(RenderError::MissingFrames(clip.clip_id.clone()));
     }
@@ -973,7 +1128,7 @@ where
     for path in captured {
         let _ = fs::remove_file(path);
     }
-    Ok(())
+    Ok(diagnostics)
 }
 
 fn apply_replay_emphasis(
@@ -985,7 +1140,7 @@ fn apply_replay_emphasis(
     enabled: bool,
 ) -> Result<(), RenderError> {
     if !enabled {
-        fs::copy(input, output)?;
+        copy_file(input, output)?;
         return Ok(());
     }
     let media = probe_media(ffprobe, input)?;
@@ -1000,7 +1155,7 @@ fn apply_replay_emphasis(
     let replay_start = (output_peak - 1.15).max(0.0);
     let replay_end = (output_peak + 1.0).min(media.duration_seconds);
     if replay_end - replay_start < 0.8 {
-        fs::copy(input, output)?;
+        copy_file(input, output)?;
         return Ok(());
     }
     let filter = format!(
@@ -1200,10 +1355,12 @@ fn mix_final_audio(
 
 fn run_qc(ffmpeg: &Path, ffprobe: &Path, output: &Path) -> Result<QcReport, RenderError> {
     let media = probe_media(ffprobe, output)?;
+    validate_media_contract(&media)?;
     let qc_output = output_with_loader_retry(|| {
         let mut command = background_command(ffmpeg);
         command.args([
             "-hide_banner",
+            "-xerror",
             "-i",
             &path_arg(output),
             "-vf",
@@ -1217,26 +1374,32 @@ fn run_qc(ffmpeg: &Path, ffprobe: &Path, output: &Path) -> Result<QcReport, Rend
         command
     })
     .map_err(|error| RenderError::Media(format!("无法运行质量检查：{error}")))?;
+    parse_qc_report(output, media, qc_output)
+}
+
+fn parse_qc_report(
+    output: &Path,
+    media: MediaInfo,
+    qc_output: Output,
+) -> Result<QcReport, RenderError> {
+    validate_media_contract(&media)?;
+    require_success(&qc_output, "质量检查")?;
     let stderr = String::from_utf8_lossy(&qc_output.stderr);
     let black_events = stderr.matches("black_start:").count();
     let freeze_events = stderr.matches("freeze_start:").count();
     let audio_mean_db = parse_db_value(&stderr, "mean_volume:");
     let audio_peak_db = parse_db_value(&stderr, "max_volume:");
+    if audio_mean_db.is_none() || audio_peak_db.is_none() {
+        return Err(RenderError::Media(
+            "质量检查未返回完整音量检测结果，不能报告已通过。".to_string(),
+        ));
+    }
     let mut warnings = Vec::new();
     if black_events > 0 {
         warnings.push(format!("检测到 {black_events} 个超过 0.5 秒的黑帧区间。"));
     }
     if freeze_events > 0 {
         warnings.push(format!("检测到 {freeze_events} 个超过 1.5 秒的冻结区间。"));
-    }
-    if !media.has_audio {
-        warnings.push("最终成片没有音轨。".to_string());
-    }
-    if media.width != 1920 || media.height != 1080 {
-        warnings.push(format!(
-            "最终分辨率为 {}x{}，不是目标 1920x1080。",
-            media.width, media.height
-        ));
     }
     Ok(QcReport {
         schema_version: RENDER_SCHEMA_VERSION.to_string(),
@@ -1264,6 +1427,7 @@ struct MediaInfo {
     height: u32,
     has_video: bool,
     has_audio: bool,
+    video_frames: Option<usize>,
 }
 
 fn probe_media(ffprobe: &Path, path: &Path) -> Result<MediaInfo, RenderError> {
@@ -1273,7 +1437,7 @@ fn probe_media(ffprobe: &Path, path: &Path) -> Result<MediaInfo, RenderError> {
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=codec_type,width,height",
+            "format=duration:stream=codec_type,width,height,nb_frames",
             "-of",
             "json",
             &path_arg(path),
@@ -1298,11 +1462,16 @@ fn probe_media(ffprobe: &Path, path: &Path) -> Result<MediaInfo, RenderError> {
     let mut height = 0;
     let mut has_video = false;
     let mut has_audio = false;
+    let mut video_frames = None;
     if let Some(streams) = value.get("streams").and_then(|value| value.as_array()) {
         for stream in streams {
             match stream.get("codec_type").and_then(|value| value.as_str()) {
                 Some("video") => {
                     has_video = true;
+                    video_frames = stream
+                        .get("nb_frames")
+                        .and_then(|value| value.as_str())
+                        .and_then(|value| value.parse().ok());
                     width = stream
                         .get("width")
                         .and_then(|value| value.as_u64())
@@ -1323,14 +1492,31 @@ fn probe_media(ffprobe: &Path, path: &Path) -> Result<MediaInfo, RenderError> {
         height,
         has_video,
         has_audio,
+        video_frames,
     })
 }
 
 fn validate_request(request: &RenderRequest) -> Result<(), RenderError> {
+    if request.timeline.source_sha256 != request.source_sha256 {
+        return Err(RenderError::InvalidPlan(
+            "录像时间轴与原录像身份不一致，请重新分析。".to_string(),
+        ));
+    }
     if !request.source_replay.is_file() {
         return Err(RenderError::MissingReplay(
             request.source_replay.display().to_string(),
         ));
+    }
+    if file_sha256(&request.source_replay)? != request.source_sha256 {
+        return Err(RenderError::InvalidPlan(
+            "原录像内容已变化，与分析数据不一致；请重新分析。".to_string(),
+        ));
+    }
+    if !request.timeline.replay.playback_time_seconds.is_finite()
+        || request.timeline.replay.playback_time_seconds <= 0.0
+        || request.timeline.replay.playback_ticks <= 0
+    {
+        return Err(RenderError::InvalidPlan("录像时间轴无效。".to_string()));
     }
     if !request.dota2_exe.is_file() {
         return Err(RenderError::MissingTool("Dota 2".to_string()));
@@ -1343,14 +1529,26 @@ fn validate_request(request: &RenderRequest) -> Result<(), RenderError> {
     let mut ids = HashSet::new();
     let mut take_groups = HashMap::<String, Vec<&RenderClip>>::new();
     for clip in &request.clips {
+        if clip.clip_id.is_empty()
+            || clip.clip_id.len() > 160
+            || !clip
+                .clip_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !clip.source_start_seconds.is_finite()
+            || !clip.source_end_seconds.is_finite()
+            || !clip.source_peak_seconds.is_finite()
+            || !clip.anchor_seconds.is_finite()
+        {
+            return Err(RenderError::InvalidPlan("片段编号或时间无效。".to_string()));
+        }
         if !ids.insert(&clip.clip_id) {
             return Err(RenderError::InvalidPlan(format!(
                 "片段 {} 重复出现",
                 clip.clip_id
             )));
         }
-        let duration = clip.source_end_seconds - clip.source_start_seconds;
-        if !duration.is_finite() || !(1.0..=100.0).contains(&duration) {
+        if !valid_source_frame_range(clip.source_start_seconds, clip.source_end_seconds) {
             return Err(RenderError::InvalidPlan(format!(
                 "{} 的时长必须在 1 到 100 秒之间",
                 clip.clip_id
@@ -1480,9 +1678,18 @@ fn render_fingerprint_with_pipeline(
 
 fn load_or_create_state(path: &Path, fingerprint: &str) -> Result<RenderState, RenderError> {
     if path.is_file() {
-        let state: RenderState = serde_json::from_slice(&fs::read(path)?)?;
-        if state.fingerprint == fingerprint {
-            return Ok(state);
+        match serde_json::from_slice::<RenderState>(&fs::read(path)?) {
+            Ok(state) if state.fingerprint == fingerprint => return Ok(state),
+            previous => {
+                let backup = path.with_extension(format!("rejected-{}.json", unique_stamp()));
+                copy_file(path, &backup)?;
+                execution::record(
+                    "cache_state_rejected",
+                    serde_json::json!({
+                        "backup": backup, "parseError": previous.err().map(|error| error.to_string()),
+                    }),
+                )?;
+            }
         }
     }
     let state = RenderState {
@@ -1505,39 +1712,80 @@ fn prepare_replay(
     source: &Path,
     replay_dir: &Path,
     job_id: &str,
-    fingerprint: &str,
+    expected_sha256: &str,
 ) -> Result<PreparedReplay, RenderError> {
-    let source_canonical = fs::canonicalize(source)?;
-    let replay_canonical = fs::canonicalize(replay_dir)?;
-    let (path, created_by_app) = if source_canonical
-        .parent()
-        .is_some_and(|parent| parent == replay_canonical)
-    {
-        (source_canonical, false)
-    } else {
-        let safe_job = job_id
-            .chars()
-            .filter(|character| character.is_ascii_alphanumeric())
-            .take(18)
-            .collect::<String>();
-        let destination = replay_dir.join(format!("d2h_{}_{}.dem", safe_job, &fingerprint[..10]));
-        if !destination.is_file()
-            || fs::metadata(&destination)?.len() != fs::metadata(&source_canonical)?.len()
-        {
-            fs::copy(&source_canonical, &destination)?;
-        }
-        (destination, true)
-    };
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| RenderError::InvalidPlan("录像文件名无法用于回放。".to_string()))?
-        .to_string();
-    Ok(PreparedReplay {
+    // Always use a newly-created ASCII alias. In particular, never interpolate
+    // the user's original filename into a console command, even in replays/.
+    let safe_job: String = job_id
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(18)
+        .collect();
+    let stem = format!("d2h_{}_{}", safe_job, unique_stamp());
+    let path = replay_dir.join(format!("{stem}.dem"));
+    let mut prepared = PreparedReplay {
         path,
         replay_reference: format!("replays/{stem}"),
-        created_by_app,
-    })
+        created_by_app: false,
+    };
+    let mut input = fs::File::open(source)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&prepared.path)?;
+    prepared.created_by_app = true;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        execution::check_cancelled()?;
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        output.write_all(&buffer[..count])?;
+    }
+    output.sync_all()?;
+    drop(output);
+    if format!("{:x}", hasher.finalize()) != expected_sha256
+        || file_sha256(&prepared.path)? != expected_sha256
+    {
+        return Err(RenderError::InvalidPlan(
+            "复制录像期间源内容发生变化或副本校验失败，请重新分析。".to_string(),
+        ));
+    }
+    Ok(prepared)
+}
+
+impl Drop for PreparedReplay {
+    fn drop(&mut self) {
+        if self.created_by_app {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+struct OwnedDota(Child);
+
+impl Drop for OwnedDota {
+    fn drop(&mut self) {
+        let pid = self.0.id();
+        let mut first_attempt = true;
+        // Also hold the owning stack during unwinding until the same Child is
+        // confirmed stopped. A second failed best-effort attempt is not enough.
+        wait_for_verified_cleanup(
+            || shutdown_dota(&mut self.0, std::mem::take(&mut first_attempt)),
+            |error| {
+                let _ = execution::record(
+                    "cleanup_pending",
+                    serde_json::json!({
+                        "pid": pid, "error": error, "duringUnwind": std::thread::panicking(),
+                    }),
+                );
+            },
+            || thread::sleep(Duration::from_secs(2)),
+        );
+    }
 }
 
 fn dota_game_dir(dota2_exe: &Path) -> Result<PathBuf, RenderError> {
@@ -1583,74 +1831,184 @@ fn wait_for_vconsole(
     Err(RenderError::VConsoleUnavailable)
 }
 
+// Format recovered read-only from the installed engine2.dll:
+// "  Currently playing %d of %d ticks. Minutes:%.2f File:%s".
+// Unknown client formats fail closed and are preserved in the diagnostic log.
+fn parse_demo_current_tick(line: &str) -> Option<u32> {
+    let value = line.trim().strip_prefix("Currently playing ")?;
+    let (current, remaining) = value.split_once(" of ")?;
+    let (total, _) = remaining.split_once(" ticks.")?;
+    let current: u32 = current.parse().ok()?;
+    let total: u32 = total.parse().ok()?;
+    (current <= total).then_some(current)
+}
+
+// Verified string in the installed client.dll. This confirms position only.
+fn parse_camera_look_at(line: &str) -> Option<[f32; 3]> {
+    let value = line.trim().strip_prefix("Camera look-at position: ")?;
+    let mut coordinates = value.split_ascii_whitespace();
+    let result = [
+        coordinates.next()?.parse().ok()?,
+        coordinates.next()?.parse().ok()?,
+        coordinates.next()?.parse().ok()?,
+    ];
+    (coordinates.next().is_none() && result.iter().all(|value: &f32| value.is_finite()))
+        .then_some(result)
+}
+
+fn seek_observation_is_stable(previous: Option<u32>, current: Option<u32>, target: u32) -> bool {
+    current.is_some_and(|tick| tick.abs_diff(target) <= 5 && previous == current)
+}
+
 fn wait_for_seek(
     target_tick: u32,
     cancellation: &CancellationToken,
     child: &mut Child,
-) -> Result<(), RenderError> {
+) -> Result<u32, RenderError> {
     let started = Instant::now();
-    let mut had_response = false;
+    let mut previous_tick = None;
+    let mut last_tick = None;
+    let mut last_error = None;
     while started.elapsed() < Duration::from_secs(15) {
         check_cancelled(cancellation)?;
         if child.try_wait()?.is_some() {
             return Err(RenderError::DotaExited);
         }
-        if let Ok(report) =
-            execute_vconsole_commands(&["demo_info".to_string()], VCONSOLE_COMMAND_TIMEOUT)
-        {
-            had_response = true;
-            if report
-                .console_excerpt
-                .iter()
-                .flat_map(|line| line.split(|character: char| !character.is_ascii_digit()))
-                .filter_map(|value| value.parse::<u32>().ok())
-                .any(|tick| tick.abs_diff(target_tick) <= 5)
-            {
-                return Ok(());
+        match execute_logged_commands(&["demo_info".to_string()]) {
+            Ok(report) => {
+                let current = report
+                    .console_excerpt
+                    .iter()
+                    .find_map(|line| parse_demo_current_tick(line));
+                execution::record(
+                    "seek_observation",
+                    serde_json::json!({
+                        "targetTick": target_tick, "observedTick": current, "previousTick": previous_tick,
+                    }),
+                )?;
+                if seek_observation_is_stable(previous_tick, current, target_tick) {
+                    return Ok(current.expect("stable observation has a tick"));
+                }
+                previous_tick = current;
+                last_tick = current.or(last_tick);
+            }
+            Err(error) => {
+                previous_tick = None;
+                last_error = Some(error.to_string());
             }
         }
-        thread::sleep(Duration::from_millis(650));
+        wait_with_cancel(Duration::from_millis(650), cancellation, child, |_| {})?;
     }
-    if had_response {
-        Ok(())
-    } else {
-        Err(RenderError::ReplayControl(
-            "回放跳转后没有收到状态回应。".to_string(),
-        ))
-    }
+    Err(RenderError::ReplayControl(format!(
+        "回放跳转未确认，已停止录制：目标 tick {target_tick}，最后实际 tick {last_tick:?}，状态错误 {last_error:?}。请保留本次控制日志。"
+    )))
+}
+
+fn execute_logged_commands(commands: &[String]) -> Result<VConsoleExecutionReport, RenderError> {
+    let result = execute_vconsole_commands(commands, VCONSOLE_COMMAND_TIMEOUT);
+    execution::record(
+        "vconsole_commands",
+        serde_json::json!({
+            "commands": commands,
+            "response": result.as_ref().ok(),
+            "error": result.as_ref().err().map(ToString::to_string),
+        }),
+    )?;
+    result.map_err(|error| RenderError::ReplayControl(error.to_string()))
 }
 
 fn send_commands(commands: &[String]) -> Result<(), RenderError> {
-    execute_vconsole_commands(commands, VCONSOLE_COMMAND_TIMEOUT)
-        .map(|_| ())
-        .map_err(|error| RenderError::ReplayControl(error.to_string()))
+    execute_logged_commands(commands).map(|_| ())
 }
 
-fn shutdown_dota(child: &mut Child) -> Option<String> {
-    let _ = execute_vconsole_commands(
-        &[
-            "endmovie".to_string(),
-            "demo_pause".to_string(),
-            "cl_drawhud 1".to_string(),
-            "dota_hide_cursor 0".to_string(),
-        ],
-        Duration::from_secs(2),
-    );
-    let pid = child.id().to_string();
-    #[cfg(windows)]
-    {
-        let _ = background_command("taskkill")
-            .args(["/PID", &pid, "/T"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+fn wait_for_verified_cleanup(
+    mut attempt: impl FnMut() -> Option<String>,
+    mut pending: impl FnMut(&str),
+    mut pause: impl FnMut(),
+) {
+    // Cancellation requests stop production, never ownership accounting. This
+    // function intentionally has no cancellation/timeout escape: callers may
+    // release their activity gate only after the owned process is confirmed out.
+    let mut failures = 0_u64;
+    while let Some(error) = attempt() {
+        failures = failures.saturating_add(1);
+        // Bound repeated diagnostics even if Windows cannot confirm this handle
+        // for hours. Ownership checks continue after these eight notices.
+        if failures <= 128 && failures.is_power_of_two() {
+            pending(&error);
+        }
+        pause();
     }
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(8) {
-        match child.try_wait() {
-            Ok(Some(_)) => return None,
-            Ok(None) => thread::sleep(Duration::from_millis(250)),
-            Err(error) => return Some(format!("关闭 Dota 2 状态检查失败：{error}")),
+}
+
+fn finish_dota_session<F>(child: &mut Child, total_clips: usize, on_progress: &mut F)
+where
+    F: FnMut(RenderProgress),
+{
+    let pid = child.id();
+    let mut first_attempt = true;
+    wait_for_verified_cleanup(
+        || shutdown_dota(child, std::mem::take(&mut first_attempt)),
+        |error| {
+            // A full disk or broken progress receiver must not bypass cleanup.
+            let _ = execution::record(
+                "cleanup_pending",
+                serde_json::json!({"pid": pid, "error": error}),
+            );
+            emit(
+                on_progress,
+                "cleanup_pending",
+                "running",
+                &format!(
+                    "Dota 2（本任务 PID {pid}）尚未确认关闭，正在重试收尾。取消、关闭或更新将等待收尾完成。{error}"
+                ),
+                80,
+                total_clips,
+                total_clips,
+            );
+        },
+        || thread::sleep(Duration::from_secs(2)),
+    );
+    let _ = execution::record(
+        "dota_stopped",
+        serde_json::json!({"pid": pid, "confirmed": true}),
+    );
+}
+
+fn shutdown_dota(child: &mut Child, restore_session: bool) -> Option<String> {
+    match child.try_wait() {
+        Ok(Some(_)) => return None,
+        Ok(None) => {}
+        Err(error) => {
+            return Some(format!(
+                "无法核对本任务的 Dota 2 句柄，等待确认后再操作：{error}"
+            ));
+        }
+    }
+    if restore_session {
+        let _ = execute_vconsole_commands(
+            &[
+                "endmovie".to_string(),
+                "demo_pause".to_string(),
+                "cl_drawhud 1".to_string(),
+                "dota_hide_cursor 0".to_string(),
+            ],
+            Duration::from_secs(2),
+        );
+        let pid = child.id().to_string();
+        #[cfg(windows)]
+        {
+            let mut command = background_command("taskkill");
+            command.args(["/PID", &pid, "/T"]);
+            let _ = execution::cleanup_output(command);
+        }
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(8) {
+            match child.try_wait() {
+                Ok(Some(_)) => return None,
+                Ok(None) => thread::sleep(Duration::from_millis(250)),
+                Err(error) => return Some(format!("关闭 Dota 2 状态检查失败：{error}")),
+            }
         }
     }
     match child.kill().and_then(|_| child.wait()) {
@@ -1687,15 +2045,16 @@ fn steam_is_running() -> Result<bool, RenderError> {
 
 #[cfg(windows)]
 fn windows_process_is_running(image_name: &str) -> Result<bool, RenderError> {
-    let output = background_command("tasklist")
-        .args([
-            "/FI",
-            &format!("IMAGENAME eq {image_name}"),
-            "/FO",
-            "CSV",
-            "/NH",
-        ])
-        .output()?;
+    let mut command = background_command("tasklist");
+    command.args([
+        "/FI",
+        &format!("IMAGENAME eq {image_name}"),
+        "/FO",
+        "CSV",
+        "/NH",
+    ]);
+    let output = execution::output(command)?;
+    require_success(&output, "进程状态检查")?;
     Ok(String::from_utf8_lossy(&output.stdout)
         .to_ascii_lowercase()
         .contains(&image_name.to_ascii_lowercase()))
@@ -1728,7 +2087,7 @@ fn wait_for_movie_files(
     cancellation: &CancellationToken,
 ) -> Result<Vec<PathBuf>, RenderError> {
     let started = Instant::now();
-    let mut last_count = 0;
+    let mut previous_files = BTreeMap::new();
     let mut stable_since = Instant::now();
     while started.elapsed() < Duration::from_secs(20) {
         check_cancelled(cancellation)?;
@@ -1741,13 +2100,17 @@ fn wait_for_movie_files(
                     .file_name()
                     .and_then(|value| value.to_str())
                     .is_some_and(|name| name.contains(prefix));
-                is_new && (name_matches || before.is_empty())
+                is_new && name_matches
             })
             .map(|(path, _)| path.clone())
             .collect::<Vec<_>>();
         captured.sort();
-        if captured.len() != last_count {
-            last_count = captured.len();
+        let captured_files: BTreeMap<_, _> = captured
+            .iter()
+            .map(|path| (path.clone(), current[path]))
+            .collect();
+        if captured_files != previous_files {
+            previous_files = captured_files;
             stable_since = Instant::now();
         } else if captured.len() >= FRAME_RATE as usize
             && stable_since.elapsed() >= Duration::from_secs(2)
@@ -1787,11 +2150,11 @@ fn copy_capture_files(
     let mut copied = Vec::with_capacity(images.len());
     for (index, source) in images.iter().enumerate() {
         let destination = raw_dir.join(format!("frame-{:06}.jpg", index + 1));
-        fs::copy(source, &destination)?;
+        copy_file(source, &destination)?;
         copied.push(destination);
     }
     let wav_destination = raw_dir.join("game.wav");
-    fs::copy(wav, &wav_destination)?;
+    copy_file(wav, &wav_destination)?;
     Ok((copied, wav_destination))
 }
 
@@ -2033,11 +2396,142 @@ fn tail_text(output: &Output, lines: usize) -> String {
         .join(" | ")
 }
 
-fn segment_cache_is_valid(ffprobe: &Path, path: &Path) -> bool {
+fn segment_cache_is_valid(
+    request: &RenderRequest,
+    clip: &RenderClip,
+    state: &SegmentState,
+) -> bool {
+    let expected = expected_clip_duration(clip, &request.settings);
+    if !cache_metadata_matches(state, clip, expected) {
+        return false;
+    }
+    let path = Path::new(&state.output_path);
     path.is_file()
         && fs::metadata(path).is_ok_and(|metadata| metadata.len() > 1024)
-        && probe_media(ffprobe, path)
-            .is_ok_and(|media| media.duration_seconds >= 1.0 && media.has_video && media.has_audio)
+        && file_sha256(path).is_ok_and(|sha| sha == state.content_sha256)
+        && probe_media(&request.ffprobe_exe, path)
+            .is_ok_and(|media| validate_segment_media(&media, expected).is_ok())
+        && run_qc(&request.ffmpeg_exe, &request.ffprobe_exe, path)
+            .is_ok_and(|qc| qc.warnings.is_empty())
+}
+
+fn cache_metadata_matches(state: &SegmentState, clip: &RenderClip, expected: f32) -> bool {
+    state.status == "complete"
+        && state.quality_checked
+        && state.camera_target_verified
+        && state.capture_pipeline == CAPTURE_PIPELINE_VERSION
+        && state.candidate_id == clip.candidate_id
+        && state.content_sha256.len() == 64
+        && (state.expected_duration_seconds - expected).abs() <= 0.001
+        && (state.duration_seconds - expected).abs() <= 0.1
+}
+
+fn expected_clip_duration(clip: &RenderClip, settings: &RenderSettings) -> f32 {
+    let source = clip.source_end_seconds - clip.source_start_seconds;
+    let impact_start =
+        (clip.source_peak_seconds - clip.source_start_seconds - 1.5).clamp(0.0, source);
+    let impact_end =
+        (clip.source_peak_seconds - clip.source_start_seconds + 2.0).clamp(impact_start, source);
+    let speed = if settings.slow_motion { 0.72 } else { 1.0 };
+    let duration = impact_start + (impact_end - impact_start) / speed + source - impact_end;
+    if settings.replay_emphasis {
+        let peak = (clip.source_peak_seconds - clip.source_start_seconds)
+            .clamp(0.0, source)
+            .min(duration);
+        let replay = (peak + 1.0).min(duration) - (peak - 1.15).max(0.0);
+        duration + if replay >= 0.8 { replay / 0.82 } else { 0.0 }
+    } else {
+        duration
+    }
+}
+
+fn validate_media_contract(media: &MediaInfo) -> Result<(), RenderError> {
+    if !media.has_video
+        || !media.has_audio
+        || media.width != 1920
+        || media.height != 1080
+        || !media.duration_seconds.is_finite()
+        || media.duration_seconds < 1.0
+    {
+        return Err(RenderError::Media(
+            "媒体缺少有效视频/音轨，或分辨率、时长不符合成片要求。".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_source_frame_range(start: f32, end: f32) -> bool {
+    start.is_finite()
+        && end.is_finite()
+        && start >= 0.0
+        && end > start
+        && (30..=3000).contains(&((end * 30.0).round() as i64 - (start * 30.0).round() as i64))
+}
+
+fn validate_segment_media(media: &MediaInfo, expected: f32) -> Result<(), RenderError> {
+    validate_media_contract(media)?;
+    let frames = frame_count_for_duration(expected);
+    if (media.duration_seconds - expected).abs() > 0.1
+        || media
+            .video_frames
+            .is_none_or(|actual| actual.abs_diff(frames) > 2)
+    {
+        return Err(RenderError::Media(format!(
+            "片段时长或帧数与方案不一致：预期 {expected:.3} 秒/{frames} 帧，实际 {:.3} 秒/{:?} 帧。",
+            media.duration_seconds, media.video_frames
+        )));
+    }
+    Ok(())
+}
+
+fn require_success(output: &Output, purpose: &str) -> Result<(), RenderError> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(RenderError::Media(format!(
+            "{purpose}失败：{}",
+            command_failure_text(output, 12)
+        )))
+    }
+}
+
+fn file_sha256(path: &Path) -> Result<String, RenderError> {
+    let mut file = fs::File::open(path)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut hasher = Sha256::new();
+    loop {
+        execution::check_cancelled()?;
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn copy_file(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> io::Result<u64> {
+    let mut input = fs::File::open(source)?;
+    let mut output = fs::File::create(destination)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut length = 0;
+    loop {
+        execution::check_cancelled()?;
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        output.write_all(&buffer[..count])?;
+        length += count as u64;
+    }
+    Ok(length)
+}
+
+fn unique_stamp() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
 }
 
 fn impact_cues(ffprobe_exe: &Path, segments: &[(RenderClip, PathBuf)]) -> Vec<f32> {
@@ -2065,12 +2559,12 @@ $speaker.SetOutputToWaveFile($env:D2H_NARRATION_PATH)
 $speaker.Speak($env:D2H_NARRATION_TEXT)
 $speaker.Dispose()
 "#;
-    let output = background_command("powershell.exe")
+    let mut command = background_command("powershell.exe");
+    command
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .env("D2H_NARRATION_PATH", path)
-        .env("D2H_NARRATION_TEXT", text)
-        .output()
-        .map_err(|error| error.to_string())?;
+        .env("D2H_NARRATION_TEXT", text);
+    let output = execution::output(command).map_err(|error| error.to_string())?;
     if output.status.success() && path.is_file() {
         Ok(())
     } else {
@@ -2127,8 +2621,49 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<(), RenderError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(value)?)?;
+    let temporary = path.with_extension(format!("pending-{}.json", unique_stamp()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)?;
+    file.sync_all()?;
+    drop(file);
+    atomic_replace(&temporary, path)?;
     Ok(())
+}
+
+fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+        let destination: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        // Both names are app-owned files in the same directory. No recursive
+        // operations or user media are involved in replacing this JSON state.
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination)
+    }
 }
 
 fn unix_seconds() -> Result<u64, RenderError> {
@@ -2154,6 +2689,322 @@ mod tests {
         select_final_segments, source_asset_numbering, source_to_tick,
     };
     use d2_highlights_core::{ParserIdentity, ReplayMetadata, ReplayPlayer, TimelineDocument};
+
+    #[test]
+    fn cleanup_retries_and_cannot_report_completion_before_exit_is_confirmed() {
+        use std::cell::{Cell, RefCell};
+        let attempts = Cell::new(0);
+        let pauses = Cell::new(0);
+        let pending = RefCell::new(Vec::new());
+        super::wait_for_verified_cleanup(
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                match attempt {
+                    1 => Some("fixture: termination denied".to_string()),
+                    2 => Some("fixture: process still running".to_string()),
+                    3 => None,
+                    _ => panic!("must stop retrying after verified exit"),
+                }
+            },
+            |reason| {
+                assert!(attempts.get() < 3);
+                pending.borrow_mut().push(reason.to_string());
+            },
+            || pauses.set(pauses.get() + 1),
+        );
+        // The caller may release its activity permit only at this point.
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(pending.borrow().len(), 2);
+        assert_eq!(pauses.get(), 2);
+    }
+
+    #[test]
+    fn cancellation_during_cleanup_is_reported_only_after_verified_exit() {
+        use std::cell::Cell;
+        let temp = tempfile::tempdir().unwrap();
+        let cancellation = super::CancellationToken::new();
+        let _scope =
+            super::execution::Scope::enter(cancellation.clone(), temp.path().join("cleanup.jsonl"))
+                .unwrap();
+        let attempts = Cell::new(0);
+        super::wait_for_verified_cleanup(
+            || {
+                let attempt = attempts.get() + 1;
+                attempts.set(attempt);
+                if attempt == 1 {
+                    Some("fixture: cleanup pending".to_string())
+                } else {
+                    assert!(cancellation.is_cancelled());
+                    None
+                }
+            },
+            |_| cancellation.cancel(),
+            || {},
+        );
+        assert_eq!(attempts.get(), 2);
+        assert!(matches!(
+            super::check_cancelled(&cancellation),
+            Err(super::RenderError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn already_confirmed_cleanup_does_not_emit_pending_or_retry() {
+        super::wait_for_verified_cleanup(
+            || None,
+            |_| panic!("already closed must not emit cleanup_pending"),
+            || panic!("already closed must not retry"),
+        );
+    }
+
+    #[test]
+    fn cleanup_diagnostics_are_bounded_while_ownership_checks_continue() {
+        use std::cell::Cell;
+        let attempts = Cell::new(0);
+        let notices = Cell::new(0);
+        let pauses = Cell::new(0);
+        super::wait_for_verified_cleanup(
+            || {
+                attempts.set(attempts.get() + 1);
+                (attempts.get() <= 20_000).then(|| "fixture: still pending".to_string())
+            },
+            |_| notices.set(notices.get() + 1),
+            || pauses.set(pauses.get() + 1),
+        );
+        assert_eq!(attempts.get(), 20_001);
+        assert_eq!(pauses.get(), 20_000);
+        assert_eq!(notices.get(), 8);
+    }
+
+    #[test]
+    fn seek_only_accepts_the_current_field_of_the_native_status_format() {
+        assert_eq!(
+            super::parse_demo_current_tick(
+                "  Currently playing 9000 of 30000 ticks. Minutes:5.00 File:replays/d2h_fixture"
+            ),
+            Some(9000)
+        );
+        for line in [
+            "Current tick: 9000; total ticks: 30000",
+            "total ticks: 30000",
+            "Currently playing 40000 of 30000 ticks. Minutes:0 File:a",
+            "echo Currently playing 1000 of 3000 ticks. Minutes:0 File:a",
+            "Currently playing x of 3000 ticks.",
+        ] {
+            assert_eq!(super::parse_demo_current_tick(line), None, "{line}");
+        }
+        assert!(!super::seek_observation_is_stable(
+            Some(9000),
+            Some(9000),
+            1000
+        ));
+        assert!(!super::seek_observation_is_stable(None, Some(1000), 1000));
+        assert!(!super::seek_observation_is_stable(
+            Some(999),
+            Some(1000),
+            1000
+        ));
+        assert!(!super::seek_observation_is_stable(Some(1000), None, 1000));
+        assert!(super::seek_observation_is_stable(
+            Some(1000),
+            Some(1000),
+            1000
+        ));
+    }
+
+    #[test]
+    fn camera_feedback_is_position_only_and_rejects_invalid_values() {
+        assert_eq!(
+            super::parse_camera_look_at(
+                "Camera look-at position: 123.500000 -456.250000 128.000000"
+            ),
+            Some([123.5, -456.25, 128.0])
+        );
+        for line in [
+            "Camera look-at position: NaN 0 0",
+            "Camera look-at position: 1 2",
+            "Camera look-at position: 1 2 3 4",
+            "dota_spectator_mode 3",
+        ] {
+            assert!(super::parse_camera_look_at(line).is_none());
+        }
+    }
+
+    #[test]
+    fn editing_boundaries_are_measured_in_source_frames() {
+        for frame in [0, 3331, 40001, 93272] {
+            let start = frame as f32 / 30.0;
+            assert!(super::valid_source_frame_range(
+                start,
+                (frame + 30) as f32 / 30.0
+            ));
+            assert!(super::valid_source_frame_range(
+                start,
+                (frame + 3000) as f32 / 30.0
+            ));
+            assert!(!super::valid_source_frame_range(
+                start,
+                (frame + 29) as f32 / 30.0
+            ));
+            assert!(!super::valid_source_frame_range(
+                start,
+                (frame + 3001) as f32 / 30.0
+            ));
+        }
+        assert!(!super::valid_source_frame_range(f32::NAN, 10.0));
+        assert!(!super::valid_source_frame_range(-1.0, 10.0));
+    }
+
+    fn fixture_media(duration: f32) -> super::MediaInfo {
+        super::MediaInfo {
+            duration_seconds: duration,
+            width: 1920,
+            height: 1080,
+            has_video: true,
+            has_audio: true,
+            video_frames: Some((duration * 30.0).round() as usize),
+        }
+    }
+
+    fn fixture_output(code: i32, stderr: &str) -> std::process::Output {
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        };
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code << 8)
+        };
+        std::process::Output {
+            status,
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn failed_or_incomplete_qc_never_returns_zero_defect_success() {
+        let path = std::path::Path::new("fixture.mp4");
+        assert!(
+            super::parse_qc_report(
+                path,
+                fixture_media(12.25),
+                fixture_output(
+                    1,
+                    "No such filter: 'freezedetect'\nError initializing filters!\n"
+                )
+            )
+            .is_err()
+        );
+        assert!(super::parse_qc_report(path, fixture_media(12.25), fixture_output(0, "")).is_err());
+        let mut missing_audio = fixture_media(12.25);
+        missing_audio.has_audio = false;
+        assert!(
+            super::parse_qc_report(
+                path,
+                missing_audio,
+                fixture_output(0, "mean_volume: -14.2 dB\nmax_volume: -0.8 dB")
+            )
+            .is_err()
+        );
+        let report = super::parse_qc_report(
+            path,
+            fixture_media(12.25),
+            fixture_output(0, "mean_volume: -14.2 dB\nmax_volume: -0.8 dB"),
+        )
+        .unwrap();
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn cache_requires_target_verification_pipeline_identity_and_expected_duration() {
+        let clip = mirana_clip(ClipCameraMode::PlayerPerspective);
+        let mut state = super::SegmentState {
+            candidate_id: clip.candidate_id.clone(),
+            output_path: "fixture.mp4".to_string(),
+            duration_seconds: 4.0,
+            expected_duration_seconds: 4.0,
+            status: "complete".to_string(),
+            capture_pipeline: super::CAPTURE_PIPELINE_VERSION.to_string(),
+            content_sha256: "a".repeat(64),
+            quality_checked: true,
+            camera_target_verified: false,
+        };
+        assert!(!super::cache_metadata_matches(&state, &clip, 4.0));
+        state.camera_target_verified = true;
+        assert!(super::cache_metadata_matches(&state, &clip, 4.0));
+        state.duration_seconds = 2.0;
+        assert!(!super::cache_metadata_matches(&state, &clip, 4.0));
+        state.duration_seconds = 4.0;
+        state.capture_pipeline = "old".to_string();
+        assert!(!super::cache_metadata_matches(&state, &clip, 4.0));
+        assert!(super::validate_segment_media(&fixture_media(2.0), 7.7).is_err());
+        assert!(super::validate_segment_media(&fixture_media(7.7), 7.7).is_ok());
+        let mut wrong_frames = fixture_media(7.7);
+        wrong_frames.video_frames = Some(30);
+        assert!(super::validate_segment_media(&wrong_frames, 7.7).is_err());
+    }
+
+    #[test]
+    fn replay_alias_is_safe_even_when_original_is_already_in_replays() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["my match.dem", "中文 录像.dem", "a;quit.dem"] {
+            let source = temp.path().join(name);
+            std::fs::write(&source, b"original fixture").unwrap();
+            let hash = super::file_sha256(&source).unwrap();
+            let prepared = super::prepare_replay(&source, temp.path(), "d2h-test", &hash).unwrap();
+            let alias = prepared.path.clone();
+            assert_ne!(alias, source);
+            assert_eq!(std::fs::read(&alias).unwrap(), b"original fixture");
+            assert!(
+                d2_highlights_replay_control::validate_command(&format!(
+                    "playdemo {}",
+                    prepared.replay_reference
+                ))
+                .is_ok()
+            );
+            drop(prepared);
+            assert!(!alias.exists());
+            assert_eq!(std::fs::read(&source).unwrap(), b"original fixture");
+        }
+    }
+
+    #[test]
+    fn replay_replacement_between_inspection_and_copy_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("fixture.dem");
+        std::fs::write(&source, b"old data").unwrap();
+        let hash = super::file_sha256(&source).unwrap();
+        std::fs::write(&source, b"new data").unwrap();
+        assert!(super::prepare_replay(&source, temp.path(), "d2h-test", &hash).is_err());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read(source).unwrap(), b"new data");
+    }
+
+    #[test]
+    fn corrupt_cache_state_is_preserved_and_rebuilt_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        std::fs::write(&path, b"{truncated").unwrap();
+        let rebuilt = super::load_or_create_state(&path, "fixture").unwrap();
+        assert_eq!(rebuilt.fingerprint, "fixture");
+        super::write_json(&path, &rebuilt).unwrap();
+        assert_eq!(
+            super::load_or_create_state(&path, "fixture")
+                .unwrap()
+                .fingerprint,
+            "fixture"
+        );
+        let backup = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().contains("rejected-"))
+            .unwrap();
+        assert_eq!(std::fs::read(backup.path()).unwrap(), b"{truncated");
+    }
 
     #[cfg(windows)]
     #[test]
@@ -2217,16 +3068,16 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
     #[test]
     fn output_names_follow_the_replay_and_never_replace_existing_files() {
         let temp = tempfile::tempdir().unwrap();
-        let replay = std::path::Path::new(r"C:\replays\1234567890.dem");
+        let replay = std::path::Path::new("replays/1000000004.dem");
         let stem = replay_output_stem(replay);
-        assert_eq!(stem, "1234567890");
-        assert_eq!(available_output_stem(temp.path(), &stem), "1234567890");
+        assert_eq!(stem, "1000000004");
+        assert_eq!(available_output_stem(temp.path(), &stem), "1000000004");
 
-        std::fs::write(temp.path().join("1234567890.mp4"), b"old").unwrap();
-        assert_eq!(available_output_stem(temp.path(), &stem), "1234567890_2");
+        std::fs::write(temp.path().join("1000000004.mp4"), b"old").unwrap();
+        assert_eq!(available_output_stem(temp.path(), &stem), "1000000004_2");
 
-        std::fs::write(temp.path().join("1234567890_2_质量报告.json"), b"{}").unwrap();
-        assert_eq!(available_output_stem(temp.path(), &stem), "1234567890_3");
+        std::fs::write(temp.path().join("1000000004_2_质量报告.json"), b"{}").unwrap();
+        assert_eq!(available_output_stem(temp.path(), &stem), "1000000004_3");
     }
 
     #[test]
@@ -2406,6 +3257,7 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
             tree_orders: Vec::new(),
             temporary_trees: Vec::new(),
             salutes: Vec::new(),
+            state_snapshots: Vec::new(),
         }
     }
 

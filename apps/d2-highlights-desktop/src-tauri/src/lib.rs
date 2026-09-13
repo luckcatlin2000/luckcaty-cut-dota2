@@ -1,4 +1,7 @@
+mod activity;
 mod analysis_export;
+
+use activity::{Activities, Activity};
 
 use analysis_export::{
     AnalysisPackageExportRequest, AnalysisPackageExportResult, export_analysis_package,
@@ -20,7 +23,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 const EDIT_PLAN_SCHEMA_VERSION: &str = "d2h.edit-plan/1.6";
@@ -46,6 +49,8 @@ struct AppState {
     ffmpeg_exe: Option<PathBuf>,
     ffprobe_exe: Option<PathBuf>,
     render_runtime: Arc<Mutex<RenderRuntime>>,
+    activities: Activities,
+    exported_packages: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 #[derive(Clone)]
@@ -459,7 +464,17 @@ fn export_replay_analysis_package(
     if !valid_job_id(&request.job_id) {
         return Err("任务编号无效，请重新打开分析结果。".to_string());
     }
-    export_analysis_package(&state.jobs_root, request)
+    let _lease = state.activities.begin(Activity::Export)?;
+    let result = export_analysis_package(&state.jobs_root, request)?;
+    // Only a directory produced by this process grants an external open receipt.
+    if let Ok(path) = fs::canonicalize(&result.package_path) {
+        state
+            .exported_packages
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(path);
+    }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -520,9 +535,11 @@ async fn analyze_dem(
     on_progress: Channel<AnalysisProgress>,
     state: State<'_, AppState>,
 ) -> Result<AnalysisSummary, String> {
+    let lease = state.activities.begin(Activity::Analysis)?;
     let dem_path = PathBuf::from(dem_path);
     let jobs_root = state.jobs_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _lease = lease;
         let summary = analyze_dem_with_progress(&dem_path, &jobs_root, |progress| {
             let _ = on_progress.send(progress);
         })
@@ -579,6 +596,7 @@ fn save_edit_plan(
     if !valid_job_id(&request.job_id) {
         return Err("任务编号无效，请重新打开分析结果。".to_string());
     }
+    let _lease = state.activities.begin(Activity::Save)?;
     if request.plans.len() != 2 {
         return Err("剪辑方案必须同时包含默认剪辑和 WTF 导演。".to_string());
     }
@@ -621,9 +639,6 @@ fn save_edit_plan(
         .iter()
         .find(|plan| plan.mode == request.active_mode)
         .ok_or_else(|| "找不到当前剪辑方案。".to_string())?;
-    if active_plan.clips.is_empty() {
-        return Err("当前方案还没有片段，请先选择高光或采用 WTF 故事。".to_string());
-    }
     let active_clips = active_plan.clips.clone();
     let active_settings = active_plan.settings.clone();
     let selected_clip_count = active_clips.len();
@@ -645,8 +660,8 @@ fn save_edit_plan(
     let director_dir = job_dir.join("director");
     fs::create_dir_all(&director_dir).map_err(|error| error.to_string())?;
     let output_path = director_dir.join("edit-plan.json");
-    let bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
-    fs::write(output_path, bytes).map_err(|error| error.to_string())?;
+    d2_highlights_core::write_json_pretty(&output_path, &document)
+        .map_err(|error| format!("保存剪辑方案失败：{error}"))?;
 
     Ok(SaveEditPlanResult {
         selected_clip_count,
@@ -704,8 +719,7 @@ fn build_edit_plan_slot(
         {
             return Err(format!("候选 {} 的起止时间无效。", clip.candidate_id));
         }
-        let duration = clip.source_end_seconds - clip.source_start_seconds;
-        if !(1.0..=100.0).contains(&duration) {
+        if !valid_frame_duration(clip.source_start_seconds, clip.source_end_seconds) {
             return Err(format!(
                 "片段 {} 的时长必须在 1 到 100 秒之间。",
                 clip.clip_id
@@ -724,8 +738,10 @@ fn build_edit_plan_slot(
             || clip.short_source_start_seconds < 0.0
             || clip.short_source_end_seconds <= clip.short_source_start_seconds
             || clip.short_source_end_seconds > timeline.replay.playback_time_seconds
-            || !(1.0..=100.0)
-                .contains(&(clip.short_source_end_seconds - clip.short_source_start_seconds))
+            || !valid_frame_duration(
+                clip.short_source_start_seconds,
+                clip.short_source_end_seconds,
+            )
         {
             return Err(format!("片段 {} 保存的短击杀时间无效。", clip.clip_id));
         }
@@ -892,7 +908,9 @@ fn get_edit_plan(
     }
 
     let document = read_json::<EditPlanDocument>(&path)?;
-    Ok(load_edit_plan(document))
+    load_edit_plan(document)
+        .map(Some)
+        .ok_or_else(|| "已保存草稿的版本或结构不受支持，原文件已保留，请勿覆盖。".to_string())
 }
 
 fn load_edit_plan(document: EditPlanDocument) -> Option<LoadedEditPlan> {
@@ -1126,32 +1144,19 @@ async fn start_render(
     if !valid_job_id(&job_id) {
         return Err("任务编号无效，请重新打开分析结果。".to_string());
     }
-    let cancellation = {
-        let mut runtime = state
-            .render_runtime
-            .lock()
-            .map_err(|_| "成片任务状态不可用，请重启应用。".to_string())?;
-        if runtime.active {
-            return Err("已有成片任务正在运行，请等待完成或先取消。".to_string());
-        }
-        let cancellation = CancellationToken::new();
-        runtime.active = true;
-        runtime.cancellation = Some(cancellation.clone());
-        cancellation
-    };
+    let lease = state.activities.begin(Activity::Render)?;
+    let cancellation = register_render_cancellation(&state.activities, &state.render_runtime)?;
 
-    let request = build_render_request(&job_id, &state);
-    let request = match request {
-        Ok(request) => request,
-        Err(error) => {
-            reset_render_runtime(&state.render_runtime);
-            return Err(error);
-        }
-    };
+    let worker_state = state.inner().clone();
     let progress_channel = on_progress.clone();
     let joined = tauri::async_runtime::spawn_blocking(move || {
-        let result = render(request, cancellation, |progress| {
-            let _ = progress_channel.send(progress);
+        let _lease = lease;
+        let _runtime_guard = RenderRuntimeGuard(worker_state.render_runtime.clone());
+        let result = build_render_request(&job_id, &worker_state).and_then(|request| {
+            render(request, cancellation, |progress| {
+                let _ = progress_channel.send(progress);
+            })
+            .map_err(|error| error.to_string())
         });
         if let Err(error) = &result {
             let _ = progress_channel.send(RenderProgress {
@@ -1166,7 +1171,6 @@ async fn start_render(
         result.map_err(|error| error.to_string())
     })
     .await;
-    reset_render_runtime(&state.render_runtime);
     joined.map_err(|error| error.to_string())?
 }
 
@@ -1192,19 +1196,56 @@ fn open_local_path(path: String, state: State<'_, AppState>) -> Result<(), Strin
     if !target.starts_with(&jobs_root) {
         return Err("只能打开猫猫任务目录中的输出文件。".to_string());
     }
+    open_output_path(&target)
+}
+
+fn resolve_exported_package(path: &Path, receipts: &HashSet<PathBuf>) -> Result<PathBuf, String> {
+    let target = fs::canonicalize(path).map_err(|_| "分析包目录不存在，可能已被移动。")?;
+    if !target.is_dir() || !receipts.contains(&target) {
+        return Err("只能打开本次应用已成功导出的分析包目录。".into());
+    }
+    Ok(target)
+}
+
+#[tauri::command]
+fn open_exported_analysis_package(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let target = {
+        let receipts = state
+            .exported_packages
+            .lock()
+            .map_err(|_| "导出记录不可用。")?;
+        resolve_exported_package(Path::new(&path), &receipts)?
+    };
+    open_output_path(&target)
+}
+
+fn open_output_path(target: &Path) -> Result<(), String> {
     let mut command = if target.is_dir() {
         let mut command = Command::new("explorer.exe");
-        command.arg(&target);
+        command.arg(target);
         command
     } else {
         let mut command = Command::new("rundll32.exe");
-        command.arg("url.dll,FileProtocolHandler").arg(&target);
+        command.arg("url.dll,FileProtocolHandler").arg(target);
         command
     };
     command
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("无法打开输出：{error}"))
+}
+
+#[tauri::command]
+async fn close_app_after_cleanup(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    begin_render_close(&state.activities, &state.render_runtime)?;
+    let activities = state.activities.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        activities.wait_for_close(Duration::from_secs(120))
+    })
+    .await
+    .map_err(|error| format!("等待任务收尾失败：{error}"))??;
+    app.exit(0);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1254,7 +1295,9 @@ async fn install_app_update(
     app: AppHandle,
     pending_update: State<'_, PendingUpdate>,
     on_event: Channel<AppUpdateEvent>,
+    state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let _lease = state.activities.begin(Activity::Update)?;
     let update = {
         let mut runtime = pending_update
             .0
@@ -1273,7 +1316,7 @@ async fn install_app_update(
 
     let mut started = false;
     let download_result = update
-        .download_and_install(
+        .download(
             |chunk_length, content_length| {
                 if !started {
                     started = true;
@@ -1287,16 +1330,24 @@ async fn install_app_update(
         )
         .await;
 
-    if let Err(error) = download_result {
+    let install_result = match download_result {
+        Ok(bytes) => update
+            .install(bytes)
+            .map_err(|error| format!("安装更新失败：{error}")),
+        Err(error) => Err(format!("更新包下载或签名验证失败：{error}")),
+    };
+    if let Err(error) = install_result {
+        state.activities.set_update_exit_ready(false)?;
         let mut runtime = pending_update
             .0
             .lock()
-            .map_err(|_| "更新失败且状态无法恢复，请重启应用。".to_string())?;
+            .map_err(|_| "更新失败且状态无法恢复，请重启应用。")?;
         runtime.installing = false;
         runtime.pending = Some(update);
-        return Err(format!("更新包下载或签名验证失败：{error}"));
+        return Err(error);
     }
 
+    state.activities.set_update_exit_ready(true)?;
     app.restart()
 }
 
@@ -1423,6 +1474,60 @@ fn normalize_user_camera_mode(mode: ClipCameraMode) -> ClipCameraMode {
         | ClipCameraMode::FreeCamera
         | ClipCameraMode::PlayerPerspective => ClipCameraMode::PlayerPerspective,
     }
+}
+
+struct RenderRuntimeGuard(Arc<Mutex<RenderRuntime>>);
+
+fn register_render_cancellation(
+    activities: &Activities,
+    runtime: &Mutex<RenderRuntime>,
+) -> Result<CancellationToken, String> {
+    let cancellation = {
+        let mut runtime = runtime
+            .lock()
+            .map_err(|_| "成片任务状态不可用，请重启应用。".to_string())?;
+        if runtime.active {
+            return Err("已有成片任务正在运行，请等待完成或先取消。".to_string());
+        }
+        let cancellation = CancellationToken::new();
+        runtime.active = true;
+        runtime.cancellation = Some(cancellation.clone());
+        cancellation
+    };
+    // Close can start after acquiring the activity lease but before publishing
+    // this token. Check after publication; the close path checks the token after
+    // marking closing, so either interleaving observes and cancels the render.
+    // Do not hold the runtime lock while reading the activity state.
+    if activities.is_closing() {
+        cancellation.cancel();
+    }
+    Ok(cancellation)
+}
+
+fn begin_render_close(
+    activities: &Activities,
+    runtime: &Mutex<RenderRuntime>,
+) -> Result<(), String> {
+    activities.begin_close()?;
+    let runtime = runtime.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(cancellation) = &runtime.cancellation {
+        cancellation.cancel();
+    }
+    Ok(())
+}
+
+impl Drop for RenderRuntimeGuard {
+    fn drop(&mut self) {
+        reset_render_runtime(&self.0);
+    }
+}
+
+fn valid_frame_duration(start: f32, end: f32) -> bool {
+    if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
+        return false;
+    }
+    let frames = (f64::from(end) * 30.0).round() - (f64::from(start) * 30.0).round();
+    (30.0..=3000.0).contains(&frames)
 }
 
 fn reset_render_runtime(runtime: &Arc<Mutex<RenderRuntime>>) {
@@ -1721,6 +1826,8 @@ pub fn run() {
                 ffmpeg_exe,
                 ffprobe_exe,
                 render_runtime: Arc::new(Mutex::new(RenderRuntime::default())),
+                activities: Activities::default(),
+                exported_packages: Arc::new(Mutex::new(HashSet::new())),
             });
             Ok(())
         })
@@ -1737,11 +1844,31 @@ pub fn run() {
             start_render,
             cancel_render,
             open_local_path,
+            open_exported_analysis_package,
+            close_app_after_cleanup,
             check_for_app_update,
             install_app_update
         ])
-        .run(tauri::generate_context!())
-        .expect("unable to start Cat Cut Assistant");
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event
+                && let Some(state) = window.try_state::<AppState>()
+                && !state.activities.exit_ready()
+            {
+                // The frontend close listener must persist both drafts before requesting cleanup.
+                api.prevent_close();
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("unable to start Cat Cut Assistant")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event
+                && let Some(state) = app.try_state::<AppState>()
+                && !state.activities.exit_ready()
+            {
+                api.prevent_exit();
+                let _ = app.emit("app-close-requested", ());
+            }
+        });
 }
 
 #[cfg(test)]
@@ -1764,9 +1891,90 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn close_before_render_token_publication_cancels_new_token() {
+        let activities = super::Activities::default();
+        let runtime = std::sync::Mutex::new(super::RenderRuntime::default());
+        let lease = activities.begin(super::Activity::Render).unwrap();
+        super::begin_render_close(&activities, &runtime).unwrap();
+        assert!(runtime.lock().unwrap().cancellation.is_none());
+        let cancellation = super::register_render_cancellation(&activities, &runtime).unwrap();
+        assert!(cancellation.is_cancelled());
+        drop(lease);
+        activities
+            .wait_for_close(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(activities.exit_ready());
+    }
+
+    #[test]
+    fn close_after_render_token_publication_cancels_existing_token() {
+        let activities = super::Activities::default();
+        let runtime = std::sync::Mutex::new(super::RenderRuntime::default());
+        let lease = activities.begin(super::Activity::Render).unwrap();
+        let cancellation = super::register_render_cancellation(&activities, &runtime).unwrap();
+        assert!(!cancellation.is_cancelled());
+        super::begin_render_close(&activities, &runtime).unwrap();
+        assert!(cancellation.is_cancelled());
+        drop(lease);
+        activities
+            .wait_for_close(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(activities.exit_ready());
+    }
+
+    #[test]
+    fn duration_limits_use_frames_despite_f32_rounding() {
+        assert!(super::valid_frame_duration(28.3, 128.3));
+        assert!(super::valid_frame_duration(1900.3, 2000.3));
+        assert!(super::valid_frame_duration(28.3, 29.3));
+        assert!(!super::valid_frame_duration(28.3, 128.34));
+        assert!(!super::valid_frame_duration(28.3, 29.26));
+        assert!(!super::valid_frame_duration(f32::NAN, 100.0));
+        assert!(!super::valid_frame_duration(-1.0, 1.0));
+    }
+
+    #[test]
+    fn external_open_requires_exact_successful_package_receipt() {
+        let root = tempdir().unwrap();
+        let exported = root.path().join("exported-package");
+        let other = root.path().join("unrelated");
+        fs::create_dir_all(exported.join("nested")).unwrap();
+        fs::create_dir(&other).unwrap();
+        let canonical = fs::canonicalize(&exported).unwrap();
+        let receipts = std::collections::HashSet::from([canonical.clone()]);
+        assert_eq!(
+            super::resolve_exported_package(&exported, &receipts).unwrap(),
+            canonical
+        );
+        assert!(super::resolve_exported_package(&other, &receipts).is_err());
+        assert!(super::resolve_exported_package(&exported.join("nested"), &receipts).is_err());
+        assert!(super::resolve_exported_package(&root.path().join("missing"), &receipts).is_err());
+    }
+
+    #[test]
+    fn empty_dual_drafts_round_trip_without_render_requirements() {
+        let value = serde_json::json!({
+            "schema_version": EDIT_PLAN_SCHEMA_VERSION,
+            "source_sha256": "source",
+            "job_id": "d2h-0000000000000000",
+            "active_mode": "default",
+            "plans": [
+                {"mode":"default", "clips":[], "settings":RenderSettings::default()},
+                {"mode":"wtf", "clips":[], "settings":RenderSettings::default()}
+            ],
+            "mode": "dual", "updated_unix_seconds":0,
+            "clips":[], "settings":RenderSettings::default()
+        });
+        let document: EditPlanDocument = serde_json::from_value(value).unwrap();
+        let loaded = load_edit_plan(document).unwrap();
+        assert_eq!(loaded.plans.len(), 2);
+        assert!(loaded.plans.iter().all(|plan| plan.clips.is_empty()));
+    }
+
+    #[test]
     fn edit_plan_job_id_stays_inside_jobs_root() {
-        assert!(valid_job_id("d2h-ff5145119d7415b3"));
-        assert!(!valid_job_id("../d2h-ff5145119d7415b3"));
+        assert!(valid_job_id("d2h-0000000000000000"));
+        assert!(!valid_job_id("../d2h-0000000000000000"));
         assert!(!valid_job_id("d2h-.."));
         assert!(!valid_job_id("other-job"));
     }
@@ -1774,7 +1982,7 @@ mod tests {
     #[test]
     fn recent_job_activity_is_persisted_inside_the_job() {
         let root = tempdir().expect("create recent jobs root");
-        let job_id = "d2h-ff5145119d7415b3";
+        let job_id = "d2h-0000000000000000";
         fs::create_dir_all(root.path().join(job_id)).expect("create job directory");
 
         mark_job_recent(root.path(), job_id).expect("mark job recent");
@@ -1789,7 +1997,7 @@ mod tests {
     #[test]
     fn reanalysis_archives_the_existing_edit_plan_without_deleting_it() {
         let root = tempdir().expect("create jobs root");
-        let job_id = "d2h-ff5145119d7415b3";
+        let job_id = "d2h-0000000000000000";
         let director = root.path().join(job_id).join("director");
         fs::create_dir_all(&director).expect("create director directory");
         fs::write(director.join("edit-plan.json"), b"saved plan").expect("write edit plan");
@@ -1818,11 +2026,11 @@ mod tests {
 
     #[test]
     fn replay_ids_are_digits_only_and_path_safe() {
-        assert!(valid_replay_id("8918165123"));
+        assert!(valid_replay_id("1000000001"));
         assert!(valid_replay_id("1"));
         assert!(!valid_replay_id(""));
-        assert!(!valid_replay_id("8918165123.dem"));
-        assert!(!valid_replay_id("../8918165123"));
+        assert!(!valid_replay_id("1000000001.dem"));
+        assert!(!valid_replay_id("../1000000001"));
         assert!(!valid_replay_id("123456789012345678901"));
     }
 
@@ -1917,17 +2125,17 @@ mod tests {
     #[test]
     fn replay_lookup_finds_a_valid_source2_dem() {
         let directory = tempdir().expect("create replay directory");
-        let replay_path = directory.path().join("8918165123.dem");
+        let replay_path = directory.path().join("1000000001.dem");
         let mut replay = fs::File::create(&replay_path).expect("create replay");
         replay.write_all(b"PBDEMS2\0fixture").expect("write replay");
 
         let result = resolve_replay_by_id(
             directory.path().display().to_string(),
-            "8918165123".to_string(),
+            "1000000001".to_string(),
         )
         .expect("resolve replay");
 
-        assert_eq!(result.replay_id, "8918165123");
+        assert_eq!(result.replay_id, "1000000001");
         assert_eq!(Path::new(&result.path), replay_path);
     }
 
@@ -1936,10 +2144,10 @@ mod tests {
         let directory = tempdir().expect("create replay directory");
         let error = resolve_replay_by_id(
             directory.path().display().to_string(),
-            "8916655598".to_string(),
+            "1000000002".to_string(),
         )
         .expect_err("missing replay must fail");
-        assert!(error.contains("8916655598.dem"));
+        assert!(error.contains("1000000002.dem"));
     }
 
     #[test]

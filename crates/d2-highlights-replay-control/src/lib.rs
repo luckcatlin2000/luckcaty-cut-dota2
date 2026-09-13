@@ -61,7 +61,7 @@ pub enum ReplayControlError {
     InvalidReplayClock,
     #[error("VConsole command is empty")]
     EmptyCommand,
-    #[error("VConsole command contains a newline or NUL byte")]
+    #[error("VConsole command contains a control character, separator, quote or comment")]
     UnsafeCommand,
     #[error("VConsole command is not allowlisted: {0}")]
     CommandNotAllowed(String),
@@ -69,6 +69,8 @@ pub enum ReplayControlError {
     CommandTooLong(usize),
     #[error("VConsole probe timed out before the echo marker was observed")]
     MarkerTimeout,
+    #[error("VConsole reported a command failure: {0}")]
+    CommandFailed(String),
     #[error("system clock is before the Unix epoch")]
     Clock,
     #[error("VConsole I/O error: {0}")]
@@ -353,7 +355,13 @@ pub fn validate_command(command: &str) -> Result<(), ReplayControlError> {
     if trimmed.is_empty() {
         return Err(ReplayControlError::EmptyCommand);
     }
-    if command.contains(['\r', '\n', '\0']) {
+    // All production commands use typed numeric or ASCII alias arguments. No
+    // current caller needs quoting, comments or command chaining. Reject them
+    // before encoding; checking only the first word is not a command boundary.
+    if command.chars().any(char::is_control)
+        || command.contains([';', '"', '\''])
+        || command.contains("//")
+    {
         return Err(ReplayControlError::UnsafeCommand);
     }
     let name = trimmed
@@ -412,6 +420,8 @@ pub fn execute_vconsole_commands(
     stream.write_all(&build_cmnd_packet(&format!("echo {marker}"))?)?;
     let marker_result = wait_for_marker(&mut stream, &marker, timeout, started)?;
 
+    let console_excerpt = extract_console_excerpt(&marker_result.bytes, &marker);
+    reject_console_errors(&console_excerpt)?;
     Ok(VConsoleExecutionReport {
         host: Ipv4Addr::LOCALHOST.to_string(),
         port: VCONSOLE_PORT,
@@ -419,9 +429,26 @@ pub fn execute_vconsole_commands(
         acknowledged: true,
         initial_bytes_drained,
         response_bytes_received: marker_result.bytes_received,
-        console_excerpt: extract_console_excerpt(&marker_result.bytes, &marker),
+        console_excerpt,
         elapsed_milliseconds: started.elapsed().as_millis(),
     })
+}
+
+fn reject_console_errors(lines: &[String]) -> Result<(), ReplayControlError> {
+    let error = lines.iter().find(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        line.starts_with("unknown command")
+            || line.starts_with("error:")
+            || line.starts_with("syntax:")
+            || line.contains("couldn't open demo file")
+            || line.contains("failed to read demo header")
+            || line.contains("can't playdemo")
+    });
+    if let Some(error) = error {
+        Err(ReplayControlError::CommandFailed(error.clone()))
+    } else {
+        Ok(())
+    }
 }
 
 fn connect_vconsole(timeout: Duration) -> Result<TcpStream, ReplayControlError> {
@@ -569,6 +596,39 @@ mod tests {
             build_cmnd_packet("echo ok\nquit"),
             Err(ReplayControlError::UnsafeCommand)
         ));
+        for command in [
+            "playdemo replays/a; quit",
+            "echo ok;quit",
+            "echo //comment",
+            "echo \"quoted\"",
+            "echo ok\tquit",
+        ] {
+            assert!(
+                matches!(
+                    build_cmnd_packet(command),
+                    Err(ReplayControlError::UnsafeCommand)
+                ),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn acknowledgement_does_not_hide_native_command_errors() {
+        assert!(reject_console_errors(&["Unknown command: dota_missing".to_string()]).is_err());
+        assert!(
+            reject_console_errors(&[
+                "CDemoPlayer::StartPlayback: couldn't open demo file 'a'".to_string()
+            ])
+            .is_err()
+        );
+        assert!(
+            reject_console_errors(&[
+                "Currently playing 100 of 3000 ticks. Minutes:0.05 File:replays/d2h_safe"
+                    .to_string()
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -677,10 +737,12 @@ mod tests {
                 long_range_kill: None,
                 will_reincarnate: None,
                 assist_players: Vec::new(),
+                context: Default::default(),
             }],
             tree_orders: Vec::new(),
             temporary_trees: Vec::new(),
             salutes: Vec::new(),
+            state_snapshots: Vec::new(),
         };
 
         let plan = build_replay_control_plan(&director, &timeline).unwrap();
@@ -735,6 +797,7 @@ mod tests {
             tree_orders: Vec::new(),
             temporary_trees: Vec::new(),
             salutes: Vec::new(),
+            state_snapshots: Vec::new(),
         };
 
         assert!(matches!(

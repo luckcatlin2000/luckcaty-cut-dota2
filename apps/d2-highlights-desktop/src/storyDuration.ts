@@ -1,4 +1,5 @@
 import type { ClipDurationMode, HighlightCandidate } from "./types";
+import { replayEndFrame, roundFrame } from "./frameTime.ts";
 
 export const DEFAULT_STORY_PRE_ROLL_SECONDS = 60;
 export const MAX_STORY_PRE_ROLL_SECONDS = 90;
@@ -45,7 +46,7 @@ export function killSequenceRange(
     return null;
   }
 
-  const replayEnd = Math.max(0, replayDurationSeconds);
+  const replayEnd = replayEndFrame(replayDurationSeconds);
   const preRoll = clamp(
     requestedPreRollSeconds,
     0,
@@ -124,8 +125,14 @@ export function normalizeStoryDurationClips<T extends StoryDurationClip>(
     );
 
   const previousEndByHero = new Map<string, number>();
+  const previousEndByCandidate = new Map<string, number>();
   for (const scene of scenes) {
-    const previousEnd = previousEndByHero.get(scene.hero) ?? 0;
+    // A user-created duplicate is a deliberate repeat of the same event. Only
+    // distinct candidates trim one another; repeated takes share its prior bound.
+    const candidateKey = `${scene.hero}:${scene.candidate?.id ?? scene.sceneId}`;
+    const previousEnd = previousEndByCandidate.get(candidateKey) ??
+      previousEndByHero.get(scene.hero) ?? 0;
+    previousEndByCandidate.set(candidateKey, previousEnd);
     const latestValidStart = Math.max(0, scene.range.endSeconds - 1);
     const startSeconds = roundFrame(
       Math.min(
@@ -151,8 +158,4 @@ export function normalizeStoryDurationClips<T extends StoryDurationClip>(
 
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(maximum, Math.max(minimum, value));
-}
-
-function roundFrame(value: number) {
-  return Math.round(value * 30) / 30;
 }

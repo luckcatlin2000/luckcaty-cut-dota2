@@ -14,6 +14,7 @@ d2-highlights-director = { path = "../d2-highlights-director" }
 d2-highlights-parser-source2 = { path = "../d2-highlights-parser-source2" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -7,7 +7,7 @@ use d2_highlights_core::{
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const DETECTOR_NAME: &str = "rules-v2";
-pub const DETECTOR_VERSION: &str = "0.5.0";
+pub const DETECTOR_VERSION: &str = "0.6.0";
 const CLUSTER_GAP_SECONDS: f32 = 18.0;
 const SETUP_SECONDS: f32 = 12.0;
 const RESULT_SECONDS: f32 = 8.0;
@@ -37,11 +37,7 @@ pub fn detect_highlights(
     let hero_deaths = timeline
         .events
         .iter()
-        .filter(|event| {
-            event.event_type == "DotaCombatlogDeath"
-                && event.target_is_hero == Some(true)
-                && event.time_seconds.is_some()
-        })
+        .filter(|event| event.is_final_hero_death() && event.time_seconds.is_some())
         .collect::<Vec<_>>();
 
     let mut clusters: Vec<Vec<&CombatEvent>> = Vec::new();
@@ -116,7 +112,7 @@ pub fn detect_highlights(
 }
 
 fn buyback_dieback_candidates(timeline: &TimelineDocument) -> Vec<HighlightCandidate> {
-    let mut used_death_ticks = BTreeSet::new();
+    let mut used_deaths = BTreeSet::new();
     timeline
         .events
         .iter()
@@ -135,10 +131,8 @@ fn buyback_dieback_candidates(timeline: &TimelineDocument) -> Vec<HighlightCandi
                 .events
                 .iter()
                 .filter(|event| {
-                    event.event_type == "DotaCombatlogDeath"
+                    event.is_final_hero_death()
                         && event.target.as_deref() == Some(hero)
-                        && event.target_is_hero == Some(true)
-                        && event.will_reincarnate != Some(true)
                         && event.time_seconds.is_some_and(|death_time| {
                             death_time > buyback_time
                                 && death_time - buyback_time <= BUYBACK_DIEBACK_MAX_SECONDS
@@ -149,7 +143,7 @@ fn buyback_dieback_candidates(timeline: &TimelineDocument) -> Vec<HighlightCandi
                         .unwrap_or_default()
                         .total_cmp(&right.time_seconds.unwrap_or_default())
                 })?;
-            if !used_death_ticks.insert(death.tick) {
+            if !used_deaths.insert((death.tick, hero)) {
                 return None;
             }
             let death_time = death.time_seconds?;
@@ -355,14 +349,11 @@ fn hero_kill_sequence_candidates(timeline: &TimelineDocument) -> Vec<HighlightCa
     let mut kills_by_hero: BTreeMap<&str, Vec<KillWithSetup<'_>>> = BTreeMap::new();
 
     for death in timeline.events.iter().filter(|event| {
-        event.event_type == "DotaCombatlogDeath"
-            && event.target_is_hero == Some(true)
+        event.is_final_hero_death()
             && event.time_seconds.is_some()
-            && event.will_reincarnate != Some(true)
             && event
-                .attacker
-                .as_deref()
-                .is_some_and(|hero| roster.contains(hero))
+                .attributed_hero(|hero| roster.contains(hero))
+                .is_some()
             && event
                 .target
                 .as_deref()
@@ -372,8 +363,10 @@ fn hero_kill_sequence_candidates(timeline: &TimelineDocument) -> Vec<HighlightCa
                 _ => true,
             }
     }) {
-        let killer = death.attacker.as_deref().expect("filtered attacker");
-        let setup = find_kill_setup_event(timeline, death, killer);
+        let killer = death
+            .attributed_hero(|hero| roster.contains(hero))
+            .expect("filtered kill owner");
+        let setup = find_kill_setup_event(timeline, death, killer, &roster);
         kills_by_hero
             .entry(killer)
             .or_default()
@@ -498,12 +491,13 @@ fn find_kill_setup_event<'a>(
     timeline: &'a TimelineDocument,
     death: &'a CombatEvent,
     killer: &str,
+    roster: &BTreeSet<&str>,
 ) -> &'a CombatEvent {
     let death_time = death.time_seconds.unwrap_or_default();
     if let Some(inflictor) = non_empty(death.inflictor.as_deref())
         && let Some(ability) = timeline.events.iter().rev().find(|event| {
             event.event_type == "DotaCombatlogAbility"
-                && event.attacker.as_deref() == Some(killer)
+                && event.attributed_hero(|hero| roster.contains(hero)) == Some(killer)
                 && non_empty(event.inflictor.as_deref()) == Some(inflictor)
                 && event.time_seconds.is_some_and(|time| {
                     time <= death_time && death_time - time <= HERO_KILL_SETUP_LOOKBACK_SECONDS
@@ -519,7 +513,7 @@ fn find_kill_setup_event<'a>(
         .iter()
         .filter(|event| {
             event.event_type == "DotaCombatlogDamage"
-                && event.attacker.as_deref() == Some(killer)
+                && event.attributed_hero(|hero| roster.contains(hero)) == Some(killer)
                 && event.target.as_deref() == target
                 && event.time_seconds.is_some_and(|time| {
                     time <= death_time && death_time - time <= HERO_KILL_DAMAGE_LOOKBACK_SECONDS
@@ -535,7 +529,7 @@ fn find_kill_setup_event<'a>(
         .unwrap_or(death_time);
     if let Some(ability) = timeline.events.iter().rev().find(|event| {
         event.event_type == "DotaCombatlogAbility"
-            && event.attacker.as_deref() == Some(killer)
+            && event.attributed_hero(|hero| roster.contains(hero)) == Some(killer)
             && (event.target.is_none() || event.target.as_deref() == target)
             && event.time_seconds.is_some_and(|time| {
                 time <= damage_time && damage_time - time <= HERO_KILL_ABILITY_LEAD_SECONDS
@@ -991,6 +985,7 @@ mod tests {
             long_range_kill: Some(false),
             will_reincarnate: Some(false),
             assist_players: Vec::new(),
+            context: Default::default(),
         }
     }
 
@@ -1033,6 +1028,7 @@ mod tests {
             tree_orders: Vec::new(),
             temporary_trees: Vec::new(),
             salutes: Vec::new(),
+            state_snapshots: Vec::new(),
         }
     }
 
@@ -1566,6 +1562,92 @@ mod tests {
                 .candidates
                 .iter()
                 .all(|candidate| candidate.kind != "buyback_dieback")
+        );
+    }
+
+    #[test]
+    fn summoned_units_use_explicit_owner_for_kill_and_setup_without_guessing() {
+        let owner = "npc_dota_hero_mirana";
+        let target = "npc_dota_hero_axe";
+        let mut damage = hero_kill_event(98.0, target, None);
+        damage.event_type = "DotaCombatlogDamage".into();
+        damage.attacker = Some("npc_dota_owned_unit".into());
+        damage.damage_source = Some(owner.into());
+        let mut death = damage.clone();
+        death.event_type = "DotaCombatlogDeath".into();
+        death.time_seconds = Some(100.0);
+        death.tick = 3000;
+        let mut unknown = death.clone();
+        unknown.time_seconds = Some(150.0);
+        unknown.tick = 4500;
+        unknown.damage_source = Some("npc_dota_hero_not_in_roster".into());
+        let mut allied = death.clone();
+        allied.tick = 6000;
+        allied.time_seconds = Some(200.0);
+        allied.target_team = allied.attacker_team;
+        let mut replay = timeline(vec![damage, death, unknown, allied]);
+        add_mirana_player(&mut replay);
+        let candidates = hero_kill_sequence_candidates(&replay);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].primary_hero.as_deref(), Some(owner));
+        let sequence = candidates[0].kill_sequence.as_ref().unwrap();
+        assert_eq!(sequence.total_kills, 1);
+        assert_eq!(sequence.kills[0].death_tick, 3000);
+        assert_eq!(sequence.kills[0].setup_tick, 2940);
+    }
+
+    #[test]
+    fn known_attacker_takes_precedence_over_a_different_damage_owner() {
+        let mut death = hero_kill_event(100.0, "npc_dota_hero_axe", None);
+        death.damage_source = Some("npc_dota_hero_other".into());
+        assert_eq!(
+            death.attributed_hero(
+                |hero| ["npc_dota_hero_mirana", "npc_dota_hero_other"].contains(&hero)
+            ),
+            Some("npc_dota_hero_mirana")
+        );
+    }
+
+    #[test]
+    fn generic_fight_does_not_count_reincarnation_or_use_it_as_peak() {
+        let first = event(100.0, 3);
+        let second = event(103.0, 3);
+        let mut reincarnation = event(105.0, 3);
+        reincarnation.will_reincarnate = Some(true);
+        let baseline = detect_highlights(&timeline(vec![first.clone(), second.clone()]), 20, 0.0);
+        let actual = detect_highlights(&timeline(vec![first, second, reincarnation]), 20, 0.0);
+        assert_eq!(actual.candidates, baseline.candidates);
+        assert_eq!(actual.candidates[0].hero_deaths, 2);
+        assert_eq!(actual.candidates[0].anchor_tick, 3090);
+    }
+
+    #[test]
+    fn simultaneous_diebacks_keep_both_heroes_but_do_not_duplicate_one_death() {
+        let first = "npc_dota_hero_mirana";
+        let second = "npc_dota_hero_axe";
+        let mut replay = timeline(vec![
+            buyback_event(100.0, 0),
+            buyback_event(101.0, 1),
+            buyback_event(102.0, 0),
+            hero_death_event(120.0, first, false),
+            hero_death_event(120.0, second, false),
+        ]);
+        add_mirana_player(&mut replay);
+        replay.replay.players.push(ReplayPlayer {
+            slot: 1,
+            hero_name: second.into(),
+            player_name: None,
+            game_team: Some(3),
+            is_fake_client: false,
+        });
+        let candidates = buyback_dieback_candidates(&replay);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter_map(|candidate| candidate.primary_hero.as_deref())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([first, second])
         );
     }
 }

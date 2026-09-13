@@ -253,7 +253,7 @@ $shots = @(
             "dota_camera_focus_player 9"
         )
         cues = @()
-        purpose = "保留猫猫只用虎当时的正常操作、判断和镜头移动。"
+        purpose = "保留主角玩家当时的正常操作、判断和镜头移动。"
     },
     [pscustomobject]@{
         id = "S001-B"

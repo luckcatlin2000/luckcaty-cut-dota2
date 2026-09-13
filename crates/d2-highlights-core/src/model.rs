@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub const MANIFEST_SCHEMA_VERSION: &str = "1.0";
-pub const TIMELINE_SCHEMA_VERSION: &str = "1.3";
+pub const TIMELINE_SCHEMA_VERSION: &str = "1.4";
 pub const HIGHLIGHT_SCHEMA_VERSION: &str = "1.4";
 pub const DIRECTOR_SCHEMA_VERSION: &str = "1.4";
 pub const STORY_SCHEMA_VERSION: &str = "1.2";
@@ -90,6 +90,99 @@ pub struct CombatEvent {
     pub long_range_kill: Option<bool>,
     pub will_reincarnate: Option<bool>,
     pub assist_players: Vec<i32>,
+    #[serde(default, skip_serializing_if = "CombatEventContext::is_empty")]
+    pub context: CombatEventContext,
+}
+
+impl CombatEvent {
+    /// Resolve only an explicitly recorded attacker/owner that exists in the roster.
+    /// Entity name prefixes alone are not evidence of ownership.
+    pub fn attributed_hero<F>(&self, mut is_roster_hero: F) -> Option<&str>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.attacker
+            .as_deref()
+            .filter(|hero| is_roster_hero(hero))
+            .or_else(|| {
+                self.damage_source
+                    .as_deref()
+                    .filter(|hero| is_roster_hero(hero))
+            })
+    }
+
+    pub fn is_final_hero_death(&self) -> bool {
+        self.event_type == "DotaCombatlogDeath"
+            && self.target_is_hero == Some(true)
+            && self.will_reincarnate != Some(true)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct CombatEventContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stun_duration_seconds: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_duration_seconds: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modifier_duration_seconds: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ability_level: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_worth: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hits: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpm: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xpm: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_wards_placed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_ultimate_ability: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_night_time: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_to_radiant: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_to_dire: Option<bool>,
+}
+
+impl CombatEventContext {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ReplayPlayerState {
+    pub roster_index: u8,
+    pub hero_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_worth: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hits: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpm: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xpm: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_wards_placed: Option<u32>,
+    #[serde(default)]
+    pub items: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ReplayStateSnapshot {
+    pub tick: u32,
+    pub time_seconds: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at_night_time: Option<bool>,
+    pub players: Vec<ReplayPlayerState>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -141,6 +234,8 @@ pub struct TimelineDocument {
     pub temporary_trees: Vec<TemporaryTreeEvent>,
     #[serde(default)]
     pub salutes: Vec<PlayerSaluteEvent>,
+    #[serde(default)]
+    pub state_snapshots: Vec<ReplayStateSnapshot>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -488,7 +583,7 @@ mod tests {
                 players: vec![ReplayPlayer {
                     slot: 0,
                     hero_name: "npc_dota_hero_mirana".to_string(),
-                    player_name: Some("Player A".to_string()),
+                    player_name: Some("测试玩家 A".to_string()),
                     game_team: Some(2),
                     is_fake_client: false,
                 }],
@@ -497,6 +592,7 @@ mod tests {
             tree_orders: Vec::new(),
             temporary_trees: Vec::new(),
             salutes: Vec::new(),
+            state_snapshots: Vec::new(),
         };
 
         let json = serde_json::to_vec(&timeline).unwrap();
@@ -508,7 +604,7 @@ mod tests {
         assert_eq!(decoded.replay.players[0].hero_name, "npc_dota_hero_mirana");
         assert_eq!(
             decoded.replay.players[0].player_name.as_deref(),
-            Some("Player A")
+            Some("测试玩家 A")
         );
     }
 

@@ -76,7 +76,8 @@ if (-not $AppSource.Contains($ExpectedAuthorLabel)) {
 }
 if ($RustSource -notmatch "check_for_app_update" -or
     $RustSource -notmatch "install_app_update" -or
-    $RustSource -notmatch "download_and_install") {
+    $RustSource -notmatch '\.download\(' -or
+    $RustSource -notmatch 'update\s*\.install\(') {
     throw "Updater gate failed: controlled updater commands are incomplete."
 }
 
