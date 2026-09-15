@@ -155,6 +155,7 @@ function loadEnvironment(savedPlan: unknown, rejectLoad = false) {
     setPlanConflict: (value: boolean) => { observed.conflict = value; }, setPlanFeedback: noop,
     setNotice: (value: { message: string }) => { observed.notice = value.message; },
     setRenderProgress: noop, setRenderResult: noop, setRenderError: noop,
+    setRenderResume: noop, setResumeCheckError: noop,
   };
   return { observed, environment };
 }
@@ -191,5 +192,67 @@ test("generated hero and story clips keep both live and short timecodes inside t
   for (const clip of [...heroClips, ...storyClips]) {
     assert.equal(clip.endSeconds, 600);
     assert.equal(clip.shortEndSeconds, 600);
+  }
+});
+
+test("opening export saves the current draft before read-only checkpoint inspection", async () => {
+  const calls: string[] = [];
+  const gate = new EditorOperationGate();
+  const openSetup = handler("openMovieSetup", "startMovieRender", {
+    result: { job_id: "A" }, planReady: true, interactionBlocked: false, isTauriRuntime: true,
+    operationGate: { current: gate }, activeJobRef: { current: "A" },
+    setMovieSetupOpen: noop, setRenderResume: noop, setResumeCheckError: noop, setCheckingResume: noop,
+    saveEditPlan: async () => { calls.push("save"); return {}; },
+    refreshRenderResume: async (job: string) => { assert.ok(gate.blocked); calls.push(`inspect:${job}`); },
+  });
+  await openSetup();
+  assert.deepEqual(calls, ["save", "inspect:A"]);
+  assert.equal(gate.blocked, false);
+});
+
+test("a late checkpoint response cannot become the next job's resume action", async () => {
+  let current = true;
+  let shown: unknown = "old";
+  let finish!: (value: object) => void;
+  const pending = new Promise<object>((resolve) => { finish = resolve; });
+  const refresh = handler("refreshRenderResume", "openMovieSetup", {
+    setCheckingResume: noop, setResumeCheckError: noop,
+    setRenderResume: (value: unknown) => { shown = value; }, invoke: () => pending, toErrorMessage: String,
+  });
+  const running = refresh("A", () => current);
+  assert.equal(shown, null);
+  current = false;
+  finish({ fingerprint: "old-A" });
+  await running;
+  assert.equal(shown, null);
+});
+
+test("explicit resume sends its inspected fingerprint and failure refreshes the saved checkpoint", async () => {
+  for (const fingerprint of [null, "verified-plan-A"]) {
+    const calls: string[] = [];
+    const gate = new EditorOperationGate();
+    const start = handler("startMovieRender", "cancelMovieRender", {
+      result: { job_id: "A", replay: { playback_time_seconds: 600 } }, planReady: true,
+      capabilities: { renderReady: true }, clipEdits: [{ startSeconds: 10, endSeconds: 20, includeInFinal: true }],
+      isValidClipTimeRange, operationGate: { current: gate }, activeJobRef: { current: "A" },
+      renderCancelRequested: { current: false }, setRendering: noop, setRenderError: noop,
+      setRenderResult: noop, setRenderProgress: noop, setRenderResume: noop, setPlanFeedback: noop,
+      setCapabilities: noop, setNotice: noop, toErrorMessage: String, saveEditPlan: async () => ({}),
+      Channel: class { onmessage: unknown },
+      invoke: async (name: string, args: { resumeFingerprint?: string | null }) => {
+        calls.push(name);
+        if (name === "start_render") {
+          assert.equal(args.resumeFingerprint, fingerprint);
+          throw new Error("connection closed 10054");
+        }
+        return null;
+      },
+      refreshRenderResume: async (job: string) => {
+        assert.ok(gate.blocked); calls.push(`inspect:${job}`);
+      },
+    });
+    await start(fingerprint);
+    assert.deepEqual(calls, ["start_render", "inspect:A", "get_capabilities"]);
+    assert.equal(gate.blocked, false);
   }
 });

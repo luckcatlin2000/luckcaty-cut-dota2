@@ -3045,6 +3045,21 @@ svg {
   color: #3f8967;
 }
 
+.render-readiness.failed {
+  border-color: #df92a1;
+  background: #fff0f2;
+  color: #92263e;
+}
+
+.render-readiness.failed strong {
+  font-size: 14px;
+}
+
+#root .app-shell .movie-dialog .render-readiness.failed small {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .render-readiness > svg {
   width: 18px;
   height: 18px;
@@ -3195,13 +3210,14 @@ svg {
 }
 
 .render-progress-copy strong {
-  font-size: 10px;
+  font-size: 14px;
+  line-height: 1.5;
 }
 
 .render-progress-copy small {
   margin-top: 3px;
   color: var(--subtle);
-  font-size: 8px;
+  font-size: 12px;
 }
 
 .render-progress-track {
@@ -3221,15 +3237,18 @@ svg {
 
 .render-safety-note {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
-  color: #687f72;
-  font-size: 8px;
+  color: #52695c;
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .render-safety-note svg {
-  width: 13px;
-  height: 13px;
+  flex: 0 0 15px;
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
   color: #52a77d;
 }
 
@@ -3385,6 +3404,61 @@ svg {
   border-color: #efb6be;
   background: #fff0f2;
   color: var(--danger);
+}
+
+.movie-dialog .dialog-feedback.error {
+  min-height: 44px;
+  max-height: min(230px, 34vh);
+  align-items: flex-start;
+  gap: 10px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-color: #df92a1;
+  color: #92263e;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.movie-dialog .dialog-feedback.error > svg {
+  width: 18px;
+  height: 18px;
+  margin-top: 3px;
+}
+
+.export-error-content {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.export-error-content > strong {
+  font-size: 16px;
+}
+
+.export-error-content p {
+  margin: 3px 0 0;
+}
+
+.export-error-content details {
+  margin-top: 7px;
+}
+
+.export-error-content summary {
+  width: fit-content;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.export-error-content pre {
+  margin: 7px 0 0;
+  padding: 8px;
+  border: 1px solid #ebbdc7;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #63333e;
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .dialog-feedback svg {
@@ -4573,3 +4647,43 @@ svg {
   width: 14px;
   height: 14px;
 }
+
+/* Saved recording checkpoints in the export dialog. */
+.render-resume-panel {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 10px;
+  align-items: flex-start;
+  margin: 0 18px 10px;
+  padding: 12px;
+  border: 1px solid #a7dfcb;
+  border-radius: 5px;
+  background: #effaf5;
+  color: #266a53;
+  font-size: 13px;
+  line-height: 1.55;
+}
+.render-resume-panel > svg { width: 18px; height: 18px; flex-shrink: 0; margin-top: 2px; }
+.render-resume-panel strong { font-size: 14px; }
+.render-resume-panel p { margin: 4px 0; }
+.render-resume-panel button { margin-top: 5px; }
+
+.movie-dialog-body { display: contents; }
+.movie-dialog.with-resume { display: flex; flex-direction: column; }
+.movie-dialog.with-resume > .movie-dialog-header,
+.movie-dialog.with-resume > .movie-dialog-footer { flex: 0 0 auto; }
+.movie-dialog.with-resume .movie-dialog-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+}
+.movie-dialog.with-resume .movie-dialog-body > * { flex-shrink: 0; }
+.movie-dialog.with-resume .movie-plan-list { max-height: 150px; }
+
+.movie-dialog.with-resume .secondary-button span { display: inline; }
+
+.cache-cleanup-panel { grid-column: 1 / -1; min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 10px; font-size: 13px; line-height: 1.6; }
+.cache-cleanup-panel p { margin: 8px 0; overflow-wrap: anywhere; }
+.cache-cleanup-panel ul { max-height: 150px; overflow: auto; padding-left: 20px; overflow-wrap: anywhere; }
+.cache-cleanup-panel button { margin: 4px 8px 4px 0; }

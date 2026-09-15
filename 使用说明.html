@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="猫猫的剪辑小助手 2.0 使用说明：导入 Dota 2 录像、编辑高光、选择画面、导出视频和断点继续录制。可离线阅读。">
+<title>使用说明 · 猫猫的剪辑小助手 2.0</title>
+<style>
+:root{color-scheme:light;--ink:#29252d;--muted:#68616d;--pink:#bf365c;--line:#eadde3;--paper:#fff;--tint:#fff2f6;--green:#246b53}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:24px}body{margin:0;background:#faf7f8;color:var(--ink);font:17px/1.85 "Microsoft YaHei","PingFang SC",system-ui,sans-serif}a{color:var(--pink);text-underline-offset:4px}a:hover{text-decoration-thickness:2px}a:focus-visible,summary:focus-visible{outline:3px solid var(--pink);outline-offset:5px}.skip{position:absolute;top:-90px;left:20px;background:white;padding:10px;z-index:5}.skip:focus{top:10px}.layout{max-width:1260px;margin:auto;display:grid;grid-template-columns:242px minmax(0,1fr);gap:44px;padding:40px 32px 80px}.sidebar{position:sticky;top:28px;align-self:start;max-height:calc(100vh - 56px);overflow:auto}.brand{font-weight:800;font-size:18px;line-height:1.5;margin:0 0 10px}.brand span{display:block;color:var(--pink);font-size:14px;font-weight:600;margin-top:6px}.sidebar nav{display:grid;gap:3px;margin-top:24px}.sidebar nav a{color:var(--muted);padding:7px 12px;border-left:2px solid var(--line);text-decoration:none;font-size:16px}.sidebar nav a:hover{background:var(--tint);color:var(--pink);border-color:var(--pink)}.side-note{font-size:14px;color:var(--muted);padding:16px 12px;border-top:1px solid var(--line);margin-top:22px}main{min-width:0}.hero{padding:38px 42px;background:linear-gradient(135deg,#ffedf3,#fff 70%);border:1px solid var(--line);border-radius:20px}.eyebrow{font-size:14px;color:var(--pink);font-weight:700;letter-spacing:2px}.hero h1{font-size:42px;line-height:1.3;margin:12px 0 18px;letter-spacing:-1px}.hero p{margin:0;color:var(--muted);max-width:38em}.tags{display:flex;gap:10px;flex-wrap:wrap;margin:22px 0 0}.tags span{font-size:14px;border:1px solid var(--line);border-radius:50px;padding:2px 12px;background:#fff}.quick{display:flex;gap:12px;flex-wrap:wrap;margin-top:26px}.button{display:inline-block;padding:9px 18px;border:1px solid var(--pink);border-radius:9px;text-decoration:none;font-weight:650;color:var(--pink);background:white}.button.primary{background:var(--pink);color:white}.section{padding:38px 0 12px;border-bottom:1px solid var(--line)}.section:last-of-type{border-bottom:0}h2{font-size:27px;line-height:1.45;margin:0 0 20px}h2 .n{font-size:15px;vertical-align:middle;color:var(--pink);display:inline-block;width:37px;font-weight:700}h3{font-size:19px;margin:25px 0 9px}p{margin:10px 0 17px}ul,ol{padding-left:25px;margin:10px 0 20px}li{margin:7px 0}li::marker{color:var(--pink);font-weight:700}strong{font-weight:750}code{font:0.91em/1.7 Consolas,"Microsoft YaHei",monospace;background:#f3edf0;border-radius:4px;padding:2px 5px;overflow-wrap:anywhere}kbd{font:inherit;font-size:.93em;border:1px solid #d8cbd2;border-bottom-width:2px;background:white;border-radius:5px;padding:1px 7px;white-space:normal}.callout{border-left:4px solid var(--pink);background:var(--tint);padding:17px 22px;border-radius:0 10px 10px 0;margin:22px 0}.callout p:last-child{margin-bottom:0}.callout.ok{border-color:#398467;background:#edf7f2}.cards{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:20px 0}.card{background:white;border:1px solid var(--line);border-radius:12px;padding:20px 23px}.card h3{margin:0 0 8px}.card p{margin:0;color:var(--muted)}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:25px 0 10px}.flow div{background:white;border:1px solid var(--line);border-radius:9px;padding:13px 10px;text-align:center;line-height:1.6}.flow b{display:block;color:var(--pink);font-size:13px;margin-bottom:5px}.example{background:white;border:1px solid var(--line);border-radius:12px;padding:23px;margin:18px 0}.example .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;border-bottom:1px solid var(--line);padding-bottom:15px;margin-bottom:15px}.metrics div{font-size:14px;color:var(--muted)}.metrics b{display:block;font-size:28px;color:var(--ink);line-height:1.4}.example small{display:block;font-size:14px;color:var(--muted)}.table-wrap{overflow:auto;margin:18px 0 22px;border:1px solid var(--line);border-radius:10px}table{width:100%;border-collapse:collapse;background:white;font-size:16px}th,td{text-align:left;vertical-align:top;padding:13px 17px;border-bottom:1px solid var(--line)}th{background:#f7eff3;color:#54414b}td:first-child{width:29%;font-weight:650}tr:last-child td{border:0}.path{display:block;padding:14px 18px;white-space:normal;font-size:15px}details{background:white;border:1px solid var(--line);border-radius:10px;margin:12px 0;padding:0 20px}summary{cursor:pointer;font-weight:700;padding:15px 0;line-height:1.6}details p{color:var(--muted)}details[open]{border-color:#dcaaba}footer{font-size:14px;color:var(--muted);padding-top:35px}.small{font-size:15px;color:var(--muted)}@media(max-width:920px){.layout{grid-template-columns:1fr;padding:22px;gap:25px}.sidebar{position:static;max-height:none}.sidebar nav{display:flex;flex-wrap:wrap;gap:5px 12px;margin-top:14px}.sidebar nav a{border:0;padding:3px 0}.side-note{display:none}.hero{padding:27px}.hero h1{font-size:34px}}@media(max-width:560px){body{font-size:16px}.layout{padding:16px}.hero{padding:22px}.hero h1{font-size:30px}.cards{grid-template-columns:1fr}.flow{grid-template-columns:1fr 1fr}h2{font-size:24px}.section{padding-top:30px}.example{padding:16px}th,td{padding:10px 12px}td:first-child{width:32%}.metrics b{font-size:25px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}@media print{body{background:white;font-size:11pt}.layout{display:block;max-width:none;padding:0}.sidebar,.quick,.skip{display:none}.hero{padding:15px;border-radius:0;background:white}.hero h1{font-size:26pt}.section{padding-top:20px}.cards,.example,.callout,tr{break-inside:avoid}details{display:block}details::details-content{display:block;content-visibility:visible}.section{border-color:#aaa}a{color:inherit}.button{display:none}}
+</style>
+</head>
+<body>
+<a class="skip" href="#content">跳到使用说明</a>
+<div class="layout">
+<aside class="sidebar" aria-label="说明目录">
+<p class="brand">猫猫的剪辑小助手<span>使用说明 · 2.0</span></p>
+<nav aria-label="章节导航">
+<a href="#start">01 开始前准备</a><a href="#import">02 导入与选择主角</a><a href="#edit">03 剪辑与击杀铺垫</a><a href="#camera">04 画面与机位</a><a href="#export">05 导出视频</a><a href="#resume">06 中断后继续录制</a><a href="#files">07 找到成片和素材</a><a href="#faq">08 常见问题</a><a href="#update">09 更新与反馈</a>
+</nav>
+<p class="side-note">本页可以离线阅读。<br>使用浏览器 <kbd>Ctrl</kbd> + <kbd>+</kbd> 放大文字，<kbd>Ctrl</kbd> + <kbd>F</kbd> 查找内容。</p>
+</aside>
+<main id="content">
+<header class="hero">
+<span class="eyebrow">DOTA 2 · 本地录像剪辑</span>
+<h1>从一局录像，<br>到一条高光视频。</h1>
+<p>导入已经下载的 DEM 录像，选择主角、调整片段，再用 Dota 2 原生录制功能导出带游戏原声的视频。本说明适用于 2.0。</p>
+<div class="tags"><span>Windows 10 / 11 · x64</span><span>本地处理</span><span>支持断点续录</span><span>离线使用说明</span></div>
+<div class="quick"><a class="button primary" href="#start">开始使用</a><a class="button" href="#resume">录制中断了？继续录制</a></div>
+</header>
+
+<section class="section" id="start">
+<h2><span class="n">01</span>开始前准备</h2>
+<ol>
+<li>从<a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/latest">官方 GitHub Releases</a>下载 <code>luckcaty-cut-dota2_2.0.0_x64-setup.exe</code>，双击安装。安装版已带 FFmpeg / FFprobe，适合首次使用。</li>
+<li>准备本机已有的 <code>.dem</code> 录像；导出游戏画面需要安装 Steam 版 Dota 2。</li>
+<li>导出前正常退出你已经打开的 Dota 2。使用普通画面时，请先手动打开并登录 Steam，保持 Steam 运行。</li>
+<li>启动“猫猫的剪辑小助手”，检查左下角“本机能力”。Dota 2 未找到时，在右上角“设置”中选择 <code>dota2.exe</code>，点击“应用路径”。</li>
+</ol>
+<p class="small">便携版可运行 <code>猫猫的剪辑小助手.exe</code> 或下载的 portable EXE。单独的便携 EXE 不包含 FFmpeg；请保留配套的 <code>tools\ffmpeg\bin\ffmpeg.exe</code> 和 <code>ffprobe.exe</code>，或使用安装版。</p>
+<div class="callout ok"><strong>先剪辑，后启动游戏。</strong><p>导入、分析、选片和调整时间都不需要启动 Dota 2。点击开始导出或补录时，软件才启动自己创建的离线回放进程；不会接管你已经运行的游戏。</p></div>
+</section>
+
+<section class="section" id="import">
+<h2><span class="n">02</span>导入录像，选择主角</h2>
+<div class="flow" aria-label="四步使用流程"><div><b>STEP 1</b>导入 DEM</div><div><b>STEP 2</b>选择主角</div><div><b>STEP 3</b>调整片段</div><div><b>STEP 4</b>导出 MP4</div></div>
+<ol>
+<li>点击左上角 <kbd>导入录像</kbd>，选择或拖入 <code>.dem</code> 文件。也可先设置“录像目录”，输入录像编号，加载目录里的对应文件。</li>
+<li>等待本地分析完成，核对右侧 10 人英雄阵容。</li>
+<li>选择 <kbd>默认剪辑</kbd>，在“主角”页点击要制作高光的英雄。</li>
+<li>在“高光内容”中选择“全部”“击杀”或已支持的技巧类型，查看左侧片段清单。</li>
+</ol>
+<p>同一英雄相近的连续击杀会合并为片段。点击整局事件轴中的事件，可定位已采用片段或插入对应片段。内容筛选会重建当前英雄的片段清单，精剪后更改筛选前请留意当前方案。</p>
+<div class="cards"><div class="card"><h3>默认剪辑</h3><p>适合按主角整理击杀与技巧高光，再逐段调整时间和镜头。</p></div><div class="card"><h3>WTF 导演</h3><p>在“故事”页查看证据与节拍，点击“使用此 WTF 方案”。可能生成同一场次的同步备用机位，供后期选择。</p></div></div>
+<p>两套方案分别保存，来回切换不会覆盖另一套。WTF 导演提供素材安排，不会自动添加文案、字幕、BGM、配音或搞笑音效。</p>
+</section>
+
+<section class="section" id="edit">
+<h2><span class="n">03</span>调整片段，保留操作铺垫</h2>
+<p>在左侧选中片段，进入右侧“时间”页。先确定要展示的过程，再设置入点和出点；片段时长为 1–100 秒，并需位于录像范围内。</p>
+<div class="table-wrap"><table><thead><tr><th>操作</th><th>用途</th></tr></thead><tbody>
+<tr><td>短击杀</td><td>默认高光片段。1.9.13 起，短击杀尽量保留首杀前至少 12 秒及技能起手前 6 秒；录像起点会限制可保留范围。</td></tr>
+<tr><td>补足击杀铺垫</td><td>用于已保存的旧短击杀方案。按新规则向前延长，保留当前片段选择和出点；不会重新加入已删除的片段。</td></tr>
+<tr><td>剧情时长</td><td>用于走位、蹲人、瞄准和运营。默认首杀前保留 60 秒，可逐段设为 0–90 秒；末次击杀后保留 10 秒，整段最多 100 秒。</td></tr>
+<tr><td>精确时间</td><td>输入 <code>HH:MM:SS.mmm</code>，或用秒级、帧级按钮微调。<code>±1f</code> 按录像编辑时间轴的 30 FPS 调整；导出视频为 60 FPS。</td></tr>
+<tr><td>新增、复制、排序、删除</td><td>整理最终片段顺序。删除只移除方案中的片段，原 DEM 不受影响；同场同步机位的时间调整会联动。</td></tr>
+</tbody></table></div>
+<div class="callout"><strong>示例：米拉娜射箭前反复调整角度。</strong><p>不要只留下命中和击杀瞬间。先点击“补足击杀铺垫”，再检查时间范围；想保留更完整的准备过程，可切换“剧情时长”或手动把入点向前移。</p></div>
+<p class="small">相邻剧情片段重叠时，软件可能缩短后一段的前置时间，请以界面显示的实际范围为准。“重新分析”会先备份当前方案，再恢复当前主角的完整默认候选；它不是断点续录按钮。</p>
+</section>
+
+<section class="section" id="camera">
+<h2><span class="n">04</span>选择画面和机位</h2>
+<div class="cards"><div class="card"><h3>普通画面</h3><p>保留游戏 HUD、小地图及原生玩家昵称，只隐藏右上角回放控制模块。使用你自己的游戏显示习惯。</p></div><div class="card"><h3>干净画面</h3><p>隐藏完整 HUD 和鼠标指针，适合制作更简洁的画面。只有主动选择后才启用。</p></div></div>
+<ul><li><strong>玩家视角：</strong>默认使用所选主角玩家本人的操作视角，适合呈现选手的观察和判断。</li><li><strong>英雄跟随：</strong>镜头跟随目标英雄，适合观察动作；它并不等同于正面特写或自由电影镜头。</li></ul>
+<p>素材编号如 <code>S001-A</code>、<code>S001-B</code> 表示同一场次的不同机位。A 是默认入片机位，B / C 是备用素材；备用机位不增加默认成片时长。</p>
+</section>
+
+<section class="section" id="export">
+<h2><span class="n">05</span>导出视频</h2>
+<ol><li>点击顶部 <kbd>导出视频</kbd>，核对文件名、画面模式、源素材数量、成片时长和声音。</li><li>第一次导出点击 <kbd>开始导出视频</kbd>。如发现已保存片段，请按下一节选择继续录制。</li><li>等待离线回放启动、录像载入、逐段录制、编码、合成和质量检查。录制期间不要操作软件启动的 Dota 2。</li><li>完成后在软件内播放，或打开成片和源素材文件夹。</li></ol><div class="callout"><strong>2.0：减少缓存占用</strong><p>新导出素材优先通过硬链接共用磁盘内容，不支持时自动复制。已有视频不会自动迁移。完成页点击“检查可清理缓存”，核对目录、文件数量和体积，再点击“确认清理原始帧缓存”。清理只删除已核对的原始 JPG/WAV，保留全部 MP4、断点和诊断记录。删除不可撤销；仍可复用 MP4，但从原始帧重新编码需要重新录制。外部编辑硬链接视频前请另存独立副本。</p></div>
+<div class="callout"><strong>游戏窗口慢，不等于成片掉帧。</strong><p>软件通过 Dota 2 原生逐帧输出画面和原声，再编码为 MP4。高质量逐帧录制可能慢于实时播放；请看“已保存秒数”是否持续推进，并以导出的 MP4 播放情况判断。若进度长期不动或报错，按“中断后继续录制”处理。</p></div>
+<p>当前采用游戏原生分辨率、60 FPS、高质量图像输出与 MP4 编码，并进行标准视频颜色范围转换。软件不会替你更改游戏视频设置。高分辨率、长片段和更多机位会增加导出时间与磁盘占用，请保留足够空间。</p>
+<p class="small">声音固定为游戏原声。完成或取消后，软件会收尾并关闭本次自行启动的 Dota 2；请等待处理结束。</p>
+</section>
+
+<section class="section" id="resume">
+<h2><span class="n">06</span>录制中断后，从断点继续</h2>
+<p>2.0 支持检查和复用已保存的完整片段。遇到回放连接中断、取消或合成失败时，保留原任务和缓存，按下面步骤继续。</p>
+<ol><li>从“最近任务”打开原任务，保留中断时的剪辑方案、片段顺序、时间、机位与画面模式。</li><li>点击 <kbd>导出视频</kbd>，等待“正在检查已保存片段”。软件会显示已完成数量、剩余数量及第一个待录片段。</li><li>点击 <kbd>打开已保存片段</kbd>，抽查或查看已有 MP4，确认目标英雄与镜头正确。</li><li>选择 <kbd>从第 N 段继续</kbd>。软件重新检查缓存，只补录缺失或未通过检查的片段，然后按原顺序合成。</li></ol>
+<div class="example" aria-label="断点续录示例">
+<strong>操作示例 · 共 25 段，在第 23 段前中断</strong>
+<div class="metrics"><div><b>22</b>已保存且通过检查</div><div><b>3</b>待补录</div><div><b>23</b>首个待录片段</div></div>
+<p>确认已有 22 段镜头正确后，选择 <kbd>从第 23 段继续</kbd>，补录第 23–25 段，再合成完整视频。</p>
+<small>这是操作示例；实际可复用数量以当前任务检查结果为准。中途有其他无效片段时，也会补录对应片段。</small>
+</div>
+<div class="table-wrap"><table><thead><tr><th>看到的选项或状态</th><th>应该怎样理解</th></tr></thead><tbody>
+<tr><td>镜头未确认</td><td>软件没有自动识别目标英雄，不代表视频损坏。查看已有片段，确认镜头正确后，才能明确选择复用。</td></tr>
+<tr><td>继续合成</td><td>全部素材都已完整保存。可直接完成合成，不需要启动 Dota 2。</td></tr>
+<tr><td>重新录制全部</td><td>你主动决定重新生成所有片段时使用；它与继续录制是两个不同选项。</td></tr>
+<tr><td>没有可继续的记录</td><td>可能已更改方案或画面设置、缓存已缺失，或保存的媒体未通过检查。先核对是否打开了原任务与原方案。</td></tr>
+</tbody></table></div>
+<div class="callout ok"><strong>保留任务文件夹，断点才有依据。</strong><p>软件会核对录像内容、方案、文件哈希和媒体完整性。修改入点、出点、顺序、机位、画面模式，或录制管线变化后，不会把不匹配的旧素材直接混入新方案。旧文件会保留，但不保证任意旧版本素材都可续录。</p></div>
+</section>
+
+<section class="section" id="files">
+<h2><span class="n">07</span>成片、独立切片和方案在哪里</h2>
+<p>优先使用软件中的“打开文件夹”“打开源素材”或“打开已保存片段”。安装版的数据位置由应用管理，不必手工猜路径。</p>
+<div class="table-wrap"><table><thead><tr><th>文件</th><th>内容与命名</th></tr></thead><tbody>
+<tr><td>完整成片</td><td><code>&lt;录像文件名&gt;.mp4</code>。再次导出自动追加 <code>_2</code>、<code>_3</code>，不覆盖已有成片。</td></tr>
+<tr><td>编号源素材</td><td><code>&lt;成片文件名&gt;_源素材</code> 文件夹内有独立 MP4 与 <code>素材清单.json</code>，方便后期剪辑。</td></tr>
+<tr><td>中断前保存的片段</td><td>保存在任务的录制缓存中；通过导出窗口的“打开已保存片段”访问。还未完成合成时，完整源素材目录可能尚未生成。</td></tr>
+<tr><td>剪辑方案</td><td>自动保存在原任务中；默认剪辑和 WTF 导演各自保留。备份时建议保留整个任务文件夹。</td></tr>
+<tr><td>分析包</td><td>点击“导出分析包”生成 <code>evidence.json</code> 与 <code>report.md</code>，用于后续视频制作。分析包不包含录制视频。</td></tr>
+</tbody></table></div>
+<p>根目录便携版的任务通常位于：</p>
+<code class="path">软件所在目录\jobs\&lt;任务编号&gt;\<br>├─ output\　成片与编号源素材<br>├─ render\cache\　可供恢复检查的录制片段<br>└─ director\　剪辑方案及重新分析备份</code>
+<p class="small">原 DEM 保持只读。录制时可能准备经内容校验的副本供游戏载入，不会改写原录像。软件不上传你的录像或媒体文件。</p>
+</section>
+
+<section class="section" id="faq">
+<h2><span class="n">08</span>遇到问题怎么办</h2>
+<details open><summary>游戏启动后一直等待，或显示“未能建立离线控制连接”</summary><p>先等待任务结束或点击取消并等待收尾。确认已经正常退出自己打开的 Dota 2，软件中配置的游戏路径正确，再重试。新版已修复启动握手与播放位置反馈的已知问题；仍失败时展开“技术详情”，保留完整错误和控制日志。</p></details>
+<details open><summary>“VConsole I/O error / os error 10054”是什么意思</summary><p>它表示游戏控制连接被远端关闭，不能只凭这一行判断游戏退出的具体原因。已经完整保存的切片可以保留。等本次任务收尾后，打开原方案检查保存进度，并选择继续录制；不要为重试删除整个任务文件夹。</p></details>
+<details open><summary>只有导出时的游戏窗口很卡</summary><p>原生逐帧录制不一定实时播放，干净画面也一样。只要已保存秒数继续增加，就仍在产出画面；完成后播放 MP4 检查。若成片也有卡顿，反馈具体片段编号和时间点。</p></details>
+<details open><summary>颜色或清晰度仍不理想</summary><p>确认使用 2.0，并保留你平时使用的游戏视频设置。此版采用原生分辨率和高质量编码、标准颜色转换。录制缓存与生成它的设置绑定；如果希望按新画质重新制作旧素材，请明确选择“重新录制全部”。</p></details>
+<details open><summary>找不到 Dota 2、FFmpeg 或 FFprobe</summary><p>Dota 2：进入设置，浏览选择正确的 <code>dota2.exe</code> 后应用路径。FFmpeg / FFprobe：安装版重新运行官方安装包；便携版检查配套工具目录。分析和时间编辑可在未找到游戏时继续使用。</p></details>
+<details open><summary>录像编号加载失败，或分析后没有所需片段</summary><p>确认所选录像目录里已有 <code>&lt;编号&gt;.dem</code>；输入编号不会从网络下载录像。确认主角和内容筛选正确。需要恢复完整默认候选时可用“重新分析”，它会备份并重建当前方案；精剪后请谨慎选择。</p></details>
+<details open><summary>镜头正确，却显示“镜头未确认”</summary><p>这是自动识别状态，不是你的人工检查结论。2.0 已把媒体完成与自动镜头识别分开；查看视频并确认正确后，可以通过“从第 N 段继续”复用通过检查的素材。</p></details>
+</section>
+
+<section class="section" id="update">
+<h2><span class="n">09</span>更新与反馈</h2>
+<p>安装版会检查官方更新；发现新版时由你决定是否下载安装。更新前等待分析或导出结束。检查更新失败不影响本地剪辑，也可从官方 Release 手动下载安装包。</p>
+<p>反馈问题时，请提供：软件版本、普通/干净画面、出错阶段、片段编号，以及“技术详情”中的错误文字。涉及个人信息的录像、日志或截图，先检查再决定是否公开。</p>
+<p><a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/latest">下载正式版</a>　·　<a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/issues">反馈问题</a>　·　<a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2">官方仓库</a></p>
+</section>
+<footer>猫猫的剪辑小助手 · 使用说明 2.0 · 更新于 2026-09-15<br>单文件 HTML，无需联网即可阅读；下载、更新与反馈链接需要网络。<a href="#content">回到顶部 ↑</a></footer>
+</main>
+</div>
+</body>
+</html>

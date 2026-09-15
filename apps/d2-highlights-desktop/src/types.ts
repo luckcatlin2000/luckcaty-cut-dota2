@@ -386,6 +386,16 @@ export interface RenderProgress {
   totalClips: number;
 }
 
+export interface RenderResumeSummary {
+  fingerprint: string;
+  totalClips: number;
+  completedClips: number;
+  remainingClips: number;
+  firstPendingClip: number | null;
+  unverifiedCameraClips: number;
+  completedDirectory: string | null;
+}
+
 export interface RenderResult {
   outputPath: string;
   qcReportPath: string;

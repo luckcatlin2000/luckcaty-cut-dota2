@@ -1,5 +1,6 @@
 mod activity;
 mod analysis_export;
+mod cache_cleanup;
 
 use activity::{Activities, Activity};
 
@@ -10,8 +11,8 @@ use d2_highlights_core::{DirectorDocument, HighlightDocument, JobManifest, Timel
 use d2_highlights_pipeline::{AnalysisProgress, AnalysisSummary, analyze_dem_with_progress};
 use d2_highlights_renderer::{
     BgmMode, CameraStyle, CancellationToken, ClipCameraMode, RENDER_SCHEMA_VERSION, RenderClip,
-    RenderProgress, RenderRequest, RenderResult, RenderSettings, RenderSourceAsset, RenderTakeRole,
-    render,
+    RenderProgress, RenderRequest, RenderResult, RenderResumeSummary, RenderSettings,
+    RenderSourceAsset, RenderTakeRole, inspect_resume, render,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1136,9 +1137,31 @@ fn get_latest_render(
 }
 
 #[tauri::command]
+async fn get_render_resume(
+    job_id: String,
+    state: State<'_, AppState>,
+) -> Result<RenderResumeSummary, String> {
+    if !valid_job_id(&job_id) {
+        return Err("任务编号无效，请重新打开分析结果。".into());
+    }
+    let lease = state.activities.begin(Activity::Render)?;
+    let cancellation = register_render_cancellation(&state.activities, &state.render_runtime)?;
+    let worker_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lease = lease;
+        let _runtime_guard = RenderRuntimeGuard(worker_state.render_runtime.clone());
+        let request = build_render_request(&job_id, &worker_state)?;
+        inspect_resume(&request, &cancellation).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn start_render(
     job_id: String,
     on_progress: Channel<RenderProgress>,
+    resume_fingerprint: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<RenderResult, String> {
     if !valid_job_id(&job_id) {
@@ -1152,7 +1175,8 @@ async fn start_render(
     let joined = tauri::async_runtime::spawn_blocking(move || {
         let _lease = lease;
         let _runtime_guard = RenderRuntimeGuard(worker_state.render_runtime.clone());
-        let result = build_render_request(&job_id, &worker_state).and_then(|request| {
+        let result = build_render_request(&job_id, &worker_state).and_then(|mut request| {
+            request.resume_fingerprint = resume_fingerprint;
             render(request, cancellation, |progress| {
                 let _ = progress_channel.send(progress);
             })
@@ -1451,6 +1475,7 @@ fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest,
         timeline,
         clips,
         settings: manual_render_settings(edit_settings.clone()),
+        resume_fingerprint: None,
     })
 }
 
@@ -1841,6 +1866,9 @@ pub fn run() {
             save_edit_plan,
             get_edit_plan,
             get_latest_render,
+            get_render_resume,
+            cache_cleanup::inspect_render_cache,
+            cache_cleanup::clean_render_cache,
             start_render,
             cancel_render,
             open_local_path,
@@ -1870,6 +1898,9 @@ pub fn run() {
             }
         });
 }
+
+#[cfg(test)]
+mod resume_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,10 +1,17 @@
 mod audio;
+mod cache_storage;
+mod capture_files;
+pub use cache_storage::{CacheCleanupSummary, clean_render_cache, inspect_render_cache};
 mod execution;
+mod resume;
+pub use resume::{RenderResumeSummary, inspect_resume};
 
 use audio::write_original_bgm;
+use capture_files::CaptureFiles;
 use d2_highlights_core::TimelineDocument;
 use d2_highlights_replay_control::{
-    ReplayControlError, VConsoleExecutionReport, execute_vconsole_commands, probe_vconsole,
+    DEMO_STATUS_COMMAND, ReplayControlError, VConsoleExecutionReport, execute_vconsole_commands,
+    probe_vconsole,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,8 +39,14 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 
 pub const RENDER_SCHEMA_VERSION: &str = "d2h.render/1.9";
 // Bump this whenever Dota capture commands or frame/audio encoding behavior changes.
-const CAPTURE_PIPELINE_VERSION: &str = "d2h.capture/1.9.10-validated-capture-13";
-const FRAME_RATE: u32 = 30;
+const CAPTURE_PIPELINE_VERSION: &str = "d2h.capture/1.9.13-native-quality-16";
+// Native capture/output cadence is independent of the 30 Hz editor time grid.
+const FRAME_RATE: u32 = 60;
+const NATIVE_JPEG_QUALITY: u32 = 100;
+const VIDEO_CRF: &str = "16";
+// Preserve the game's resolution. Convert JPEG YCbCr to a standard HD video
+// matrix/range at high precision; do not apply brightness or gamma filters.
+const NATIVE_VIDEO_FILTER: &str = "pad=ceil(iw/2)*2:ceil(ih/2)*2:color=black,zscale=matrixin=470bg:matrix=709:rangein=full:range=limited:dither=error_diffusion,format=yuv420p,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709";
 const CAPTURE_PREROLL_SECONDS: f32 = 1.0;
 const VCONSOLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
@@ -187,6 +200,8 @@ pub struct RenderRequest {
     pub timeline: TimelineDocument,
     pub clips: Vec<RenderClip>,
     pub settings: RenderSettings,
+    // Explicit UI choice, excluded from the media/plan fingerprint.
+    pub resume_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -339,8 +354,8 @@ pub enum RenderError {
     MissingReplay(String),
     #[error("剪辑方案无效：{0}")]
     InvalidPlan(String),
-    #[error("Dota 2 启动后未能建立离线控制连接。")]
-    VConsoleUnavailable,
+    #[error("Dota 2 启动后未能建立离线控制连接。\n最近一次反馈：{0}")]
+    VConsoleUnavailable(String),
     #[error("Dota 2 在离线导出期间意外退出。")]
     DotaExited,
     #[error("Dota 2 回放控制失败：{0}")]
@@ -365,6 +380,7 @@ pub fn render<F>(
 where
     F: FnMut(RenderProgress),
 {
+    let _storage_lease = cache_storage::lock_job_storage(&request.job_dir)?;
     let log_path = request
         .job_dir
         .join("render")
@@ -376,6 +392,7 @@ where
         serde_json::json!({
             "jobId": request.job_id, "capturePipeline": CAPTURE_PIPELINE_VERSION,
             "clips": request.clips, "diagnostics": log_path,
+            "resumeFingerprint": request.resume_fingerprint,
         }),
     )?;
     let mut result = render_inner(request, cancellation.clone(), on_progress);
@@ -404,7 +421,7 @@ where
         &mut on_progress,
         "preflight",
         "running",
-        "正在检查 Dota 2、编码器和剪辑方案",
+        "正在检查已保存素材、编码器和剪辑方案",
         2,
         0,
         request.clips.len(),
@@ -412,14 +429,8 @@ where
     check_cancelled(&cancellation)?;
     check_command(&request.ffmpeg_exe, &["-version"], "FFmpeg")?;
     check_command(&request.ffprobe_exe, &["-version"], "FFprobe")?;
-    if dota_is_running()? {
-        return Err(RenderError::DotaAlreadyRunning);
-    }
-    if native_player_names_require_steam(request.settings.clean_hud) && !steam_is_running()? {
-        return Err(RenderError::SteamRequiredForNativeNames);
-    }
-
     let fingerprint = render_fingerprint(&request)?;
+    let should_resume = resume::resume_requested(&request, &fingerprint)?;
     let cache_root = request
         .job_dir
         .join("render")
@@ -429,54 +440,95 @@ where
     let state_path = cache_root.join("state.json");
     fs::create_dir_all(&segment_root)?;
     let mut state = load_or_create_state(&state_path, &fingerprint)?;
-    let movie_dir = dota_game_dir(&request.dota2_exe)?
-        .join("dota")
-        .join("movie");
-    fs::create_dir_all(&movie_dir)?;
-
-    let replay_dir = dota_game_dir(&request.dota2_exe)?
-        .join("dota")
-        .join("replays");
-    fs::create_dir_all(&replay_dir)?;
-    let prepared_replay = prepare_replay(
-        &request.source_replay,
-        &replay_dir,
-        &request.job_id,
-        &request.source_sha256,
+    let saved = if should_resume {
+        emit(
+            &mut on_progress,
+            "preflight",
+            "running",
+            "正在核验断点片段，完整素材将直接复用",
+            3,
+            0,
+            request.clips.len(),
+        );
+        resume::verified_segments(&request, &state, &segment_root, &cancellation, true)?
+    } else {
+        BTreeMap::new()
+    };
+    execution::record(
+        "resume_plan",
+        serde_json::json!({"requested": should_resume, "completedClips": saved.len(), "remainingClips": request.clips.len() - saved.len()}),
     )?;
 
-    emit(
-        &mut on_progress,
-        "launch",
-        "running",
-        "正在启动 Dota 2 离线回放环境",
-        6,
-        0,
-        request.clips.len(),
-    );
-    let mut owned_dota = OwnedDota(launch_dota(&request.dota2_exe)?);
-    // From successful spawn until verified shutdown there is no early return,
-    // including a diagnostic-write failure or a cancelled capture session.
-    let session_result = (|| {
-        execution::record(
-            "dota_started",
-            serde_json::json!({"pid": owned_dota.0.id()}),
-        )?;
-        run_dota_session(
-            &request,
-            &prepared_replay.replay_reference,
-            &movie_dir,
-            &segment_root,
-            &state_path,
-            &mut state,
-            &cancellation,
-            &mut owned_dota.0,
-            &mut on_progress,
-        )
-    })();
-    finish_dota_session(&mut owned_dota.0, request.clips.len(), &mut on_progress);
+    let segments = if saved.len() == request.clips.len() {
+        let mut segments = Vec::with_capacity(request.clips.len());
+        for (index, clip) in request.clips.iter().enumerate() {
+            check_cancelled(&cancellation)?;
+            segments.push(resume::reused_clip(
+                clip,
+                index,
+                request.clips.len(),
+                &saved[&clip.clip_id],
+                &mut on_progress,
+            )?);
+        }
+        segments
+    } else {
+        if dota_is_running()? {
+            return Err(RenderError::DotaAlreadyRunning);
+        }
+        if native_player_names_require_steam(request.settings.clean_hud) && !steam_is_running()? {
+            return Err(RenderError::SteamRequiredForNativeNames);
+        }
+        let movie_dir = dota_game_dir(&request.dota2_exe)?
+            .join("dota")
+            .join("movie");
+        fs::create_dir_all(&movie_dir)?;
 
-    let segments = session_result?;
+        let replay_dir = dota_game_dir(&request.dota2_exe)?
+            .join("dota")
+            .join("replays");
+        fs::create_dir_all(&replay_dir)?;
+        let prepared_replay = prepare_replay(
+            &request.source_replay,
+            &replay_dir,
+            &request.job_id,
+            &request.source_sha256,
+        )?;
+
+        emit(
+            &mut on_progress,
+            "launch",
+            "running",
+            "正在启动 Dota 2 离线回放环境",
+            6,
+            0,
+            request.clips.len(),
+        );
+        let mut owned_dota = OwnedDota(launch_dota(&request.dota2_exe)?);
+        // From successful spawn until verified shutdown there is no early return,
+        // including a diagnostic-write failure or a cancelled capture session.
+        let session_result = (|| {
+            execution::record(
+                "dota_started",
+                serde_json::json!({"pid": owned_dota.0.id()}),
+            )?;
+            run_dota_session(
+                &request,
+                &prepared_replay.replay_reference,
+                &movie_dir,
+                &segment_root,
+                &state_path,
+                &mut state,
+                &saved,
+                &cancellation,
+                &mut owned_dota.0,
+                &mut on_progress,
+            )
+        })();
+        finish_dota_session(&mut owned_dota.0, request.clips.len(), &mut on_progress);
+
+        session_result?
+    };
     let mut warnings = Vec::new();
     let unverified_count = request
         .clips
@@ -490,7 +542,7 @@ where
         .count();
     if unverified_count > 0 {
         warnings.push(format!(
-            "{unverified_count} 段素材已检查回放 tick、镜头位置和媒体完整性，但尚未核验画面中的目标英雄/事件；请查看各段诊断并确认画面。未核验目标镜头的素材不会自动复用。"
+            "{unverified_count} 段素材已检查回放 tick、镜头位置和媒体完整性，但尚未核验画面中的目标英雄/事件；请查看各段诊断并确认画面。续录只会在你选择继续后复用完整片段，不把复用视为自动识别英雄成功。"
         ));
     }
     check_cancelled(&cancellation)?;
@@ -617,7 +669,11 @@ where
         &mut on_progress,
         "complete",
         "complete",
-        "成片已完成，Dota 2 已关闭",
+        if saved.len() == request.clips.len() {
+            "成片已完成，已复用全部片段"
+        } else {
+            "成片已完成，Dota 2 已关闭"
+        },
         100,
         request.clips.len(),
         request.clips.len(),
@@ -709,7 +765,7 @@ fn export_source_assets(
             asset_id,
             camera_asset_label(&clip.camera_mode)
         ));
-        copy_file(segment, &output_path)?;
+        cache_storage::link_or_copy_new(segment, &output_path)?;
         assets.push(RenderSourceAsset {
             asset_id,
             scene_number,
@@ -808,6 +864,7 @@ fn run_dota_session<F>(
     segment_root: &Path,
     state_path: &Path,
     state: &mut RenderState,
+    saved: &BTreeMap<String, PathBuf>,
     cancellation: &CancellationToken,
     child: &mut Child,
     on_progress: &mut F,
@@ -815,8 +872,27 @@ fn run_dota_session<F>(
 where
     F: FnMut(RenderProgress),
 {
-    wait_for_vconsole(child, cancellation)?;
+    wait_for_vconsole(child, cancellation, |elapsed_seconds| {
+        emit(
+            on_progress,
+            "launch",
+            "running",
+            &format!("正在等待游戏控制连接（已等待 {elapsed_seconds} 秒）"),
+            6,
+            0,
+            request.clips.len(),
+        );
+    })?;
     check_cancelled(cancellation)?;
+    emit(
+        on_progress,
+        "launch",
+        "running",
+        "离线控制已连接，正在载入录像",
+        8,
+        0,
+        request.clips.len(),
+    );
     send_commands(&[format!("playdemo {replay_reference}")])?;
     wait_with_cancel(Duration::from_secs(12), cancellation, child, |_| {})?;
 
@@ -824,23 +900,8 @@ where
     let mut rendered_segments = Vec::with_capacity(total);
     for (index, clip) in request.clips.iter().enumerate() {
         check_cancelled(cancellation)?;
-        let cached = state
-            .segments
-            .get(&clip.clip_id)
-            .filter(|cached| Path::new(&cached.output_path).parent() == Some(segment_root));
-        if let Some(cached) = cached.filter(|cached| segment_cache_is_valid(request, clip, cached))
-        {
-            rendered_segments.push(PathBuf::from(&cached.output_path));
-            execution::record("cache_hit", serde_json::json!({"clipId": clip.clip_id}))?;
-            emit(
-                on_progress,
-                "capture",
-                "running",
-                &format!("已恢复片段 {} 的已验收缓存", index + 1),
-                clip_percent(index + 1, total),
-                index + 1,
-                total,
-            );
+        if let Some(path) = saved.get(&clip.clip_id) {
+            rendered_segments.push(resume::reused_clip(clip, index, total, path, on_progress)?);
             continue;
         }
         execution::record(
@@ -896,7 +957,13 @@ where
                     on_progress,
                     "capture",
                     "running",
-                    &format!("第 {}/{} 段正在离线导出画面与声音", index + 1, total),
+                    &format!(
+                        "第 {}/{} 段 · 已保存 {:.1}/{:.1} 秒 · {FRAME_RATE} FPS",
+                        index + 1,
+                        total,
+                        elapsed,
+                        total_duration
+                    ),
                     overall.clamp(0.0, 100.0) as u8,
                     index + 1,
                     total,
@@ -927,10 +994,11 @@ where
                 candidate_id: clip.candidate_id.clone(),
                 output_path: output_path.display().to_string(),
                 duration_seconds: media.duration_seconds,
-                status: if diagnostics.camera_target_verified && quality_checked {
+                // Media completion does not imply automatic hero identification.
+                status: if quality_checked {
                     "complete"
                 } else {
-                    "camera_target_unverified"
+                    "quality_warning"
                 }
                 .to_string(),
                 capture_pipeline: CAPTURE_PIPELINE_VERSION.to_string(),
@@ -1017,13 +1085,13 @@ where
     };
     write_json(&clip_dir.join("capture-diagnostics.json"), &diagnostics)?;
 
-    let before = collect_movie_files(movie_dir)?;
     let prefix = format!(
         "d2h_{}_{}_{}",
         index + 1,
         clip.clip_id.replace('-', "_"),
-        unix_seconds()?
+        unique_stamp()
     );
+    let mut capture_files = CaptureFiles::new(movie_dir, &prefix)?;
     let source_duration = clip.source_end_seconds - clip.source_start_seconds;
     let impact_start =
         (clip.source_peak_seconds - clip.source_start_seconds - 1.5).clamp(0.0, source_duration);
@@ -1044,16 +1112,16 @@ where
         + frame_count_for_duration(impact_start + (impact_end - impact_start) / slow_speed);
 
     send_commands(&[
-        format!("startmovie {prefix} jpg wav jpeg_quality 95 framerate {FRAME_RATE}"),
+        format!(
+            "startmovie {prefix} jpg wav jpeg_quality {NATIVE_JPEG_QUALITY} framerate {FRAME_RATE}"
+        ),
         format!("demo_pauseatservertick {end_tick}"),
         "demo_resume".to_string(),
     ])?;
     let started = Instant::now();
     if slow_speed < 1.0 && impact_end > impact_start {
         wait_for_capture_frame_count(
-            movie_dir,
-            &before,
-            &prefix,
+            &mut capture_files,
             impact_start_frame,
             capture_frame_count,
             started,
@@ -1064,9 +1132,7 @@ where
         let impact_commands = vec![format!("demo_timescale {slow_speed:.3}")];
         send_commands(&impact_commands)?;
         wait_for_capture_frame_count(
-            movie_dir,
-            &before,
-            &prefix,
+            &mut capture_files,
             impact_output_end_frame,
             capture_frame_count,
             started,
@@ -1078,9 +1144,7 @@ where
         send_commands(&result_commands)?;
     }
     wait_for_capture_frame_count(
-        movie_dir,
-        &before,
-        &prefix,
+        &mut capture_files,
         capture_frame_count,
         capture_frame_count,
         started,
@@ -1092,7 +1156,7 @@ where
 
     let raw_dir = clip_dir.join("raw");
     fs::create_dir_all(&raw_dir)?;
-    let captured = wait_for_movie_files(movie_dir, &before, &prefix, cancellation)?;
+    let captured = wait_for_movie_files(&mut capture_files, cancellation)?;
     let captured_frame_count = captured.iter().filter(|path| is_jpeg(path)).count();
     diagnostics.expected_frames = capture_frame_count;
     diagnostics.captured_frames = captured_frame_count;
@@ -1140,7 +1204,7 @@ fn apply_replay_emphasis(
     enabled: bool,
 ) -> Result<(), RenderError> {
     if !enabled {
-        copy_file(input, output)?;
+        cache_storage::link_or_copy_new(input, output)?;
         return Ok(());
     }
     let media = probe_media(ffprobe, input)?;
@@ -1155,7 +1219,7 @@ fn apply_replay_emphasis(
     let replay_start = (output_peak - 1.15).max(0.0);
     let replay_end = (output_peak + 1.0).min(media.duration_seconds);
     if replay_end - replay_start < 0.8 {
-        copy_file(input, output)?;
+        cache_storage::link_or_copy_new(input, output)?;
         return Ok(());
     }
     let filter = format!(
@@ -1181,7 +1245,7 @@ fn apply_replay_emphasis(
         "-preset".to_string(),
         "medium".to_string(),
         "-crf".to_string(),
-        "18".to_string(),
+        VIDEO_CRF.to_string(),
         "-pix_fmt".to_string(),
         "yuv420p".to_string(),
         "-c:a".to_string(),
@@ -1205,37 +1269,37 @@ fn encode_frame_sequence(
 ) -> Result<(), RenderError> {
     let pattern = raw_dir.join("frame-%06d.jpg");
     let args = vec![
-            "-y".to_string(),
-            "-framerate".to_string(),
-            FRAME_RATE.to_string(),
-            "-start_number".to_string(),
-            "1".to_string(),
-            "-i".to_string(),
-            path_arg(&pattern),
-            "-ss".to_string(),
-            format!("{audio_start_seconds:.3}"),
-            "-i".to_string(),
-            path_arg(wav),
-            "-t".to_string(),
-            format!("{duration:.3}"),
-            "-vf".to_string(),
-            "scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black,fps=30,format=yuv420p".to_string(),
-            "-c:v".to_string(),
-            "libx264".to_string(),
-            "-preset".to_string(),
-            "medium".to_string(),
-            "-crf".to_string(),
-            "18".to_string(),
-            "-c:a".to_string(),
-            "aac".to_string(),
-            "-b:a".to_string(),
-            "192k".to_string(),
-            "-ar".to_string(),
-            "48000".to_string(),
-            "-movflags".to_string(),
-            "+faststart".to_string(),
-            path_arg(output),
-        ];
+        "-y".to_string(),
+        "-framerate".to_string(),
+        FRAME_RATE.to_string(),
+        "-start_number".to_string(),
+        "1".to_string(),
+        "-i".to_string(),
+        path_arg(&pattern),
+        "-ss".to_string(),
+        format!("{audio_start_seconds:.3}"),
+        "-i".to_string(),
+        path_arg(wav),
+        "-t".to_string(),
+        format!("{duration:.3}"),
+        "-vf".to_string(),
+        NATIVE_VIDEO_FILTER.to_string(),
+        "-c:v".to_string(),
+        "libx264".to_string(),
+        "-preset".to_string(),
+        "medium".to_string(),
+        "-crf".to_string(),
+        VIDEO_CRF.to_string(),
+        "-c:a".to_string(),
+        "aac".to_string(),
+        "-b:a".to_string(),
+        "192k".to_string(),
+        "-ar".to_string(),
+        "48000".to_string(),
+        "-movflags".to_string(),
+        "+faststart".to_string(),
+        path_arg(output),
+    ];
     run_media_command(ffmpeg, &args, "编码 Dota 2 原生帧序列")
 }
 
@@ -1428,6 +1492,7 @@ struct MediaInfo {
     has_video: bool,
     has_audio: bool,
     video_frames: Option<usize>,
+    frame_rate: f32,
 }
 
 fn probe_media(ffprobe: &Path, path: &Path) -> Result<MediaInfo, RenderError> {
@@ -1437,7 +1502,7 @@ fn probe_media(ffprobe: &Path, path: &Path) -> Result<MediaInfo, RenderError> {
             "-v",
             "error",
             "-show_entries",
-            "format=duration:stream=codec_type,width,height,nb_frames",
+            "format=duration:stream=codec_type,width,height,nb_frames,avg_frame_rate",
             "-of",
             "json",
             &path_arg(path),
@@ -1463,11 +1528,22 @@ fn probe_media(ffprobe: &Path, path: &Path) -> Result<MediaInfo, RenderError> {
     let mut has_video = false;
     let mut has_audio = false;
     let mut video_frames = None;
+    let mut frame_rate = 0.0;
     if let Some(streams) = value.get("streams").and_then(|value| value.as_array()) {
         for stream in streams {
             match stream.get("codec_type").and_then(|value| value.as_str()) {
                 Some("video") => {
                     has_video = true;
+                    frame_rate = stream
+                        .get("avg_frame_rate")
+                        .and_then(|value| value.as_str())
+                        .and_then(|value| value.split_once('/'))
+                        .and_then(|(numerator, denominator)| {
+                            let numerator = numerator.parse::<f32>().ok()?;
+                            let denominator = denominator.parse::<f32>().ok()?;
+                            (denominator > 0.0).then_some(numerator / denominator)
+                        })
+                        .unwrap_or(0.0);
                     video_frames = stream
                         .get("nb_frames")
                         .and_then(|value| value.as_str())
@@ -1493,6 +1569,7 @@ fn probe_media(ffprobe: &Path, path: &Path) -> Result<MediaInfo, RenderError> {
         has_video,
         has_audio,
         video_frames,
+        frame_rate,
     })
 }
 
@@ -1814,24 +1891,46 @@ fn dota_launch_args() -> [&'static str; 4] {
 fn wait_for_vconsole(
     child: &mut Child,
     cancellation: &CancellationToken,
+    mut on_wait: impl FnMut(u64),
 ) -> Result<(), RenderError> {
     let started = Instant::now();
+    let mut attempt = 0;
+    let mut last_error = "尚未收到控制连接反馈".to_string();
     while started.elapsed() < Duration::from_secs(90) {
         check_cancelled(cancellation)?;
         if child.try_wait()?.is_some() {
             return Err(RenderError::DotaExited);
         }
-        if probe_vconsole(Duration::from_secs(2)).is_ok() {
-            // Dota can fatally race a second VConsole connection while the probe socket closes.
-            thread::sleep(Duration::from_secs(1));
-            return Ok(());
+        attempt += 1;
+        match probe_vconsole(Duration::from_secs(2)) {
+            Ok(report) => {
+                execution::record(
+                    "vconsole_ready",
+                    serde_json::json!({"attempt": attempt, "report": report}),
+                )?;
+                // Dota can fatally race a second VConsole connection while the probe socket closes.
+                thread::sleep(Duration::from_secs(1));
+                return Ok(());
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                execution::record(
+                    "vconsole_probe_failed",
+                    serde_json::json!({
+                        "attempt": attempt,
+                        "elapsedMilliseconds": started.elapsed().as_millis(),
+                        "error": last_error,
+                    }),
+                )?;
+                on_wait(started.elapsed().as_secs());
+            }
         }
         thread::sleep(Duration::from_secs(1));
     }
-    Err(RenderError::VConsoleUnavailable)
+    Err(RenderError::VConsoleUnavailable(last_error))
 }
 
-// Format recovered read-only from the installed engine2.dll:
+// The no-argument demo_goto branch in the installed engine2.dll prints:
 // "  Currently playing %d of %d ticks. Minutes:%.2f File:%s".
 // Unknown client formats fail closed and are preserved in the diagnostic log.
 fn parse_demo_current_tick(line: &str) -> Option<u32> {
@@ -1874,11 +1973,12 @@ fn wait_for_seek(
         if child.try_wait()?.is_some() {
             return Err(RenderError::DotaExited);
         }
-        match execute_logged_commands(&["demo_info".to_string()]) {
+        match execute_logged_commands(&[DEMO_STATUS_COMMAND.to_string()]) {
             Ok(report) => {
                 let current = report
                     .console_excerpt
                     .iter()
+                    .rev()
                     .find_map(|line| parse_demo_current_tick(line));
                 execution::record(
                     "seek_observation",
@@ -1899,9 +1999,38 @@ fn wait_for_seek(
         }
         wait_with_cancel(Duration::from_millis(650), cancellation, child, |_| {})?;
     }
-    Err(RenderError::ReplayControl(format!(
-        "回放跳转未确认，已停止录制：目标 tick {target_tick}，最后实际 tick {last_tick:?}，状态错误 {last_error:?}。请保留本次控制日志。"
+    execution::record(
+        "seek_failed",
+        serde_json::json!({
+            "query": DEMO_STATUS_COMMAND, "targetTick": target_tick,
+            "observedTick": last_tick, "controlError": last_error,
+        }),
+    )?;
+    Err(RenderError::ReplayControl(seek_failure_message(
+        target_tick,
+        last_tick,
+        last_error.as_deref(),
     )))
+}
+
+fn seek_failure_message(
+    target_tick: u32,
+    last_tick: Option<u32>,
+    last_error: Option<&str>,
+) -> String {
+    let reason = if last_tick.is_some() {
+        "录像尚未稳定到达指定位置，本次导出已停止。"
+    } else {
+        "未能读取录像当前播放位置，本次导出已停止。"
+    };
+    let observed = last_tick.map_or_else(|| "未收到".to_string(), |tick| format!("{tick} tick"));
+    let mut message = format!(
+        "回放跳转未确认：{reason}\n目标位置：{target_tick} tick；最近收到的位置：{observed}。\n请保留本次控制日志以便排查。"
+    );
+    if let Some(error) = last_error {
+        message.push_str(&format!("\n控制反馈：{error}"));
+    }
+    message
 }
 
 fn execute_logged_commands(commands: &[String]) -> Result<VConsoleExecutionReport, RenderError> {
@@ -2060,30 +2189,8 @@ fn windows_process_is_running(image_name: &str) -> Result<bool, RenderError> {
         .contains(&image_name.to_ascii_lowercase()))
 }
 
-fn collect_movie_files(root: &Path) -> Result<BTreeMap<PathBuf, u64>, RenderError> {
-    fn visit(path: &Path, files: &mut BTreeMap<PathBuf, u64>) -> io::Result<()> {
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                visit(&path, files)?;
-            } else {
-                files.insert(path, entry.metadata()?.len());
-            }
-        }
-        Ok(())
-    }
-    let mut files = BTreeMap::new();
-    if root.is_dir() {
-        visit(root, &mut files)?;
-    }
-    Ok(files)
-}
-
 fn wait_for_movie_files(
-    movie_dir: &Path,
-    before: &BTreeMap<PathBuf, u64>,
-    prefix: &str,
+    capture_files: &mut CaptureFiles,
     cancellation: &CancellationToken,
 ) -> Result<Vec<PathBuf>, RenderError> {
     let started = Instant::now();
@@ -2091,31 +2198,18 @@ fn wait_for_movie_files(
     let mut stable_since = Instant::now();
     while started.elapsed() < Duration::from_secs(20) {
         check_cancelled(cancellation)?;
-        let current = collect_movie_files(movie_dir)?;
-        let mut captured = current
-            .iter()
-            .filter(|(path, size)| {
-                let is_new = before.get(*path).is_none_or(|old_size| old_size != *size);
-                let name_matches = path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .is_some_and(|name| name.contains(prefix));
-                is_new && name_matches
-            })
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
-        captured.sort();
-        let captured_files: BTreeMap<_, _> = captured
-            .iter()
-            .map(|path| (path.clone(), current[path]))
-            .collect();
-        if captured_files != previous_files {
-            previous_files = captured_files;
+        let captured = capture_files.collect()?;
+        if captured != previous_files {
+            previous_files = captured;
             stable_since = Instant::now();
-        } else if captured.len() >= FRAME_RATE as usize
+        } else if captured
+            .iter()
+            .filter(|(path, size)| is_jpeg(path) && **size > 0)
+            .count()
+            >= FRAME_RATE as usize
             && stable_since.elapsed() >= Duration::from_secs(2)
         {
-            return Ok(captured);
+            return Ok(captured.into_keys().collect());
         }
         thread::sleep(Duration::from_millis(400));
     }
@@ -2246,9 +2340,7 @@ fn frame_count_for_duration(duration_seconds: f32) -> usize {
 
 #[allow(clippy::too_many_arguments)]
 fn wait_for_capture_frame_count<P>(
-    movie_dir: &Path,
-    before: &BTreeMap<PathBuf, u64>,
-    prefix: &str,
+    capture_files: &mut CaptureFiles,
     target_frames: usize,
     total_frames: usize,
     started: Instant,
@@ -2268,10 +2360,10 @@ where
         if child.try_wait()?.is_some() {
             return Err(RenderError::DotaExited);
         }
-        captured_frames = collect_movie_files(movie_dir)?
+        captured_frames = capture_files
+            .collect()?
             .iter()
-            .filter(|(path, size)| capture_file_matches(path, **size, before, prefix))
-            .filter(|(path, _)| is_jpeg(path))
+            .filter(|(path, size)| is_jpeg(path) && **size > 0)
             .count();
         let captured_seconds = captured_frames.min(total_frames) as f32 / FRAME_RATE as f32;
         on_tick(captured_seconds, total_seconds);
@@ -2283,20 +2375,6 @@ where
     Err(RenderError::Media(format!(
         "Dota 2 原生逐帧导出超时：需要 {target_frames} 帧，只得到 {captured_frames} 帧"
     )))
-}
-
-fn capture_file_matches(
-    path: &Path,
-    size: u64,
-    before: &BTreeMap<PathBuf, u64>,
-    prefix: &str,
-) -> bool {
-    let is_new = before.get(path).is_none_or(|old_size| *old_size != size);
-    let name_matches = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .is_some_and(|name| name.contains(prefix));
-    is_new && name_matches
 }
 
 fn is_jpeg(path: &Path) -> bool {
@@ -2411,14 +2489,13 @@ fn segment_cache_is_valid(
         && file_sha256(path).is_ok_and(|sha| sha == state.content_sha256)
         && probe_media(&request.ffprobe_exe, path)
             .is_ok_and(|media| validate_segment_media(&media, expected).is_ok())
-        && run_qc(&request.ffmpeg_exe, &request.ffprobe_exe, path)
-            .is_ok_and(|qc| qc.warnings.is_empty())
 }
 
 fn cache_metadata_matches(state: &SegmentState, clip: &RenderClip, expected: f32) -> bool {
-    state.status == "complete"
-        && state.quality_checked
-        && state.camera_target_verified
+    matches!(
+        state.status.as_str(),
+        "complete" | "camera_target_unverified"
+    ) && state.quality_checked
         && state.capture_pipeline == CAPTURE_PIPELINE_VERSION
         && state.candidate_id == clip.candidate_id
         && state.content_sha256.len() == 64
@@ -2448,8 +2525,10 @@ fn expected_clip_duration(clip: &RenderClip, settings: &RenderSettings) -> f32 {
 fn validate_media_contract(media: &MediaInfo) -> Result<(), RenderError> {
     if !media.has_video
         || !media.has_audio
-        || media.width != 1920
-        || media.height != 1080
+        || media.width == 0
+        || media.height == 0
+        || !media.width.is_multiple_of(2)
+        || !media.height.is_multiple_of(2)
         || !media.duration_seconds.is_finite()
         || media.duration_seconds < 1.0
     {
@@ -2471,7 +2550,8 @@ fn valid_source_frame_range(start: f32, end: f32) -> bool {
 fn validate_segment_media(media: &MediaInfo, expected: f32) -> Result<(), RenderError> {
     validate_media_contract(media)?;
     let frames = frame_count_for_duration(expected);
-    if (media.duration_seconds - expected).abs() > 0.1
+    if (media.frame_rate - FRAME_RATE as f32).abs() > 0.01
+        || (media.duration_seconds - expected).abs() > 0.1
         || media
             .video_frames
             .is_none_or(|actual| actual.abs_diff(frames) > 2)
@@ -2786,6 +2866,8 @@ mod tests {
             Some(9000)
         );
         for line in [
+            "DemoFileInfo: playback_time: 1000",
+            "playback_ticks: 30000",
             "Current tick: 9000; total ticks: 30000",
             "total ticks: 30000",
             "Currently playing 40000 of 30000 ticks. Minutes:0 File:a",
@@ -2811,6 +2893,18 @@ mod tests {
             Some(1000),
             1000
         ));
+    }
+
+    #[test]
+    fn seek_failure_distinguishes_missing_feedback_from_wrong_position() {
+        let missing = super::seek_failure_message(9000, None, None);
+        assert!(missing.contains("未能读取录像当前播放位置"));
+        assert!(missing.contains("最近收到的位置：未收到"));
+        assert!(!missing.contains("None"));
+        let wrong = super::seek_failure_message(9000, Some(500), Some("fixture: disconnected"));
+        assert!(wrong.contains("录像尚未稳定到达指定位置"));
+        assert!(wrong.contains("最近收到的位置：500 tick"));
+        assert!(wrong.contains("控制反馈：fixture: disconnected"));
     }
 
     #[test]
@@ -2863,7 +2957,8 @@ mod tests {
             height: 1080,
             has_video: true,
             has_audio: true,
-            video_frames: Some((duration * 30.0).round() as usize),
+            video_frames: Some((duration * super::FRAME_RATE as f32).round() as usize),
+            frame_rate: super::FRAME_RATE as f32,
         }
     }
 
@@ -2920,7 +3015,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_requires_target_verification_pipeline_identity_and_expected_duration() {
+    fn resume_cache_requires_media_completion_pipeline_identity_and_expected_duration() {
         let clip = mirana_clip(ClipCameraMode::PlayerPerspective);
         let mut state = super::SegmentState {
             candidate_id: clip.candidate_id.clone(),
@@ -2933,9 +3028,15 @@ mod tests {
             quality_checked: true,
             camera_target_verified: false,
         };
-        assert!(!super::cache_metadata_matches(&state, &clip, 4.0));
-        state.camera_target_verified = true;
         assert!(super::cache_metadata_matches(&state, &clip, 4.0));
+        state.status = "camera_target_unverified".into();
+        assert!(super::cache_metadata_matches(&state, &clip, 4.0));
+        state.quality_checked = false;
+        assert!(!super::cache_metadata_matches(&state, &clip, 4.0));
+        state.quality_checked = true;
+        state.status = "capturing".into();
+        assert!(!super::cache_metadata_matches(&state, &clip, 4.0));
+        state.status = "complete".into();
         state.duration_seconds = 2.0;
         assert!(!super::cache_metadata_matches(&state, &clip, 4.0));
         state.duration_seconds = 4.0;
@@ -3083,8 +3184,21 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
     #[test]
     fn native_capture_waits_for_the_requested_output_frame_count() {
         assert_eq!(frame_count_for_duration(0.0), 0);
-        assert_eq!(frame_count_for_duration(1.0 / 30.0), 1);
-        assert_eq!(frame_count_for_duration(8.0), 240);
+        assert_eq!(frame_count_for_duration(1.0 / 30.0), 2);
+        assert_eq!(frame_count_for_duration(8.0), 480);
+    }
+
+    #[test]
+    fn native_resolution_and_capture_cadence_survive_validation() {
+        let mut media = fixture_media(2.0);
+        media.width = 3840;
+        media.height = 2160;
+        assert!(super::validate_segment_media(&media, 2.0).is_ok());
+        media.frame_rate = 30.0;
+        assert!(super::validate_segment_media(&media, 2.0).is_err());
+        media.frame_rate = super::FRAME_RATE as f32;
+        media.width = 0;
+        assert!(super::validate_media_contract(&media).is_err());
     }
 
     #[test]
@@ -3163,6 +3277,7 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
             timeline: mirana_timeline(),
             clips: vec![primary, alternate],
             settings: RenderSettings::default(),
+            resume_fingerprint: None,
         };
         let output_dir = temp.path().join("source-assets");
 
@@ -3248,7 +3363,7 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
                 players: vec![ReplayPlayer {
                     slot: 7,
                     hero_name: "npc_dota_hero_mirana".to_string(),
-                    player_name: Some("Player A".to_string()),
+                    player_name: Some("猫猫只用虎".to_string()),
                     game_team: Some(3),
                     is_fake_client: false,
                 }],
@@ -3331,6 +3446,7 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
             timeline: mirana_timeline(),
             clips: vec![mirana_clip(ClipCameraMode::PlayerPerspective)],
             settings: RenderSettings::default(),
+            resume_fingerprint: None,
         };
 
         let previous =
@@ -3384,6 +3500,79 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
         assert!(qc.has_video);
         assert!(qc.has_audio);
         assert_eq!(qc.black_events, 0);
+    }
+
+    #[test]
+    #[ignore = "requires local FFmpeg; uses synthetic media, never opens Dota"]
+    fn native_encoder_preserves_resolution_rate_and_standard_color() {
+        let ffmpeg = std::path::PathBuf::from(
+            std::env::var_os("FFMPEG_EXE").unwrap_or_else(|| "ffmpeg.exe".into()),
+        );
+        let ffprobe = std::path::PathBuf::from(
+            std::env::var_os("FFPROBE_EXE").unwrap_or_else(|| "ffprobe.exe".into()),
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let raw = temp.path().join("raw");
+        std::fs::create_dir(&raw).unwrap();
+        let pattern = raw.join("frame-%06d.jpg");
+        let wav = raw.join("game.wav");
+        super::run_media_command(
+            &ffmpeg,
+            &[
+                "-y".into(),
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                "testsrc2=size=2560x1440:rate=60:duration=1".into(),
+                "-q:v".into(),
+                "2".into(),
+                super::path_arg(&pattern),
+            ],
+            "synthetic native-resolution frames",
+        )
+        .unwrap();
+        super::run_media_command(
+            &ffmpeg,
+            &[
+                "-y".into(),
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                "sine=frequency=440:sample_rate=48000:duration=1".into(),
+                super::path_arg(&wav),
+            ],
+            "synthetic audio",
+        )
+        .unwrap();
+        let output = temp.path().join("native-quality.mp4");
+        encode_frame_sequence(&ffmpeg, &raw, &wav, &output, 1.0, 0.0).unwrap();
+        let media = probe_media(&ffprobe, &output).unwrap();
+        assert_eq!((media.width, media.height), (2560, 1440));
+        assert_eq!(media.video_frames, Some(60));
+        assert_eq!(media.frame_rate, 60.0);
+        super::validate_segment_media(&media, 1.0).unwrap();
+        let metadata = super::background_command(&ffprobe)
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=color_range,color_space,color_transfer,color_primaries,pix_fmt",
+                "-of",
+                "json",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+        assert!(metadata.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+        let video = &value["streams"][0];
+        assert_eq!(video["color_range"], "tv");
+        assert_eq!(video["color_space"], "bt709");
+        assert_eq!(video["color_transfer"], "bt709");
+        assert_eq!(video["color_primaries"], "bt709");
+        assert_eq!(video["pix_fmt"], "yuv420p");
     }
 
     #[test]

@@ -8,7 +8,16 @@ use thiserror::Error;
 pub const CONTROL_SCHEMA_VERSION: &str = "1.0";
 pub const VCONSOLE_PORT: u16 = 29_000;
 const VCONSOLE_HEADER_SIZE: usize = 12;
-const VCONSOLE_COMMAND_VERSION: u32 = 0x00D4_0000;
+const VCONSOLE_COMMAND_VERSION: u16 = 0x00D4;
+// The engine's initialization stream includes large opaque CVRB frames.
+// Packet lengths are 32-bit; keep a separate defensive allocation bound.
+const MAX_VCONSOLE_PACKET_BYTES: usize = 16 * 1024 * 1024;
+// With no arguments this command prints usage and the current playback tick,
+// then returns without seeking. demo_info prints file metadata instead.
+pub const DEMO_STATUS_COMMAND: &str = "demo_goto";
+const DEMO_STATUS_USAGE: &str = "syntax: demo_goto <tick> [relative] [pause]";
+const VCONSOLE_PRINT_TEXT_OFFSET: usize = VCONSOLE_HEADER_SIZE + 28;
+const MAX_RESPONSE_TEXT_BYTES: usize = 256 * 1024;
 
 const ALLOWED_COMMANDS: &[&str] = &[
     "echo",
@@ -71,6 +80,8 @@ pub enum ReplayControlError {
     MarkerTimeout,
     #[error("VConsole reported a command failure: {0}")]
     CommandFailed(String),
+    #[error("VConsole response format is invalid: {0}")]
+    InvalidResponse(&'static str),
     #[error("system clock is before the Unix epoch")]
     Clock,
     #[error("VConsole I/O error: {0}")]
@@ -343,7 +354,7 @@ pub fn build_cmnd_packet(command: &str) -> Result<Vec<u8>, ReplayControlError> {
     let mut packet = Vec::with_capacity(total_length as usize);
     packet.extend_from_slice(b"CMND");
     packet.extend_from_slice(&VCONSOLE_COMMAND_VERSION.to_be_bytes());
-    packet.extend_from_slice(&total_length.to_be_bytes());
+    packet.extend_from_slice(&u32::from(total_length).to_be_bytes());
     packet.extend_from_slice(&0_u16.to_be_bytes());
     packet.extend_from_slice(command_bytes);
     packet.push(0);
@@ -385,7 +396,14 @@ pub fn probe_vconsole(timeout: Duration) -> Result<VConsoleProbeReport, ReplayCo
     let marker = format!("D2H_VCONSOLE_PROBE_{nonce}");
     stream.write_all(&build_cmnd_packet(&format!("echo {marker}"))?)?;
 
-    let marker_result = wait_for_marker(&mut stream, &marker, timeout, started)?;
+    let marker_result = wait_for_marker(
+        &mut stream,
+        &marker,
+        None,
+        timeout,
+        started,
+        &mut ConsoleDecoder::default(),
+    )?;
     Ok(VConsoleProbeReport {
         host: Ipv4Addr::LOCALHOST.to_string(),
         port: VCONSOLE_PORT,
@@ -407,21 +425,34 @@ pub fn execute_vconsole_commands(
 
     let started = Instant::now();
     let mut stream = connect_vconsole(timeout)?;
-    let initial_bytes_drained = drain_initial_stream(&mut stream, Duration::from_secs(2))?;
-    for command in commands {
-        stream.write_all(&build_cmnd_packet(command)?)?;
-    }
-
+    let mut decoder = ConsoleDecoder::default();
+    let initial_bytes_drained =
+        drain_initial_stream(&mut stream, Duration::from_secs(2), &mut decoder)?;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| ReplayControlError::Clock)?
         .as_nanos();
     let marker = format!("D2H_VCONSOLE_ACK_{nonce}");
+    let start_marker = format!("D2H_VCONSOLE_BEGIN_{nonce}");
+    stream.write_all(&build_cmnd_packet(&format!("echo {start_marker}"))?)?;
+    for command in commands {
+        stream.write_all(&build_cmnd_packet(command)?)?;
+    }
     stream.write_all(&build_cmnd_packet(&format!("echo {marker}"))?)?;
-    let marker_result = wait_for_marker(&mut stream, &marker, timeout, started)?;
+    let marker_result = wait_for_marker(
+        &mut stream,
+        &marker,
+        Some(&start_marker),
+        timeout,
+        started,
+        &mut decoder,
+    )?;
 
-    let console_excerpt = extract_console_excerpt(&marker_result.bytes, &marker);
-    reject_console_errors(&console_excerpt)?;
+    let mut console_excerpt = marker_result.console_lines;
+    reject_console_errors(commands, &console_excerpt)?;
+    if console_excerpt.len() > 80 {
+        console_excerpt.drain(..console_excerpt.len() - 80);
+    }
     Ok(VConsoleExecutionReport {
         host: Ipv4Addr::LOCALHOST.to_string(),
         port: VCONSOLE_PORT,
@@ -434,12 +465,14 @@ pub fn execute_vconsole_commands(
     })
 }
 
-fn reject_console_errors(lines: &[String]) -> Result<(), ReplayControlError> {
+fn reject_console_errors(commands: &[String], lines: &[String]) -> Result<(), ReplayControlError> {
+    let status_query = commands.len() == 1 && commands[0].trim() == DEMO_STATUS_COMMAND;
     let error = lines.iter().find(|line| {
         let line = line.trim().to_ascii_lowercase();
         line.starts_with("unknown command")
             || line.starts_with("error:")
-            || line.starts_with("syntax:")
+            || line.starts_with("error -")
+            || (line.starts_with("syntax:") && !(status_query && line == DEMO_STATUS_USAGE))
             || line.contains("couldn't open demo file")
             || line.contains("failed to read demo header")
             || line.contains("can't playdemo")
@@ -462,6 +495,7 @@ fn connect_vconsole(timeout: Duration) -> Result<TcpStream, ReplayControlError> 
 fn drain_initial_stream(
     stream: &mut TcpStream,
     max_duration: Duration,
+    decoder: &mut ConsoleDecoder,
 ) -> Result<usize, ReplayControlError> {
     let started = Instant::now();
     let mut drained = 0;
@@ -469,7 +503,11 @@ fn drain_initial_stream(
     while started.elapsed() < max_duration {
         match stream.read(&mut chunk) {
             Ok(0) => break,
-            Ok(count) => drained += count,
+            Ok(count) => {
+                drained += count;
+                // Keep any partial packet for the subsequent command read.
+                decoder.push(&chunk[..count])?;
+            }
             Err(error)
                 if matches!(
                     error.kind(),
@@ -487,19 +525,68 @@ fn drain_initial_stream(
 struct MarkerRead {
     read_chunks: usize,
     bytes_received: usize,
-    bytes: Vec<u8>,
+    console_lines: Vec<String>,
+}
+
+// PRNT carries 28 bytes of metadata after the common 12-byte header. Treating
+// the whole binary packet as text leaks header bytes into tick/camera lines.
+// Buffer TCP fragments and only expose complete PRNT message bodies.
+#[derive(Default)]
+struct ConsoleDecoder {
+    pending: Vec<u8>,
+}
+
+impl ConsoleDecoder {
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<String>, ReplayControlError> {
+        self.pending.extend_from_slice(bytes);
+        let mut consumed = 0;
+        let mut messages = Vec::new();
+        while self.pending.len() - consumed >= VCONSOLE_HEADER_SIZE {
+            let packet = &self.pending[consumed..];
+            // Header: type[4], version:u16, total length:u32, handle:u16.
+            // Using only bytes 8..10 works for small PRNT but truncates CVRB.
+            let length = u32::from_be_bytes([packet[6], packet[7], packet[8], packet[9]]) as usize;
+            if length < VCONSOLE_HEADER_SIZE {
+                return Err(ReplayControlError::InvalidResponse("invalid packet length"));
+            }
+            if length > MAX_VCONSOLE_PACKET_BYTES {
+                return Err(ReplayControlError::InvalidResponse(
+                    "packet length exceeds 16 MiB limit",
+                ));
+            }
+            if packet.len() < length {
+                break;
+            }
+            if &packet[..4] == b"PRNT" {
+                if length <= VCONSOLE_PRINT_TEXT_OFFSET {
+                    return Err(ReplayControlError::InvalidResponse("short PRNT packet"));
+                }
+                let body = &packet[VCONSOLE_PRINT_TEXT_OFFSET..length];
+                let end = body.iter().position(|byte| *byte == 0).ok_or(
+                    ReplayControlError::InvalidResponse("unterminated PRNT message"),
+                )?;
+                messages.push(String::from_utf8_lossy(&body[..end]).into_owned());
+            }
+            consumed += length;
+        }
+        self.pending.drain(..consumed);
+        Ok(messages)
+    }
 }
 
 fn wait_for_marker(
     stream: &mut TcpStream,
     marker: &str,
+    start_marker: Option<&str>,
     timeout: Duration,
     started: Instant,
+    decoder: &mut ConsoleDecoder,
 ) -> Result<MarkerRead, ReplayControlError> {
     let mut read_chunks = 0;
     let mut bytes_received = 0;
-    let mut response = Vec::new();
-    let mut overlap = Vec::new();
+    let mut console_lines = Vec::new();
+    let mut text_bytes = 0;
+    let mut collecting = start_marker.is_none();
     let mut chunk = vec![0_u8; 16 * 1024];
     while started.elapsed() < timeout {
         let count = match stream.read(&mut chunk) {
@@ -518,53 +605,46 @@ fn wait_for_marker(
 
         read_chunks += 1;
         bytes_received += count;
-        if response.len() < 256 * 1024 {
-            let remaining = 256 * 1024 - response.len();
-            response.extend_from_slice(&chunk[..count.min(remaining)]);
-        }
-        overlap.extend_from_slice(&chunk[..count]);
-        if overlap
-            .windows(marker.len())
-            .any(|window| window == marker.as_bytes())
-        {
-            return Ok(MarkerRead {
-                read_chunks,
-                bytes_received,
-                bytes: response,
-            });
-        }
-        let retained = marker.len().saturating_sub(1);
-        if overlap.len() > retained {
-            overlap.drain(..overlap.len() - retained);
+        for message in decoder.push(&chunk[..count])? {
+            // Only a complete echoed PRNT message is an acknowledgement.
+            // Strings in headers, metadata, or other packet types do not count.
+            if Some(message.trim()) == start_marker {
+                collecting = true;
+                console_lines.clear();
+                text_bytes = 0;
+                continue;
+            }
+            if !collecting {
+                continue;
+            }
+            if message.trim() == marker {
+                return Ok(MarkerRead {
+                    read_chunks,
+                    bytes_received,
+                    console_lines,
+                });
+            }
+            if start_marker.is_none() {
+                // The connection probe needs only its echo, not historical logs.
+                continue;
+            }
+            text_bytes += message.len();
+            if text_bytes > MAX_RESPONSE_TEXT_BYTES {
+                return Err(ReplayControlError::InvalidResponse(
+                    "command response exceeds limit",
+                ));
+            }
+            console_lines.extend(
+                message
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned),
+            );
         }
     }
 
     Err(ReplayControlError::MarkerTimeout)
-}
-
-fn extract_console_excerpt(bytes: &[u8], marker: &str) -> Vec<String> {
-    let normalized: String = bytes
-        .iter()
-        .map(|byte| {
-            if byte.is_ascii_graphic() || matches!(byte, b' ' | b'\t') {
-                *byte as char
-            } else {
-                '\n'
-            }
-        })
-        .collect();
-    let mut lines = Vec::new();
-    for line in normalized.lines() {
-        let line = line.trim();
-        if line.len() < 4 || line.contains(marker) || lines.iter().any(|seen| seen == line) {
-            continue;
-        }
-        lines.push(line.to_string());
-        if lines.len() >= 80 {
-            break;
-        }
-    }
-    lines
 }
 
 #[cfg(test)]
@@ -615,20 +695,221 @@ mod tests {
 
     #[test]
     fn acknowledgement_does_not_hide_native_command_errors() {
-        assert!(reject_console_errors(&["Unknown command: dota_missing".to_string()]).is_err());
         assert!(
-            reject_console_errors(&[
-                "CDemoPlayer::StartPlayback: couldn't open demo file 'a'".to_string()
-            ])
+            reject_console_errors(&[], &["Unknown command: dota_missing".to_string()]).is_err()
+        );
+        assert!(
+            reject_console_errors(
+                &[],
+                &["CDemoPlayer::StartPlayback: couldn't open demo file 'a'".to_string()]
+            )
             .is_err()
         );
         assert!(
-            reject_console_errors(&[
-                "Currently playing 100 of 3000 ticks. Minutes:0.05 File:replays/d2h_safe"
-                    .to_string()
-            ])
+            reject_console_errors(
+                &[],
+                &[
+                    "Currently playing 100 of 3000 ticks. Minutes:0.05 File:replays/d2h_safe"
+                        .to_string()
+                ]
+            )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn status_query_usage_is_allowed_without_ignoring_real_failures() {
+        let usage = vec!["Syntax: demo_goto <tick> [relative] [pause]".to_string()];
+        assert!(reject_console_errors(&[DEMO_STATUS_COMMAND.to_string()], &usage).is_ok());
+        for commands in [
+            vec!["demo_goto 500 absolute pause".to_string()],
+            vec!["demo_info".to_string()],
+            vec!["demo_goto".to_string(), "demo_pause".to_string()],
+        ] {
+            assert!(reject_console_errors(&commands, &usage).is_err());
+        }
+        for line in [
+            "Error - Not currently playing back a demo.",
+            "Unknown command: demo_goto",
+            "Syntax: unexpected query",
+        ] {
+            assert!(
+                reject_console_errors(&[DEMO_STATUS_COMMAND.to_string()], &[line.to_string()])
+                    .is_err()
+            );
+        }
+    }
+
+    fn console_packet(kind: &[u8; 4], text: &str) -> Vec<u8> {
+        let length = VCONSOLE_PRINT_TEXT_OFFSET + text.len() + 1;
+        let mut packet = Vec::new();
+        packet.extend_from_slice(kind);
+        packet.extend_from_slice(&VCONSOLE_COMMAND_VERSION.to_be_bytes());
+        packet.extend_from_slice(&(length as u32).to_be_bytes());
+        packet.extend_from_slice(&0_u16.to_be_bytes());
+        packet.extend_from_slice(&[b'M'; 28]);
+        packet.extend_from_slice(text.as_bytes());
+        packet.push(0);
+        packet
+    }
+
+    #[test]
+    fn print_decoder_reassembles_fragments_and_excludes_binary_metadata() {
+        let text = "  Currently playing 9000 of 30000 ticks. Minutes:5.00 File:replays/fixture";
+        let packet = console_packet(b"PRNT", text);
+        for split in 0..=packet.len() {
+            let mut decoder = ConsoleDecoder::default();
+            let mut messages = decoder.push(&packet[..split]).unwrap();
+            messages.extend(decoder.push(&packet[split..]).unwrap());
+            assert_eq!(messages, vec![text], "split {split}");
+            assert!(decoder.pending.is_empty());
+        }
+        let mut wire = console_packet(b"CVAR", text);
+        wire.extend(console_packet(b"PRNT", "中文反馈\n第二行"));
+        wire.extend(console_packet(b"PRNT", "Camera look-at position: 1 2 3"));
+        assert_eq!(
+            ConsoleDecoder::default().push(&wire).unwrap(),
+            vec!["中文反馈\n第二行", "Camera look-at position: 1 2 3",]
+        );
+    }
+
+    fn large_initialization_frame() -> Vec<u8> {
+        // Independent wire fixture: version is 16-bit, total length is 32-bit.
+        // A 131084-byte CVRB frame has a low length word of just 12. Reading
+        // only that word incorrectly treats its body as the next packet.
+        let mut frame = vec![b'C', b'V', b'R', b'B', 0, 0xd4, 0, 2, 0, 12, 0, 0];
+        frame.resize(131_084, 0);
+        let false_ack = console_packet(b"PRNT", "PROBE_FIXTURE");
+        frame[12..12 + false_ack.len()].copy_from_slice(&false_ack);
+        frame
+    }
+
+    #[test]
+    fn large_initialization_packet_keeps_following_print_packets_aligned() {
+        let mut wire = large_initialization_frame();
+        let mut decoder = ConsoleDecoder::default();
+        // Embedded PRNT bytes are compressed/opaque blob data, never an ACK.
+        assert!(decoder.push(&wire[..65_536]).unwrap().is_empty());
+        assert!(decoder.push(&wire[65_536..]).unwrap().is_empty());
+        assert!(decoder.pending.is_empty());
+        wire.extend(console_packet(b"PRNT", "PROBE_FIXTURE"));
+        let mut decoder = ConsoleDecoder::default();
+        let mut messages = Vec::new();
+        for fragment in wire.chunks(4093) {
+            messages.extend(decoder.push(fragment).unwrap());
+        }
+        assert_eq!(messages, vec!["PROBE_FIXTURE"]);
+        assert!(decoder.pending.is_empty());
+    }
+
+    #[test]
+    fn probe_marker_survives_large_initialization_over_tcp() {
+        let mut wire = large_initialization_frame();
+        wire.extend(console_packet(b"PRNT", "PROBE_FIXTURE"));
+        let (mut socket, server) = console_fixture(wire);
+        socket
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let result = wait_for_marker(
+            &mut socket,
+            "PROBE_FIXTURE",
+            None,
+            Duration::from_secs(5),
+            Instant::now(),
+            &mut ConsoleDecoder::default(),
+        );
+        // Do not close the client while the fixture server is still writing.
+        server.join().unwrap();
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
+    fn malformed_print_packets_never_become_feedback() {
+        let mut short = console_packet(b"PRNT", "ignored");
+        short[6..10].copy_from_slice(&11_u32.to_be_bytes());
+        assert!(ConsoleDecoder::default().push(&short).is_err());
+        short[6..10].copy_from_slice(&40_u32.to_be_bytes());
+        assert!(ConsoleDecoder::default().push(&short).is_err());
+        short[6..10].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(ConsoleDecoder::default().push(&short[..12]).is_err());
+        let mut unterminated = console_packet(b"PRNT", "ignored");
+        *unterminated.last_mut().unwrap() = b'x';
+        assert!(ConsoleDecoder::default().push(&unterminated).is_err());
+        let truncated = console_packet(b"PRNT", "Currently playing 9000 of 30000 ticks.");
+        assert!(
+            ConsoleDecoder::default()
+                .push(&truncated[..truncated.len() - 1])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    fn console_fixture(wire: Vec<u8>) -> (TcpStream, std::thread::JoinHandle<()>) {
+        // A private ephemeral test socket: never the game's fixed control port.
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            for fragment in wire.chunks(3) {
+                socket.write_all(fragment).unwrap();
+            }
+        });
+        (TcpStream::connect(address).unwrap(), server)
+    }
+
+    #[test]
+    fn response_window_excludes_stale_ticks_and_waits_for_print_ack() {
+        let mut wire = console_packet(b"PRNT", "Currently playing 100 of 30000 ticks.");
+        wire.extend(console_packet(b"CVAR", "ACK_FIXTURE"));
+        wire.extend(console_packet(b"PRNT", "BEGIN_FIXTURE"));
+        wire.extend(console_packet(
+            b"PRNT",
+            "Syntax: demo_goto <tick> [relative] [pause]",
+        ));
+        wire.extend(console_packet(
+            b"PRNT",
+            "Currently playing 9000 of 30000 ticks.",
+        ));
+        wire.extend(console_packet(b"PRNT", "ACK_FIXTURE"));
+        let (mut socket, server) = console_fixture(wire);
+        let result = wait_for_marker(
+            &mut socket,
+            "ACK_FIXTURE",
+            Some("BEGIN_FIXTURE"),
+            Duration::from_secs(1),
+            Instant::now(),
+            &mut ConsoleDecoder::default(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            result.console_lines,
+            vec![
+                "Syntax: demo_goto <tick> [relative] [pause]",
+                "Currently playing 9000 of 30000 ticks.",
+            ]
+        );
+    }
+
+    #[test]
+    fn acknowledgement_in_non_print_data_or_echo_text_is_not_success() {
+        let mut wire = console_packet(b"PRNT", "BEGIN_FIXTURE");
+        wire.extend(console_packet(b"CVAR", "ACK_FIXTURE"));
+        wire.extend(console_packet(b"PRNT", "echo ACK_FIXTURE"));
+        let (mut socket, server) = console_fixture(wire);
+        let result = wait_for_marker(
+            &mut socket,
+            "ACK_FIXTURE",
+            Some("BEGIN_FIXTURE"),
+            Duration::from_secs(1),
+            Instant::now(),
+            &mut ConsoleDecoder::default(),
+        );
+        server.join().unwrap();
+        assert!(matches!(result, Err(ReplayControlError::MarkerTimeout)));
     }
 
     #[test]

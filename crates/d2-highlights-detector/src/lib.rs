@@ -7,7 +7,7 @@ use d2_highlights_core::{
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const DETECTOR_NAME: &str = "rules-v2";
-pub const DETECTOR_VERSION: &str = "0.6.0";
+pub const DETECTOR_VERSION: &str = "0.6.1";
 const CLUSTER_GAP_SECONDS: f32 = 18.0;
 const SETUP_SECONDS: f32 = 12.0;
 const RESULT_SECONDS: f32 = 8.0;
@@ -16,7 +16,8 @@ const HERO_KILL_SEQUENCE_MAX_SECONDS: f32 = 75.0;
 const HERO_KILL_SETUP_LOOKBACK_SECONDS: f32 = 20.0;
 const HERO_KILL_DAMAGE_LOOKBACK_SECONDS: f32 = 8.0;
 const HERO_KILL_ABILITY_LEAD_SECONDS: f32 = 2.5;
-const HERO_KILL_VISUAL_LEAD_SECONDS: f32 = 1.0;
+const HERO_KILL_VISUAL_LEAD_SECONDS: f32 = 6.0;
+const HERO_KILL_MIN_PRE_DEATH_SECONDS: f32 = 12.0;
 const HERO_KILL_RESULT_SECONDS: f32 = 3.0;
 const TREE_COUNTER_WINDOW_SECONDS: f32 = 4.25;
 const TREE_COUNTER_SETUP_SECONDS: f32 = 4.0;
@@ -459,7 +460,12 @@ fn hero_kill_sequence_candidates(timeline: &TimelineDocument) -> Vec<HighlightCa
                 kind: "hero_kill_sequence".to_string(),
                 title: format!("{hero} kill sequence ({kill_count})"),
                 score: 72.0 + kill_count as f32 * 28.0 + skill_setups as f32 * 4.0,
-                start_seconds: (first_setup_time - HERO_KILL_VISUAL_LEAD_SECONDS).max(0.0),
+                start_seconds: (first_setup_time - HERO_KILL_VISUAL_LEAD_SECONDS)
+                    .min(
+                        sequence[0].death.time_seconds.unwrap_or(first_setup_time)
+                            - HERO_KILL_MIN_PRE_DEATH_SECONDS,
+                    )
+                    .max(0.0),
                 peak_seconds: last_death_time,
                 end_seconds: (last_death_time + HERO_KILL_RESULT_SECONDS)
                     .min(timeline.replay.playback_time_seconds),
@@ -494,6 +500,38 @@ fn find_kill_setup_event<'a>(
     roster: &BTreeSet<&str>,
 ) -> &'a CombatEvent {
     let death_time = death.time_seconds.unwrap_or_default();
+    // A Starstorm finishing blow must not discard the arrow that set up this kill.
+    // Require actual arrow damage to this victim before associating the cast.
+    if killer == "npc_dota_hero_mirana"
+        && let Some(hit) = timeline
+            .events
+            .iter()
+            .filter(|event| {
+                event.event_type == "DotaCombatlogDamage"
+                    && event.attributed_hero(|hero| roster.contains(hero)) == Some(killer)
+                    && event.target == death.target
+                    && event.inflictor.as_deref() == Some("mirana_arrow")
+                    && event.time_seconds.is_some_and(|time| {
+                        time <= death_time && death_time - time <= HERO_KILL_DAMAGE_LOOKBACK_SECONDS
+                    })
+            })
+            .min_by(|left, right| left.tick.cmp(&right.tick))
+        && let Some(cast) = timeline
+            .events
+            .iter()
+            .filter(|event| {
+                event.event_type == "DotaCombatlogAbility"
+                    && event.attributed_hero(|hero| roster.contains(hero)) == Some(killer)
+                    && event.inflictor.as_deref() == Some("mirana_arrow")
+                    && event.time_seconds.is_some_and(|time| {
+                        time <= hit.time_seconds.unwrap_or(death_time)
+                            && hit.time_seconds.unwrap_or(death_time) - time <= 5.0
+                    })
+            })
+            .max_by_key(|event| event.tick)
+    {
+        return cast;
+    }
     if let Some(inflictor) = non_empty(death.inflictor.as_deref())
         && let Some(ability) = timeline.events.iter().rev().find(|event| {
             event.event_type == "DotaCombatlogAbility"
@@ -1185,7 +1223,7 @@ mod tests {
             Some("npc_dota_hero_mirana")
         );
         assert_eq!(sequences[0].hero_deaths, 2);
-        assert_eq!(sequences[0].start_seconds, 99.0);
+        assert_eq!(sequences[0].start_seconds, 92.0);
         assert_eq!(sequences[0].peak_seconds, 114.0);
         assert_eq!(sequences[0].end_seconds, 117.0);
         let evidence = sequences[0]
@@ -1201,6 +1239,68 @@ mod tests {
         );
         assert_eq!(
             evidence.kills[1].setup_action.as_deref(),
+            Some("mirana_starfall")
+        );
+    }
+
+    #[test]
+    fn mirana_arrow_setup_precedes_a_starstorm_finishing_blow() {
+        let victim = "npc_dota_hero_juggernaut";
+        let mut hit = hero_kill_event(98.0, victim, Some("mirana_arrow"));
+        hit.event_type = "DotaCombatlogDamage".into();
+        let mut arrow = hit.clone();
+        arrow.event_type = "DotaCombatlogAbility".into();
+        arrow.time_seconds = Some(96.0);
+        arrow.tick = 2880;
+        arrow.target = None;
+        let mut finish = arrow.clone();
+        finish.time_seconds = Some(99.5);
+        finish.tick = 2985;
+        finish.inflictor = Some("mirana_starfall".into());
+        let death = hero_kill_event(100.0, victim, Some("mirana_starfall"));
+        let mut replay = timeline(vec![arrow, hit, finish, death]);
+        replay.replay.players = vec![ReplayPlayer {
+            slot: 0,
+            hero_name: "npc_dota_hero_mirana".into(),
+            player_name: None,
+            game_team: Some(2),
+            is_fake_client: false,
+        }];
+        let candidates = hero_kill_sequence_candidates(&replay);
+        let candidate = &candidates[0];
+        assert_eq!(
+            candidate.kill_sequence.as_ref().unwrap().kills[0].setup_time_seconds,
+            96.0
+        );
+        assert_eq!(candidate.start_seconds, 88.0);
+        assert_eq!(candidate.end_seconds, 103.0);
+    }
+
+    #[test]
+    fn arrow_damage_to_another_hero_is_not_a_kill_setup() {
+        let victim = "npc_dota_hero_juggernaut";
+        let mut arrow = hero_kill_event(96.0, victim, Some("mirana_arrow"));
+        arrow.event_type = "DotaCombatlogAbility".into();
+        arrow.target = None;
+        let mut other_hit = hero_kill_event(98.0, "npc_dota_hero_axe", Some("mirana_arrow"));
+        other_hit.event_type = "DotaCombatlogDamage".into();
+        let mut finish = hero_kill_event(99.5, victim, Some("mirana_starfall"));
+        finish.event_type = "DotaCombatlogAbility".into();
+        finish.target = None;
+        let death = hero_kill_event(100.0, victim, Some("mirana_starfall"));
+        let mut replay = timeline(vec![arrow, other_hit, finish, death]);
+        replay.replay.players = vec![ReplayPlayer {
+            slot: 0,
+            hero_name: "npc_dota_hero_mirana".into(),
+            player_name: None,
+            game_team: Some(2),
+            is_fake_client: false,
+        }];
+        let candidates = hero_kill_sequence_candidates(&replay);
+        assert_eq!(
+            candidates[0].kill_sequence.as_ref().unwrap().kills[0]
+                .setup_action
+                .as_deref(),
             Some("mirana_starfall")
         );
     }

@@ -87,6 +87,7 @@ fn real_dem_exports_synchronized_camera_assets_and_closes_dota() {
                 anchor_tick: candidate.anchor_tick,
             },
         ],
+        resume_fingerprint: None,
         settings: RenderSettings {
             camera_style: CameraStyle::AutoDirector,
             clean_hud: !ordinary_feed_requested(),

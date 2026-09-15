@@ -1,4 +1,5 @@
 import { getVersion } from "@tauri-apps/api/app";
+import { CacheCleanupPanel } from "./CacheCleanupPanel";
 import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { DraftWriter, EditorOperationGate } from "./editorSession";
@@ -72,6 +73,7 @@ import {
 } from "./eventTimeline";
 import type { TimelineScope } from "./eventTimeline";
 import { heroLabel } from "./heroes";
+import { extendKillSetupClips } from "./extendKillSetup";
 import {
   DEFAULT_HIGHLIGHT_RULE_IDS,
   HERO_KILL_RULE_ID,
@@ -110,6 +112,7 @@ import type {
   ReplayPlayer,
   RenderProgress,
   RenderResult,
+  RenderResumeSummary,
   RenderSettings,
   SaveEditPlanResult,
   StageStatus,
@@ -117,6 +120,8 @@ import type {
   StoryTakeRole,
 } from "./types";
 import { preferredAnalysisExportDirectory } from "./analysisExportDirectory";
+import { presentRenderError } from "./renderError";
+import { resumeAction } from "./renderResume";
 
 type View = "workbench" | "library";
 type TitlebarPanel = "notifications" | "settings" | null;
@@ -175,7 +180,7 @@ const developmentFixtureEnabled =
   new URLSearchParams(window.location.search).get("fixture") === "mirana";
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
 const analysisExportDirectoryStorageKey = "cat-cut-analysis-export-directory";
-const fallbackAppVersion = "1.9.10";
+const fallbackAppVersion = "2.0.0";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,
@@ -263,6 +268,9 @@ function App() {
   );
   const [renderResult, setRenderResult] = useState<RenderResult | null>(null);
   const [renderError, setRenderError] = useState("");
+  const [renderResume, setRenderResume] = useState<RenderResumeSummary | null>(null);
+  const [checkingResume, setCheckingResume] = useState(false);
+  const [resumeCheckError, setResumeCheckError] = useState("");
   const [completionNoticeEnabled, setCompletionNoticeEnabled] = useState(
     () => localStorage.getItem("cat-cut-completion-notice") !== "disabled",
   );
@@ -284,7 +292,7 @@ function App() {
   const activeJobRef = useRef<string | null>(null);
   activeJobRef.current = result?.job_id ?? null;
   const updating = appUpdate.phase === "downloading" || appUpdate.phase === "installing";
-  const interactionBlocked = busy || rendering || updating || closing || exportingAnalysis;
+  const interactionBlocked = busy || rendering || checkingResume || updating || closing || exportingAnalysis;
   const draftWriter = useRef(new DraftWriter<EditPlanWorkspaceRequest, SaveEditPlanResult>(
     (request) => invoke<SaveEditPlanResult>("save_edit_plan", { request }),
   ));
@@ -349,7 +357,33 @@ function App() {
     void import("./devFixture").then(({ miranaDevelopmentSummary }) => {
       if (!disposed) {
         void restoreAnalysisWorkspace(miranaDevelopmentSummary, null).then(() => {
-          if (!disposed) setSelectedPath(miranaDevelopmentSummary.source.path);
+          if (!disposed) {
+            setSelectedPath(miranaDevelopmentSummary.source.path);
+            const resumeFixture = new URLSearchParams(window.location.search).get("resume");
+            if (resumeFixture === "interrupted" || resumeFixture === "compose") {
+              setClipEdits((existing) => Array.from({ length: 25 }, (_, index) => ({
+                ...existing[0]!, clipId: `fixture-resume-${index}`, takeGroupId: null,
+              })));
+              const complete = resumeFixture === "compose";
+              setRenderResume({ fingerprint: "development-fixture", totalClips: 25,
+                completedClips: complete ? 25 : 22, remainingClips: complete ? 0 : 3,
+                firstPendingClip: complete ? null : 23, unverifiedCameraClips: complete ? 25 : 22,
+                completedDirectory: "fixture/segments" });
+              setCapabilities({ ...emptyCapabilities, renderReady: true });
+              setRenderError("Dota 2 回放控制失败：VConsole I/O error: 远程主机强迫关闭了一个现有的连接。 (os error 10054)");
+              setMovieSetupOpen(true);
+            }
+            if (new URLSearchParams(window.location.search).get("exportProgress") === "native") {
+              setRenderProgress({ stage: "capture", status: "running",
+                message: "第 1/25 段 · 已保存 7.5/16.0 秒 · 60 FPS",
+                percent: 12, currentClip: 1, totalClips: 25 });
+              setMovieSetupOpen(true);
+            }
+            if (new URLSearchParams(window.location.search).get("exportError") === "seek") {
+              setRenderError("Dota 2 回放控制失败：回放跳转未确认：未能读取录像当前播放位置，本次导出已停止。\n目标位置：9000 tick；最近收到的位置：未收到。\n请保留本次控制日志以便排查。");
+              setMovieSetupOpen(true);
+            }
+          }
         });
       }
     });
@@ -537,6 +571,8 @@ function App() {
     setRenderProgress(null);
     setRenderResult(latest);
     setRenderError("");
+    setRenderResume(null);
+    setResumeCheckError("");
     return !conflict;
   }
 
@@ -911,6 +947,15 @@ function App() {
     setPlanFeedback("");
   }
 
+  function extendCurrentKillSetups() {
+    if (!planReady || operationGate.current.blocked || !result) return;
+    const extended = extendKillSetupClips(clipEdits, result.highlights.candidates);
+    setClipEdits(extended.clips);
+    setPlanFeedback(extended.changedScenes
+      ? `已为 ${extended.changedScenes} 个场次补足击杀前铺垫，保留当前片段选择和出点。`
+      : "当前片段已保留足够铺垫，剧情时长和自定义片段保持原样。");
+  }
+
   function applyHeroHighlightSelection(
     hero: string,
     ruleIds: readonly HighlightRuleId[],
@@ -1215,7 +1260,41 @@ function App() {
     }
   }
 
-  async function startMovieRender() {
+  async function refreshRenderResume(jobId: string, current: () => boolean) {
+    setCheckingResume(true);
+    setRenderResume(null);
+    setResumeCheckError("");
+    try {
+      const summary = await invoke<RenderResumeSummary>("get_render_resume", { jobId });
+      if (current()) setRenderResume(summary);
+    } catch (reason: unknown) {
+      if (current()) setResumeCheckError(`已保存片段检查未完成：${toErrorMessage(reason)}`);
+    } finally {
+      setCheckingResume(false);
+    }
+  }
+
+  async function openMovieSetup() {
+    if (!result || !planReady || interactionBlocked) return;
+    const token = operationGate.current.begin("render");
+    if (!token) return;
+    const jobId = result.job_id;
+    const current = () => operationGate.current.current(token) && activeJobRef.current === jobId;
+    setMovieSetupOpen(true);
+    setRenderResume(null);
+    setResumeCheckError("");
+    setCheckingResume(true);
+    try {
+      if (isTauriRuntime && await saveEditPlan(false) && current()) {
+        await refreshRenderResume(jobId, current);
+      }
+    } finally {
+      setCheckingResume(false);
+      operationGate.current.finish(token);
+    }
+  }
+
+  async function startMovieRender(resumeFingerprint: string | null = null) {
     if (!result || !planReady) return;
     if (!capabilities.renderReady) {
       setRenderError(capabilities.renderReason ?? "当前成片环境不完整，请检查 Dota 2 和媒体工具。");
@@ -1249,10 +1328,11 @@ function App() {
         setRenderProgress(message);
         if (message.status === "failed") setRenderError(message.message);
       };
-      const completed = await invoke<RenderResult>("start_render", { jobId, onProgress: channel });
+      const completed = await invoke<RenderResult>("start_render", { jobId, onProgress: channel, resumeFingerprint });
       if (!current()) return;
       setRenderResult(completed);
-      setRenderProgress({ stage: "complete", status: "complete", message: "成片已完成，Dota 2 已关闭",
+      setRenderResume(null);
+      setRenderProgress({ stage: "complete", status: "complete", message: "成片已完成",
         percent: 100, currentClip: completed.segmentCount, totalClips: completed.segmentCount });
       setNotice({ kind: "success", title: "高光成片已完成",
         message: `${formatDuration(completed.durationSeconds)} · ${completed.width}x${completed.height}` });
@@ -1262,6 +1342,7 @@ function App() {
         setRenderError(message);
         setRenderProgress(null);
         setNotice({ kind: "error", title: "成片任务没有完成", message });
+        await refreshRenderResume(jobId, current);
       }
     } finally {
       operationGate.current.finish(token);
@@ -1438,7 +1519,7 @@ function App() {
           onImport={openImportDialog}
           onAnalyze={confirmReanalysis}
           onExportAnalysis={() => void exportAnalysisPackage()}
-          onOpenMovieSetup={() => { if (!interactionBlocked) setMovieSetupOpen(true); }}
+          onOpenMovieSetup={() => void openMovieSetup()}
         />
 
         {view === "library" ? (
@@ -1475,6 +1556,7 @@ function App() {
             onApplyStory={applyStoryPlan}
             onUpdateRenderSettings={updateRenderSettings}
             onAddClip={addClip}
+            onExtendKillSetups={extendCurrentKillSetups}
             onActivateTimelineCandidate={activateTimelineCandidate}
             onDuplicateClip={duplicateClip}
             onDeleteClip={deleteClip}
@@ -1540,13 +1622,17 @@ function App() {
           renderProgress={renderProgress}
           renderResult={renderResult}
           renderError={renderError}
+          resume={renderResume}
+          checkingResume={checkingResume}
+          resumeCheckError={resumeCheckError}
           feedback={planFeedback}
           onClose={() => {
-            if (!rendering) {
+            if (!rendering && !checkingResume && !savingPlan) {
               setMovieSetupOpen(false);
             }
           }}
           onStart={() => void startMovieRender()}
+          onResume={() => { if (resumeAction(renderResume)) void startMovieRender(renderResume!.fingerprint); }}
           onCancel={() => void cancelMovieRender()}
           onOpenPath={(path) => void openRenderPath(path)}
         />
@@ -2513,6 +2599,7 @@ interface ResultsViewProps {
   onApplyStory: (storyId: string) => void;
   onUpdateRenderSettings: (patch: Partial<RenderSettings>) => void;
   onAddClip: () => void;
+  onExtendKillSetups: () => void;
   onActivateTimelineCandidate: (candidateId: string) => void;
   onDuplicateClip: (clipId: string) => void;
   onDeleteClip: (clipId: string) => void;
@@ -2537,6 +2624,7 @@ function ResultsView({
   onApplyStory,
   onUpdateRenderSettings,
   onAddClip,
+  onExtendKillSetups,
   onActivateTimelineCandidate,
   onDuplicateClip,
   onDeleteClip,
@@ -2750,6 +2838,11 @@ function ResultsView({
             </span>
             <h2>片段清单</h2>
           </div>
+          <button className="add-clip-button" onClick={onExtendKillSetups}
+            title="将当前短击杀至少延长到首杀前 12 秒，并保留起手前 6 秒；不会重新添加已删除片段">
+            <SkipBack />
+            <span>补足击杀铺垫</span>
+          </button>
           <button className="add-clip-button" onClick={onAddClip}>
             <Plus />
             <span>新增片段</span>
@@ -4178,9 +4271,13 @@ function MovieSetupDialog({
   renderProgress,
   renderResult,
   renderError,
+  resume,
+  checkingResume,
+  resumeCheckError,
   feedback,
   onClose,
   onStart,
+  onResume,
   onCancel,
   onOpenPath,
 }: {
@@ -4194,9 +4291,13 @@ function MovieSetupDialog({
   renderProgress: RenderProgress | null;
   renderResult: RenderResult | null;
   renderError: string;
+  resume: RenderResumeSummary | null;
+  checkingResume: boolean;
+  resumeCheckError: string;
   feedback: string;
   onClose: () => void;
   onStart: () => void;
+  onResume: () => void;
   onCancel: () => void;
   onOpenPath: (path: string) => void;
 }) {
@@ -4223,7 +4324,11 @@ function MovieSetupDialog({
     !isValidClipTimeRange(clip.sourceStartSeconds, clip.sourceEndSeconds, result.replay.playback_time_seconds),
   );
 
-  const active = saving || rendering;
+  const [cleaningCache, setCleaningCache] = useState(false);
+  const active = saving || rendering || checkingResume || cleaningCache;
+  const resumeView = resumeAction(resume);
+  const hasResumePanel = (!rendering || checkingResume) && (checkingResume || !!resumeView || !!resumeCheckError);
+  const errorPresentation = renderError ? presentRenderError(renderError) : null;
   const previewSource =
     renderResult && isTauriRuntime
       ? convertFileSrc(renderResult.outputPath)
@@ -4253,7 +4358,7 @@ function MovieSetupDialog({
       }}
     >
       <section
-        className={`movie-dialog ${renderResult ? "with-preview" : ""}`}
+        className={`movie-dialog ${renderResult ? "with-preview" : ""} ${hasResumePanel ? "with-resume" : ""}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby="movie-dialog-title"
@@ -4277,21 +4382,28 @@ function MovieSetupDialog({
           </button>
         </header>
 
+        <div className="movie-dialog-body">
         <div
           className={`render-readiness ${
-            capabilities.renderReady ? "ready" : "waiting"
+            renderError ? "failed" : capabilities.renderReady ? "ready" : "waiting"
           }`}
         >
-          {capabilities.renderReady ? <CheckCircle2 /> : <CircleAlert />}
+          {capabilities.renderReady && !renderError ? <CheckCircle2 /> : <CircleAlert />}
           <span>
             <strong>
-              {capabilities.renderReady
+              {renderError
+                ? "本次导出未完成"
+                : capabilities.renderReady
                 ? "本地成片环境已就绪"
                 : "当前机器缺少成片环境"}
             </strong>
             <small>
-              {capabilities.renderReady
-                ? "开始后会自动启动离线 Dota 2，完成或取消后自动关闭。"
+              {renderError
+                ? "请查看下方错误说明，处理后可重新导出。"
+                : capabilities.renderReady
+                ? resumeView && resume?.remainingClips === 0
+                  ? "所有片段已保存，可直接继续合成。"
+                  : "开始录制后会自动启动离线 Dota 2，完成或取消后自动关闭。"
                 : capabilities.renderReason}
             </small>
           </span>
@@ -4338,6 +4450,27 @@ function MovieSetupDialog({
           <span>重复导出自动编号</span>
         </div>
 
+        {(!rendering || checkingResume) && (
+          checkingResume ? <div className="render-resume-panel" role="status">
+            <LoaderCircle className="spin" /><span>正在检查已保存片段，请稍候…</span>
+          </div> : resumeView ? <div className="render-resume-panel" role="status">
+            <CheckCircle2 />
+            <div>
+              <strong>{resumeView.title}</strong>
+              <p>{resumeView.description}</p>
+              {resume!.unverifiedCameraClips > 0 && <p>
+                已保存文件检查通过；软件未自动识别目标英雄。请查看镜头，确认正确后点击继续。
+              </p>}
+              {resume?.completedDirectory && <button className="secondary-button"
+                onClick={() => onOpenPath(resume.completedDirectory!)}>
+                <FolderOpen />打开已保存片段
+              </button>}
+            </div>
+          </div> : resumeCheckError ? <div className="dialog-feedback error" role="alert">
+            <CircleAlert /><span>{resumeCheckError}</span>
+          </div> : null
+        )}
+
         {renderResult ? (
           <div className="render-complete-panel">
             <div className="render-complete-summary">
@@ -4364,6 +4497,10 @@ function MovieSetupDialog({
                 playsInline
               />
             )}
+            <CacheCleanupPanel key={renderResult.qcReportPath} jobId={result.job_id}
+              reportPath={renderResult.qcReportPath}
+              disabled={saving || rendering || checkingResume || !isTauriRuntime}
+              onBusyChange={setCleaningCache} />
             {renderResult.warnings.length > 0 && (
               <div className="render-warning-list">
                 {renderResult.warnings.map((warning) => (
@@ -4393,7 +4530,7 @@ function MovieSetupDialog({
             </div>
             <div className="render-safety-note">
               <ShieldCheck />
-              <span>请不要操作 Dota 2；任务结束后客户端会自动关闭。</span>
+              <span>正在逐帧保存原生画面；游戏窗口可能慢于实时播放，成片为 60 FPS。请不要操作 Dota 2，结束后客户端会自动关闭。</span>
             </div>
           </div>
         ) : (
@@ -4444,10 +4581,19 @@ function MovieSetupDialog({
             </span>
           </div>
         )}
-        {renderError && (
-          <div className="dialog-feedback error">
+        {errorPresentation && (
+          <div className="dialog-feedback error export-error" role="alert">
             <CircleAlert />
-            <span>{renderError}</span>
+            <div className="export-error-content">
+              <strong>{errorPresentation.title}</strong>
+              <p>{errorPresentation.message}</p>
+              {errorPresentation.details && (
+                <details>
+                  <summary>技术详情</summary>
+                  <pre>{errorPresentation.details}</pre>
+                </details>
+              )}
+            </div>
           </div>
         )}
         {feedback && !renderError && (
@@ -4457,10 +4603,11 @@ function MovieSetupDialog({
           </div>
         )}
 
+        </div>
         <footer className="movie-dialog-footer">
           {renderResult ? (
             <>
-              <button className="secondary-button" onClick={onClose}>
+              <button className="secondary-button" onClick={onClose} disabled={active}>
                 关闭
               </button>
               <button
@@ -4490,10 +4637,14 @@ function MovieSetupDialog({
                 <Play />
                 <span>外部播放</span>
               </button>
+              {resumeView && <button className="primary-button" onClick={onResume}
+                disabled={active || !capabilities.renderReady || finalClipCount === 0 || hasInvalidClip}>
+                <Play /><span>{resumeView.button}</span>
+              </button>}
               <button
-                className="primary-button"
+                className={resumeView ? "secondary-button" : "primary-button"}
                 disabled={
-                  saving ||
+                  active ||
                   !capabilities.renderReady ||
                   finalClipCount === 0 ||
                   hasInvalidClip
@@ -4501,7 +4652,7 @@ function MovieSetupDialog({
                 onClick={onStart}
               >
                 <RefreshCw />
-                <span>按当前方案重新生成</span>
+                <span>{resumeView ? "重新录制全部" : "按当前方案重新生成"}</span>
               </button>
             </>
           ) : rendering ? (
@@ -4511,13 +4662,17 @@ function MovieSetupDialog({
             </button>
           ) : (
             <>
-              <button className="secondary-button" onClick={onClose}>
+              <button className="secondary-button" onClick={onClose} disabled={active}>
                 关闭
               </button>
+              {resumeView && <button className="primary-button" onClick={onResume}
+                disabled={active || !capabilities.renderReady || finalClipCount === 0 || hasInvalidClip}>
+                <Play /><span>{resumeView.button}</span>
+              </button>}
               <button
-                className="primary-button"
+                className={resumeView ? "secondary-button" : "primary-button"}
                 disabled={
-                  saving ||
+                  active ||
                   !capabilities.renderReady ||
                   finalClipCount === 0 ||
                   hasInvalidClip
@@ -4530,7 +4685,7 @@ function MovieSetupDialog({
                 }
               >
                 {saving ? <LoaderCircle className="spin" /> : <Film />}
-                <span>{saving ? "正在保存方案" : "开始导出视频"}</span>
+                <span>{checkingResume ? "正在检查已保存片段" : saving ? "正在保存方案" : resumeView ? "重新录制全部" : "开始导出视频"}</span>
               </button>
             </>
           )}
