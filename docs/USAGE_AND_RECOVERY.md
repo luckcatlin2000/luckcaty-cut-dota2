@@ -12,7 +12,7 @@
 
 ## 精确剪辑
 
-1. 普通用户安装 GitHub Releases 提供的 `luckcaty-cut-dota2_1.9.10_x64-setup.exe`；开发者可运行 `scripts\desktop-dev.ps1`。
+1. 普通用户安装 GitHub Releases 提供的 `luckcaty-cut-dota2_2.0.0_x64-setup.exe`；开发者可运行 `scripts\desktop-dev.ps1`。
 2. 点击“载入录像”，在“录像目录”中输入或选择任意本地目录，再输入录像编号；也可直接选择或拖入 `.dem`。
 3. 分析完成后确认整局 10 人阵容。
 4. 如果左下角显示 Dota 2“未找到”，打开右上角“设置”，在“Dota 2 程序路径”中粘贴完整路径或浏览选择 `dota2.exe`，再点击“应用路径”。该设置只保存在当前电脑；“恢复自动检测”会清除用户指定值并重新扫描常见 Steam 目录。

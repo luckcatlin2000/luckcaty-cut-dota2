@@ -4,7 +4,7 @@
 
 官方仓库：<https://github.com/luckcatlin2000/luckcaty-cut-dota2>
 
-当前正式版：`1.9.10`。第一次了解本项目，可以先阅读[软件介绍](软件介绍.md)。
+当前正式版：[2.0（2.0.0）](https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.0.0)。第一次了解本项目，可以先阅读[软件介绍](软件介绍.md)。
 
 ```text
 导入 .dem
