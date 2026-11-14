@@ -54,6 +54,8 @@ R3 已记录 213 项 Rust 通过、9 项外部条件测试 ignored，86 项前�
 
 ## GitHub Release
 
+`desktop-release.ps1` 在创建候选前调用 `verify-installer-scope.ps1`，核对本轮实际生成的 NSIS `File` 指令。仅允许高光主程序、FFmpeg/FFprobe、对应许可证与来源以及必要的 WebView2 运行时输入；额外模块、任务或未知载荷均阻断。默认构建必须保持 `wtf-module` 未启用，独立开发入口不使用 `src/bin` 自动发现路径。`verify.ps1` 运行该门禁的合成回归，不启动安装器。
+
 GitHub Actions 只验证源码，不持有更新签名私钥，也不重建已经验收的安装包。维护者在推送前必须再次确认官方仓库、`main`、标签和以下附件：
 
 - `latest.json`

@@ -51,6 +51,10 @@ try {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $updaterVerifyScript
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+    $installerScopeValidator = Join-Path $PSScriptRoot 'verify-installer-scope.ps1'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installerScopeValidator -SelfTest
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     & cargo fmt --all -- --check
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

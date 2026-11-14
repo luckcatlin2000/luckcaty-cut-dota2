@@ -8,6 +8,11 @@ rust-version.workspace = true
 repository.workspace = true
 license-file.workspace = true
 default-run = "cat-cut-assistant"
+autobins = false
+
+[features]
+default = []
+wtf-module = []
 
 [lib]
 name = "d2_highlights_desktop_lib"
@@ -19,7 +24,8 @@ path = "src/main.rs"
 
 [[bin]]
 name = "maomao-wtf-director"
-path = "src/bin/wtf.rs"
+path = "src/wtf_entry.rs"
+required-features = ["wtf-module"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

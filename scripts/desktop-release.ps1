@@ -108,6 +108,14 @@ finally {
     $SigningPassword = $null
 }
 
+$InstallerScopeScript = Join-Path $PSScriptRoot "verify-installer-scope.ps1"
+$InstallerSource = Join-Path $CargoTargetRoot "release\nsis\x64\installer.nsi"
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $InstallerScopeScript `
+    -InstallerScriptPath $InstallerSource
+if ($LASTEXITCODE -ne 0) {
+    throw "Installer payload scope verification failed. No release candidate was created."
+}
+
 $BuiltExecutable = Join-Path $CargoTargetRoot "release\cat-cut-assistant.exe"
 $ExecutableBytes = [System.IO.File]::ReadAllBytes($BuiltExecutable)
 if ($ExecutableBytes.Length -lt 256 -or
