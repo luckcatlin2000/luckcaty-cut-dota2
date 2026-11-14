@@ -2,7 +2,7 @@
 
 面向 Windows 的本地 Dota 2 DEM 高光剪辑工具：读取录像、选择英雄、调整片段，再导出带游戏原声的 MP4。
 
-官方仓库：[luckcatlin2000/luckcaty-cut-dota2](https://github.com/luckcatlin2000/luckcaty-cut-dota2)。**用户已确认 2.5.0 R3 并批准发布，线上发布尚待完成。** 此次 GitHub 发行范围仅为“高光时刻”。目前已发布的正式版仍为 [2.0.0](https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.0.0)，新安装包及上线状态以 [GitHub Releases](https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases) 为准。正式说明准备稿见 [更新记录的 2.5.0 节](CHANGELOG.md)。
+官方仓库：[luckcatlin2000/luckcaty-cut-dota2](https://github.com/luckcatlin2000/luckcaty-cut-dota2)。**[2.5.0 已正式发布](https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.5.0)，公开下载已核验。** 此次 GitHub 发行范围仅为“高光时刻”。正式说明见 [更新记录的 2.5.0 节](CHANGELOG.md)。
 
 ```text
 本地 DEM → 10 人英雄阵容与击杀事件 → 选择并编辑高光片段
@@ -26,7 +26,7 @@
 | 排查反馈 | 增加“导出排查包”，将错误说明与本局诊断记录保存为一个 ZIP，历史任务也可导出 |
 | 导出界面 | 对齐信息与操作区，放大关键文字，使用醒目的红色诊断入口，保留技术详情与复制排查信息 |
 
-**此次安装包与 R3 候选只提供高光主程序。** WTF、剧情与录像分析的正式提供状态均为未发布，当前按钮统一显示“尚未正式提供”提示，即使本机已有独立程序也不会由这些按钮启动。这是官方发行范围的限制，不表示录像分析不存在，也不删除任何已有程序或数据。
+**此次 2.5.0 安装包只提供高光主程序。** WTF、剧情与录像分析的正式提供状态均为未发布，当前按钮统一显示“尚未正式提供”提示，即使本机已有独立程序也不会由这些按钮启动。这是官方发行范围的限制，不表示录像分析不存在，也不删除任何已有程序或数据。
 
 WTF 剪辑与录像分析是独立模块，高光不恢复“默认剪辑 / WTF 导演”切换。独立 WTF 已有本地开发候选及真实故事、草稿、1.2 同步方案交接实现，作为内部预览保留，不随本次主程序发布，也不由当前导航按钮启动。开发范围与历史验证见 [WTF 模块说明](docs/WTF_MODULE.md)。
 
@@ -48,7 +48,7 @@ WTF 剪辑与录像分析是独立模块，高光不恢复“默认剪辑 / WTF 
 
 ## 下载与使用
 
-Windows 10/11 x64 用户可从 [GitHub Releases](https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/latest) 获取正式安装包。2.5.0 安装包名为 `luckcaty-cut-dota2_2.5.0_x64-setup.exe`；发布前请勿把候选或本地 EXE 当作已上线版本，以 Release 的标签和附件为准。
+Windows 10/11 x64 用户可从 [2.5.0 正式 Release](https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.5.0) 获取安装包 `luckcaty-cut-dota2_2.5.0_x64-setup.exe`。
 
 官方安装版包含配套 FFmpeg/FFprobe，许可证与来源随包提供。独立便携 EXE 不包含媒体工具；请保留配套目录，或自行配置工具路径。Release 会提供 SHA-256 供核对。应用发现新版本时仅提示，下载和安装由用户决定。
 
@@ -80,7 +80,7 @@ ZIP 包含当前排查说明、已有录制日志、早期失败或取消的尝�
 
 R1 的 196 项 Rust/74 项前端、R2 的 210 项 Rust/85 项前端和双 EXE 构建均保留为历史记录。R2 真实只读故事分析及主备导入属于 WTF 内部预览，不是本次公开发行内容，也不作为 R3 发行门禁已通过的依据。原 WTF 候选继续保留。
 
-**R3 未另跑真实 DEM，也未进行新的 UI、鼠标操作、原生保存窗口或游戏视频导出验收。** R2 只读样本仍作为历史保留；原固定超时报错仍需新日志定位。用户已确认 R3 并授权上传；发布完成前不把本地候选标为已上线。
+正式发布前另已通过 NSIS 14 项门禁夹具、实际安装包载荷检查、签名与篡改拒绝、隔离无输入冷启动健康检查（WebView2 与窗口响应），[CI 运行成功](https://github.com/luckcatlin2000/luckcaty-cut-dota2/actions/runs/43560103512)。**R3 未另跑真实 DEM，未进行新的视觉、鼠标、原生保存窗口或游戏视频导出验收。** R2 只读样本仍作为历史保留；原固定超时报错仍需新日志定位。
 
 ## 开发与仓库边界
 

@@ -1,8 +1,8 @@
 # 更新记录
 
-> 2.1.0 至 2.4.0 为本地开发与用户验收记录；2.5.0 R3 已由用户确认并批准发布，线上发布完成前仍为待发布说明，实际状态以 GitHub Release 为准。
+> 2.1.0 至 2.4.0 为本地开发与用户验收记录；[2.5.0 已正式发布](https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.5.0)，公开下载已核验。
 
-## 2.5.0 - 2026-11-14（用户已确认，待发布）
+## 2.5.0 - 2026-11-14（正式发布，仅高光时刻）
 
 - 此次仅提供“高光时刻”。保留本地 DEM 解析、10 人选角、击杀高光、片段编辑、玩家视角/英雄跟随、普通/干净画面、游戏原声、60 FPS 与断点续录。
 - 内置 WTF、剧情、录像分析与解说工作台迁出。三个模块入口统一提示“尚未正式提供”，前后端均有门禁；本机已安装模块也不会绕过。未来正式开放且检测到兼容安装后，用户点击才启动。
@@ -15,7 +15,7 @@
 
 验证：R3 完整检查 213 项 Rust 通过、9 项外部条件测试 ignored，86 项前端测试及前端生产构建、格式与严格 Clippy 通过；单主高光 EXE 生产构建与候选版本、GUI 子系统、哈希和配套工具核对通过，不含模块 EXE 或模块清单。R3 未另跑真实 DEM，也未进行新的 UI、鼠标、原生保存窗口或游戏实测。R1/R2 和 WTF 双 EXE 均仅作历史内部记录，旧候选保留。
 
-用户已确认 R3 并批准发布，线上完成前不将本地候选标为已上线。最终附件 SHA-256 由发布者从本次签名工件补入正式 Release，不沿用旧候选哈希。捆绑 FFmpeg 的许可证与实际构建来源随安装包提供，说明见 [第三方组件](https://github.com/luckcatlin2000/luckcaty-cut-dota2/blob/v2.5.0/docs/THIRD_PARTY.md) 和 [FFmpeg 来源记录](https://github.com/luckcatlin2000/luckcaty-cut-dota2/blob/v2.5.0/tools/ffmpeg/SOURCE.txt)。
+正式发布门禁另通过 NSIS 14 项夹具、实际安装包载荷检查、签名与篡改拒绝及隔离无输入冷启动健康检查（WebView2 与窗口响应，不含视觉或游戏验收）。发布标签绑定 `5830a928cc228ad841a4ba99df60804e15065eaf`，[CI 运行成功](https://github.com/luckcatlin2000/luckcaty-cut-dota2/actions/runs/43560103512)；正式附件及 SHA-256 见 [2.5.0 Release](https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.5.0)。捆绑 FFmpeg 的许可证与实际构建来源随安装包提供，说明见 [第三方组件](https://github.com/luckcatlin2000/luckcaty-cut-dota2/blob/v2.5.0/docs/THIRD_PARTY.md) 和 [FFmpeg 来源记录](https://github.com/luckcatlin2000/luckcaty-cut-dota2/blob/v2.5.0/tools/ffmpeg/SOURCE.txt)。
 
 ## 2026-10-30 本地开发记录：高光独立模块（2.4.0）
 
