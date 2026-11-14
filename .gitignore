@@ -48,3 +48,21 @@ config.local.*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Private local archive and signing material: never publish
+/.local/
+/.release-secrets/
+/视频项目/
+
+# Local design samples and retired UI checks (not part of current verification)
+/design/
+/scripts/verify-commentary-recommendations-ui.cjs
+/scripts/verify-commentary-ui.cjs
+/scripts/verify-export-dialog-layout-ui.cjs
+/scripts/verify-export-errors-ui.cjs
+/scripts/verify-story-module-ui.cjs
+/scripts/verify-story-multi-hero-ui.cjs
+/scripts/verify-story-output-access-ui.cjs
+/scripts/verify-story-time-clips-ui.cjs
+/scripts/verify-timestamp-import-ui.cjs
+/scripts/verify-video-output-ui.cjs

@@ -9,7 +9,7 @@ $DesktopRoot = Join-Path $ProjectRoot "apps\d2-highlights-desktop"
 Push-Location $DesktopRoot
 try {
     if (-not (Test-Path -LiteralPath (Join-Path $DesktopRoot "node_modules"))) {
-        npm ci
+        npm install
     }
 
     if ($Build) {

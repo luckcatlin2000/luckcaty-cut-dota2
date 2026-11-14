@@ -14,16 +14,29 @@ export interface Capabilities {
   dota2Found: boolean;
   renderReason: string | null;
   jobsRoot: string;
-  recommendedAnalysisExportDirectory: string;
   recommendedReplayDirectory: string | null;
   dota2Path: string | null;
   dota2PathSource: "automatic" | "custom" | "missing";
+  videoOutputDirectory?: string | null;
 }
 
 export interface ReplayLookupResult {
   replayDirectory: string;
   replayId: string;
   path: string;
+}
+
+export interface ReplayLibraryFile {
+  name: string;
+  path: string;
+  byteLength: number;
+  downloadedAtUnixMs: number | null;
+  timeBasis: "created" | "modified" | "unknown";
+}
+
+export interface ReplayLibrarySnapshot {
+  directory: string;
+  files: ReplayLibraryFile[];
 }
 
 export interface RecentJob {
@@ -286,6 +299,7 @@ export interface DirectorDocument {
 }
 
 export interface AnalysisSummary {
+  analysis_warnings?: string[];
   job_id: string;
   job_dir: string;
   source: DemSource;
@@ -297,17 +311,10 @@ export interface AnalysisSummary {
   reused_existing_job: boolean;
 }
 
-export interface AnalysisPackageExportResult {
-  packagePath: string;
-  evidencePath: string;
-  reportPath: string;
-  eventCount: number;
-  incidentCount: number;
-}
-
 export type ClipDurationMode = "short" | "story";
 
 export interface EditPlanClip {
+  imported?: ImportedClip | null;
   clipId: string;
   candidateId: string;
   viewHero: string | null;
@@ -321,6 +328,14 @@ export interface EditPlanClip {
   shortSourceEndSeconds: number;
   sourceStartSeconds: number;
   sourceEndSeconds: number;
+}
+
+export interface ImportedClip {
+  title: string;
+  sourceId: string;
+  candidateSourceId?: string | null;
+  anchorTick: number;
+  anchorSeconds: number;
 }
 
 export type EditorPlanMode = "default" | "wtf";
@@ -406,6 +421,12 @@ export interface RenderResult {
   height: number;
   segmentCount: number;
   sourceAssetCount: number;
+  warnings: string[];
+}
+
+export interface RenderDiagnosticArchive {
+  archivePath: string;
+  fileCount: number;
   warnings: string[];
 }
 

@@ -241,6 +241,64 @@ svg {
   overflow-y: auto;
 }
 
+.video-output-location {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fffdfd;
+}
+
+.movie-dialog .video-output-location {
+  margin: 12px 14px 0;
+}
+
+.video-output-title {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.video-output-path {
+  min-width: 0;
+  margin: 0;
+  color: #574952;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  user-select: text;
+}
+
+#root .app-shell .video-output-location .video-output-note {
+  display: block;
+  color: #81747d;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.video-output-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.video-output-actions .video-output-button {
+  height: 32px;
+  padding: 0 11px;
+}
+
+#root .app-shell .movie-dialog .movie-export-note {
+  margin: 8px 14px 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .popover-heading {
   display: flex;
   min-height: 43px;
@@ -1842,49 +1900,40 @@ svg {
   background: #ffffff;
 }
 
-.plan-mode-switch,
-.display-mode-switch {
+.inspector-toolbar {
   position: sticky;
+  top: 0;
   z-index: 5;
+  background: #ffffff;
+}
+
+.display-mode-switch {
   display: flex;
-  min-height: 58px;
+  min-height: 52px;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 8px 10px;
+  padding: 12px;
   border-bottom: 1px solid var(--line);
   background: #ffffff;
 }
 
-.plan-mode-switch {
-  top: 0;
-}
-
-.display-mode-switch {
-  top: 58px;
-  min-height: 52px;
-}
-
-.plan-mode-switch > span,
 .display-mode-switch > span {
   display: grid;
   gap: 2px;
   min-width: 74px;
 }
 
-.plan-mode-switch small,
 .display-mode-switch small {
   color: var(--subtle);
   font-size: 9px;
 }
 
-.plan-mode-switch strong,
 .display-mode-switch strong {
   color: var(--text);
   font-size: 12px;
 }
 
-.plan-mode-switch > div,
 .display-mode-switch > div {
   display: grid;
   width: 190px;
@@ -1895,7 +1944,6 @@ svg {
   background: #f8f3f5;
 }
 
-.plan-mode-switch button,
 .display-mode-switch button {
   min-height: 30px;
   border: 0;
@@ -1918,7 +1966,6 @@ svg {
   height: 13px;
 }
 
-.plan-mode-switch button.active,
 .display-mode-switch button.active {
   background: #ffffff;
   color: #bd5069;
@@ -1926,9 +1973,6 @@ svg {
 }
 
 .inspector-tabs {
-  position: sticky;
-  top: 110px;
-  z-index: 4;
   display: grid;
   grid-template-columns: repeat(3, 1fr);
   height: 46px;
@@ -2969,10 +3013,10 @@ svg {
 }
 
 .movie-dialog {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   width: min(620px, calc(100vw - 48px));
   max-height: min(650px, calc(100vh - 48px));
-  grid-template-rows: auto auto auto auto minmax(100px, 1fr) auto auto;
   overflow: hidden;
   border: 1px solid #ddcdd4;
   border-radius: 8px;
@@ -3314,11 +3358,11 @@ svg {
 
 .movie-plan-row {
   display: grid;
-  min-height: 48px;
+  min-height: 62px;
   grid-template-columns: 25px minmax(0, 1fr) minmax(90px, 130px);
   align-items: center;
   gap: 8px;
-  padding: 5px 10px;
+  padding: 9px 12px;
   border-bottom: 1px solid var(--line-soft);
 }
 
@@ -3334,7 +3378,7 @@ svg {
   border-radius: 50%;
   background: var(--pink-soft);
   color: var(--pink-strong);
-  font-size: 8px;
+  font-size: 11px;
   font-weight: 800;
 }
 
@@ -3345,15 +3389,19 @@ svg {
 
 .movie-plan-copy strong {
   overflow: hidden;
-  font-size: 9px;
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.5;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.movie-plan-copy small {
+#root .app-shell .movie-plan-copy small {
   margin-top: 3px;
-  color: var(--subtle);
-  font-size: 8px;
+  color: #81747d;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.5;
 }
 
 .movie-plan-hero {
@@ -3364,15 +3412,22 @@ svg {
   gap: 5px;
   overflow: hidden;
   color: #4b8eb7;
-  font-size: 8px;
+  font-size: 12px;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .movie-plan-hero svg {
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
   flex: 0 0 auto;
+}
+
+.movie-plan-hero-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .movie-plan-empty {
@@ -3461,6 +3516,70 @@ svg {
   overflow-wrap: anywhere;
 }
 
+.diagnostic-export-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.diagnostic-export-button {
+  display: inline-flex;
+  width: fit-content;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 12px;
+  border: 1px solid #bb354b;
+  border-radius: 6px;
+  background: #c53d54;
+  color: #ffffff;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.diagnostic-export-button:hover:not(:disabled) {
+  border-color: #a72d42;
+  background: #ae3047;
+}
+
+.diagnostic-export-button:disabled {
+  border-color: #df9eaa;
+  background: #f7e4e8;
+  color: #9c3a4c;
+  opacity: 1;
+}
+
+.movie-dialog .diagnostic-export-panel {
+  align-items: flex-start;
+  gap: 10px;
+  margin: 12px 14px 0;
+  padding: 10px 12px;
+  border-color: #e4a1ad;
+  background: #fff3f4;
+  color: #9c3a4c;
+}
+
+.diagnostic-export-panel > svg {
+  width: 17px;
+  height: 17px;
+  margin-top: 7px;
+}
+
+.diagnostic-export-copy {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+}
+
+#root .app-shell .movie-dialog .diagnostic-export-note {
+  display: block;
+  margin-top: 4px;
+  color: #9c3a4c;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .dialog-feedback svg {
   width: 13px;
   height: 13px;
@@ -3469,11 +3588,12 @@ svg {
 
 .movie-dialog-footer {
   display: flex;
+  flex-wrap: wrap;
   min-height: 58px;
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
-  padding: 0 14px;
+  padding: 10px 14px;
   border-top: 1px solid var(--line);
   background: #fffafd;
 }
@@ -4668,17 +4788,16 @@ svg {
 .render-resume-panel p { margin: 4px 0; }
 .render-resume-panel button { margin-top: 5px; }
 
-.movie-dialog-body { display: contents; }
-.movie-dialog.with-resume { display: flex; flex-direction: column; }
-.movie-dialog.with-resume > .movie-dialog-header,
-.movie-dialog.with-resume > .movie-dialog-footer { flex: 0 0 auto; }
-.movie-dialog.with-resume .movie-dialog-body {
+.movie-dialog > .movie-dialog-header,
+.movie-dialog > .movie-dialog-footer { flex: 0 0 auto; }
+.movie-dialog-body {
   display: flex;
   flex-direction: column;
+  flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
 }
-.movie-dialog.with-resume .movie-dialog-body > * { flex-shrink: 0; }
+.movie-dialog-body > * { flex-shrink: 0; }
 .movie-dialog.with-resume .movie-plan-list { max-height: 150px; }
 
 .movie-dialog.with-resume .secondary-button span { display: inline; }

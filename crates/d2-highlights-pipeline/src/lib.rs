@@ -1,13 +1,17 @@
 use d2_highlights_core::{
-    DIRECTOR_SCHEMA_VERSION, DemSource, DirectorDocument, HIGHLIGHT_SCHEMA_VERSION,
+    AudioPlan, DIRECTOR_SCHEMA_VERSION, DemSource, DirectorDocument, HIGHLIGHT_SCHEMA_VERSION,
     HighlightCandidate, HighlightDocument, IngestError, JobManifest, ReplayMetadata,
     STORY_SCHEMA_VERSION, StageStatus, StoryDocument, TIMELINE_SCHEMA_VERSION, TimelineDocument,
     ingest_dem, update_stage, write_json_pretty,
 };
-use d2_highlights_detector::{DETECTOR_NAME, DETECTOR_VERSION, detect_highlights};
+use d2_highlights_detector::{
+    DETECTOR_NAME, DETECTOR_VERSION, HERO_KILLS_DETECTOR_NAME, detect_hero_kill_highlights,
+    detect_highlights,
+};
 use d2_highlights_director::{StoryValidationError, build_director_plan, build_story_document};
 use d2_highlights_parser_source2::{
-    PARSER_ADAPTER_CACHE_VERSION, ParserAdapterError, SOURCE2_DEMO_VERSION, parse_combat_timeline,
+    COMBAT_ONLY_PARSER_NAME, PARSER_ADAPTER_CACHE_VERSION, ParserAdapterError,
+    SOURCE2_DEMO_VERSION, parse_combat_timeline, parse_highlight_timeline,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -31,6 +35,17 @@ struct AnalysisCacheStamp {
     director_sha256: String,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct HighlightsCacheStamp {
+    version: String,
+    mode: String,
+    source_sha256: String,
+    detector_version: String,
+    parser_adapter_version: String,
+    timeline_sha256: String,
+    highlights_sha256: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct AnalysisProgress {
     pub stage: String,
@@ -49,6 +64,7 @@ pub struct AnalysisSummary {
     pub stories: StoryDocument,
     pub director: DirectorDocument,
     pub reused_existing_job: bool,
+    pub analysis_warnings: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -73,6 +89,192 @@ pub enum PipelineError {
 
 pub fn analyze_dem(dem_path: &Path, jobs_root: &Path) -> Result<AnalysisSummary, PipelineError> {
     analyze_dem_with_progress(dem_path, jobs_root, |_| {})
+}
+
+/// Desktop recorder analysis, deliberately independent from full analysis caches
+/// and story/director generation. The full CLI pipeline remains available below.
+pub fn analyze_highlights_with_progress<F>(
+    dem_path: &Path,
+    jobs_root: &Path,
+    mut report: F,
+) -> Result<AnalysisSummary, PipelineError>
+where
+    F: FnMut(AnalysisProgress),
+{
+    report(progress("ingest", StageStatus::Running, "正在检查录像文件"));
+    let ingested = ingest_dem(dem_path, jobs_root)?;
+    report(progress("ingest", StageStatus::Complete, "录像校验完成"));
+    let timeline_path = ingested.job_dir.join("timeline/combat-events.json");
+    let highlights_path = ingested.job_dir.join("timeline/highlights.json");
+    let stamp_path = ingested.job_dir.join("highlights-cache.json");
+    let stamp = read_json::<HighlightsCacheStamp>(&stamp_path).ok();
+    let cached_timeline = read_json::<TimelineDocument>(&timeline_path)
+        .ok()
+        .filter(|timeline| {
+            stage_complete(&ingested.manifest, "parse")
+                && timeline.schema_version == TIMELINE_SCHEMA_VERSION
+                && timeline.source_sha256 == ingested.manifest.source.sha256
+                && matches!(
+                    timeline.parser.name.as_str(),
+                    "source2-demo" | COMBAT_ONLY_PARSER_NAME
+                )
+                && timeline.parser.version == SOURCE2_DEMO_VERSION
+                && stamp.as_ref().is_none_or(|stamp| {
+                    stamp.parser_adapter_version == PARSER_ADAPTER_CACHE_VERSION
+                })
+        });
+    let timeline_rebuilt = cached_timeline.is_none();
+    let timeline = if let Some(timeline) = cached_timeline {
+        report(progress("parse", StageStatus::Complete, "已复用比赛事件"));
+        timeline
+    } else {
+        update_stage(&ingested.job_dir, "parse", StageStatus::Running, None, None)?;
+        report(progress(
+            "parse",
+            StageStatus::Running,
+            "正在读取击杀与技能事件",
+        ));
+        let timeline = match parse_highlight_timeline(dem_path, &ingested.manifest.source.sha256) {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                let _ = update_stage(
+                    &ingested.job_dir,
+                    "parse",
+                    StageStatus::Failed,
+                    None,
+                    Some(error.to_string()),
+                );
+                report(progress("parse", StageStatus::Failed, "录像解析失败"));
+                return Err(error.into());
+            }
+        };
+        write_json_pretty(&timeline_path, &timeline)?;
+        update_stage(
+            &ingested.job_dir,
+            "parse",
+            StageStatus::Complete,
+            Some("timeline/combat-events.json".into()),
+            None,
+        )?;
+        report(progress("parse", StageStatus::Complete, "比赛事件读取完成"));
+        timeline
+    };
+
+    let previous = read_json::<HighlightDocument>(&highlights_path)
+        .ok()
+        .filter(|document| document.source_sha256 == timeline.source_sha256);
+    let can_reuse = !timeline_rebuilt
+        && stage_complete(&ingested.manifest, "detect")
+        && previous.as_ref().is_some_and(|document| {
+            document.schema_version == HIGHLIGHT_SCHEMA_VERSION
+                && document.detector.name == HERO_KILLS_DETECTOR_NAME
+                && document.detector.version == DETECTOR_VERSION
+                && document.candidates.iter().all(|candidate| {
+                    candidate.kind == "hero_kill_sequence" && candidate.kill_sequence.is_some()
+                })
+        })
+        && stamp.as_ref().is_some_and(|stamp| {
+            stamp.version == ANALYSIS_CACHE_VERSION
+                && stamp.mode == HERO_KILLS_DETECTOR_NAME
+                && stamp.source_sha256 == timeline.source_sha256
+                && stamp.detector_version == DETECTOR_VERSION
+                && stamp.parser_adapter_version == PARSER_ADAPTER_CACHE_VERSION
+                && artifact_hash(&timeline_path).ok().as_deref()
+                    == Some(stamp.timeline_sha256.as_str())
+                && artifact_hash(&highlights_path).ok().as_deref()
+                    == Some(stamp.highlights_sha256.as_str())
+        });
+    let highlights = if can_reuse {
+        report(progress("detect", StageStatus::Complete, "已复用高光候选"));
+        previous.expect("validated cached highlights")
+    } else {
+        update_stage(
+            &ingested.job_dir,
+            "detect",
+            StageStatus::Running,
+            None,
+            None,
+        )?;
+        report(progress(
+            "detect",
+            StageStatus::Running,
+            "正在整理英雄击杀片段",
+        ));
+        let mut highlights = detect_hero_kill_highlights(&timeline);
+        if let Some(previous) = previous {
+            preserve_candidate_ids(&mut highlights, &previous, &timeline);
+        } else if ingested.job_dir.join("director/edit-plan.json").is_file() {
+            let untrusted = HighlightDocument {
+                candidates: Vec::new(),
+                ..highlights.clone()
+            };
+            preserve_candidate_ids(&mut highlights, &untrusted, &timeline);
+        }
+        write_json_pretty(&highlights_path, &highlights)?;
+        update_stage(
+            &ingested.job_dir,
+            "detect",
+            StageStatus::Complete,
+            Some("timeline/highlights.json".into()),
+            None,
+        )?;
+        write_json_pretty(
+            &stamp_path,
+            &HighlightsCacheStamp {
+                version: ANALYSIS_CACHE_VERSION.into(),
+                mode: HERO_KILLS_DETECTOR_NAME.into(),
+                source_sha256: timeline.source_sha256.clone(),
+                detector_version: DETECTOR_VERSION.into(),
+                parser_adapter_version: PARSER_ADAPTER_CACHE_VERSION.into(),
+                timeline_sha256: artifact_hash(&timeline_path)?,
+                highlights_sha256: artifact_hash(&highlights_path)?,
+            },
+        )?;
+        report(progress(
+            "detect",
+            StageStatus::Complete,
+            "高光片段已经整理好",
+        ));
+        highlights
+    };
+
+    // Preserve the shared response/artifact contract without invoking either
+    // planner. Edit plans and migrated story workspaces are never rewritten here.
+    let stories = StoryDocument {
+        schema_version: STORY_SCHEMA_VERSION.into(),
+        source_sha256: timeline.source_sha256.clone(),
+        detector: highlights.detector.clone(),
+        stories: Vec::new(),
+    };
+    let director = DirectorDocument {
+        schema_version: DIRECTOR_SCHEMA_VERSION.into(),
+        source_sha256: timeline.source_sha256.clone(),
+        template: "highlights_only".into(),
+        total_duration_seconds: 0.0,
+        transition_seconds: 0.0,
+        segments: Vec::new(),
+        audio: AudioPlan {
+            music_role: String::new(),
+            bpm_min: 0,
+            bpm_max: 0,
+            game_audio_duck_db: 0.0,
+            music_duck_under_voice_db: 0.0,
+            cues: Vec::new(),
+        },
+    };
+    report(progress("complete", StageStatus::Complete, "高光整理完成"));
+    Ok(AnalysisSummary {
+        job_id: ingested.manifest.job_id,
+        job_dir: ingested.job_dir.display().to_string(),
+        source: ingested.manifest.source,
+        analysis_warnings: Vec::new(),
+        replay: timeline.replay,
+        event_count: timeline.events.len(),
+        highlights,
+        stories,
+        director,
+        reused_existing_job: can_reuse,
+    })
 }
 
 pub fn analyze_dem_with_progress<F>(
@@ -140,7 +342,10 @@ where
             stage_complete(&ingested.manifest, "parse")
                 && timeline.schema_version == TIMELINE_SCHEMA_VERSION
                 && timeline.source_sha256 == ingested.manifest.source.sha256
-                && timeline.parser.name == "source2-demo"
+                && matches!(
+                    timeline.parser.name.as_str(),
+                    "source2-demo" | COMBAT_ONLY_PARSER_NAME
+                )
                 && timeline.parser.version == SOURCE2_DEMO_VERSION
                 && stamp.as_ref().is_none_or(|stamp| {
                     stamp.parser_adapter_version == PARSER_ADAPTER_CACHE_VERSION
@@ -288,6 +493,7 @@ where
         job_id: ingested.manifest.job_id,
         job_dir: ingested.job_dir.display().to_string(),
         source: ingested.manifest.source,
+        analysis_warnings: timeline_warnings(&timeline),
         replay: timeline.replay,
         event_count: timeline.events.len(),
         highlights,
@@ -528,6 +734,7 @@ fn load_summary(
         job_id: manifest.job_id.clone(),
         job_dir: job_dir.display().to_string(),
         source: manifest.source.clone(),
+        analysis_warnings: timeline_warnings(&timeline),
         replay: timeline.replay,
         event_count: timeline.events.len(),
         highlights,
@@ -535,6 +742,14 @@ fn load_summary(
         director,
         reused_existing_job,
     })
+}
+
+fn timeline_warnings(timeline: &TimelineDocument) -> Vec<String> {
+    if timeline.parser.name == COMBAT_ONLY_PARSER_NAME {
+        vec!["已读取击杀与技能事件，时间定位可用；这份录像的部分实体技巧暂无法自动识别。".into()]
+    } else {
+        Vec::new()
+    }
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, PipelineError> {
@@ -578,6 +793,99 @@ mod tests {
             stories_sha256: artifact_hash(&directory.join("director/stories.json")).unwrap(),
             director_sha256: artifact_hash(&directory.join("director/plan.json")).unwrap(),
         }
+    }
+
+    #[test]
+    fn recorder_cache_never_reuses_full_candidates_or_runs_planners() {
+        let temp = tempfile::tempdir().unwrap();
+        let dem = temp.path().join("source.dem");
+        fs::write(&dem, b"PBDEMS2\0\x10\0\0\0\0\0\0\0").unwrap();
+        let jobs = temp.path().join("jobs");
+        let ingested = ingest_dem(&dem, &jobs).unwrap();
+        let directory = &ingested.job_dir;
+        let timeline = test_timeline(&ingested.manifest.source.sha256);
+        let full = detect_highlights(&timeline, 20, 18.0);
+        assert!(
+            full.candidates
+                .iter()
+                .any(|candidate| candidate.kind != "hero_kill_sequence")
+        );
+        write_json_pretty(&directory.join("timeline/combat-events.json"), &timeline).unwrap();
+        write_json_pretty(&directory.join("timeline/highlights.json"), &full).unwrap();
+        write_json_pretty(
+            &directory.join("director/stories.json"),
+            &build_story_document(&timeline, &full).unwrap(),
+        )
+        .unwrap();
+        write_json_pretty(
+            &directory.join("director/plan.json"),
+            &build_director_plan(&full, "comic_hype_v1", 10, 90.0),
+        )
+        .unwrap();
+        for stage in ["parse", "detect", "direct"] {
+            update_stage(directory, stage, StageStatus::Complete, None, None).unwrap();
+        }
+        write_json_pretty(
+            &directory.join("analysis-cache.json"),
+            &cache_stamp_for(&timeline.source_sha256, directory),
+        )
+        .unwrap();
+        let story_before = fs::read(directory.join("director/stories.json")).unwrap();
+        let director_before = fs::read(directory.join("director/plan.json")).unwrap();
+        let saved_plan = br#"{"candidate_id":"hk-001","source_start_seconds":88.0}"#;
+        fs::write(directory.join("director/edit-plan.json"), saved_plan).unwrap();
+
+        let mut stages = Vec::new();
+        let recorder =
+            analyze_highlights_with_progress(&dem, &jobs, |event| stages.push(event.stage))
+                .unwrap();
+        assert!(!recorder.reused_existing_job);
+        assert!(!stages.iter().any(|stage| stage == "direct"));
+        assert_eq!(recorder.replay, timeline.replay);
+        assert!(recorder.stories.stories.is_empty());
+        assert!(recorder.director.segments.is_empty());
+        let mut expected = full
+            .candidates
+            .into_iter()
+            .filter(|candidate| candidate.kind == "hero_kill_sequence")
+            .collect::<Vec<_>>();
+        for (index, candidate) in expected.iter_mut().enumerate() {
+            candidate.rank = index + 1;
+        }
+        assert_eq!(recorder.highlights.candidates, expected);
+        assert_eq!(
+            fs::read(directory.join("director/edit-plan.json")).unwrap(),
+            saved_plan
+        );
+        assert_eq!(
+            fs::read(directory.join("director/stories.json")).unwrap(),
+            story_before
+        );
+        assert_eq!(
+            fs::read(directory.join("director/plan.json")).unwrap(),
+            director_before
+        );
+        assert!(
+            analyze_highlights_with_progress(&dem, &jobs, |_| {})
+                .unwrap()
+                .reused_existing_job
+        );
+
+        let mut stamp: HighlightsCacheStamp =
+            read_json(&directory.join("highlights-cache.json")).unwrap();
+        stamp.mode = DETECTOR_NAME.into();
+        write_json_pretty(&directory.join("highlights-cache.json"), &stamp).unwrap();
+        assert!(
+            !analyze_highlights_with_progress(&dem, &jobs, |_| {})
+                .unwrap()
+                .reused_existing_job
+        );
+        assert!(!analyze_dem(&dem, &jobs).unwrap().reused_existing_job);
+        assert!(analyze_dem(&dem, &jobs).unwrap().reused_existing_job);
+        assert_eq!(
+            fs::read(directory.join("director/edit-plan.json")).unwrap(),
+            saved_plan
+        );
     }
 
     #[test]

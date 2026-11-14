@@ -14,7 +14,8 @@ use thiserror::Error;
 
 pub const SOURCE2_DEMO_VERSION: &str = "0.5.8";
 /// Bump when adapter semantics change without changing the timeline schema.
-pub const PARSER_ADAPTER_CACHE_VERSION: &str = "1";
+pub const PARSER_ADAPTER_CACHE_VERSION: &str = "2";
+pub const COMBAT_ONLY_PARSER_NAME: &str = "source2-demo/combat-log-only";
 const PARSER_STACK_BYTES: usize = 64 * 1024 * 1024;
 const DIRECTOR_SNAPSHOT_INTERVAL_SECONDS: f64 = 30.0;
 
@@ -295,16 +296,48 @@ impl CombatObserver {
     }
 }
 
+struct CombatOnlyObserver(CombatObserver);
+impl Observer for CombatOnlyObserver {
+    fn interests(&self) -> Interests {
+        Interests::COMBAT_LOG_ENTRIES | Interests::STRING_TABLE_STATE
+    }
+    fn on_combat_log(&mut self, ctx: &Context, entry: &CombatLogEntry) -> ObserverResult {
+        Observer::on_combat_log(&mut self.0, ctx, entry)
+    }
+}
+
 pub fn parse_combat_timeline(
     path: &Path,
     source_sha256: &str,
+) -> Result<TimelineDocument, ParserAdapterError> {
+    match parse_worker(path, source_sha256, true) {
+        Err(ParserAdapterError::WorkerPanic | ParserAdapterError::Parse(_)) => {
+            parse_worker(path, source_sha256, false)
+        }
+        result => result,
+    }
+}
+
+/// Recorder path: retain the same combat-log decoding and replay metadata, but
+/// do not register entity, tree-order, salute or director-state observers.
+pub fn parse_highlight_timeline(
+    path: &Path,
+    source_sha256: &str,
+) -> Result<TimelineDocument, ParserAdapterError> {
+    parse_worker(path, source_sha256, false)
+}
+
+fn parse_worker(
+    path: &Path,
+    source_sha256: &str,
+    entities: bool,
 ) -> Result<TimelineDocument, ParserAdapterError> {
     let owned_path = path.to_path_buf();
     let owned_sha256 = source_sha256.to_string();
     thread::Builder::new()
         .name("d2-dem-parser".to_string())
         .stack_size(PARSER_STACK_BYTES)
-        .spawn(move || parse_combat_timeline_inner(&owned_path, &owned_sha256))
+        .spawn(move || parse_combat_timeline_inner(&owned_path, &owned_sha256, entities))
         .map_err(ParserAdapterError::ThreadSpawn)?
         .join()
         .map_err(|_| ParserAdapterError::WorkerPanic)?
@@ -313,6 +346,7 @@ pub fn parse_combat_timeline(
 fn parse_combat_timeline_inner(
     path: &Path,
     source_sha256: &str,
+    entities: bool,
 ) -> Result<TimelineDocument, ParserAdapterError> {
     let file = File::open(path).map_err(|source| ParserAdapterError::Open {
         path: path.to_path_buf(),
@@ -356,22 +390,42 @@ fn parse_combat_timeline_inner(
     } else {
         1.0 / 30.0
     };
-    let observer = parser.add_observer(CombatObserver::new(seconds_per_tick, heroes_by_roster));
-    parser.run_to_end()?;
-
+    let observer = CombatObserver::new(seconds_per_tick, heroes_by_roster);
+    let (events, tree_orders, temporary_trees, salutes, state_snapshots) = if entities {
+        let observer = parser.add_observer(observer);
+        parser.run_to_end()?;
+        let o = observer.borrow();
+        (
+            o.events.clone(),
+            o.tree_orders.clone(),
+            o.temporary_trees.clone(),
+            o.salutes.clone(),
+            o.state_snapshots.clone(),
+        )
+    } else {
+        let observer = parser.add_observer(CombatOnlyObserver(observer));
+        parser.run_to_end()?;
+        let o = observer.borrow();
+        (
+            o.0.events.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+    };
     let game_build = parser.context().game_build();
-    let observer = observer.borrow();
-    let events = observer.events.clone();
-    let tree_orders = observer.tree_orders.clone();
-    let temporary_trees = observer.temporary_trees.clone();
-    let salutes = observer.salutes.clone();
-    let state_snapshots = observer.state_snapshots.clone();
 
     Ok(TimelineDocument {
         schema_version: TIMELINE_SCHEMA_VERSION.to_string(),
         source_sha256: source_sha256.to_string(),
         parser: ParserIdentity {
-            name: "source2-demo".to_string(),
+            name: if entities {
+                "source2-demo"
+            } else {
+                COMBAT_ONLY_PARSER_NAME
+            }
+            .to_string(),
             version: SOURCE2_DEMO_VERSION.to_string(),
         },
         replay: ReplayMetadata {

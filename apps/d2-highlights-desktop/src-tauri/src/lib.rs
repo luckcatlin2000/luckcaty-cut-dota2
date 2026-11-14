@@ -1,14 +1,16 @@
 mod activity;
-mod analysis_export;
 mod cache_cleanup;
+mod diagnostics;
+mod external_modules;
+mod replay_library;
+mod timestamp_import;
+mod video_output;
+mod wtf;
 
 use activity::{Activities, Activity};
 
-use analysis_export::{
-    AnalysisPackageExportRequest, AnalysisPackageExportResult, export_analysis_package,
-};
-use d2_highlights_core::{DirectorDocument, HighlightDocument, JobManifest, TimelineDocument};
-use d2_highlights_pipeline::{AnalysisProgress, AnalysisSummary, analyze_dem_with_progress};
+use d2_highlights_core::{HighlightDocument, JobManifest, TimelineDocument};
+use d2_highlights_pipeline::{AnalysisProgress, AnalysisSummary, analyze_highlights_with_progress};
 use d2_highlights_renderer::{
     BgmMode, CameraStyle, CancellationToken, ClipCameraMode, RENDER_SCHEMA_VERSION, RenderClip,
     RenderProgress, RenderRequest, RenderResult, RenderResumeSummary, RenderSettings,
@@ -33,6 +35,18 @@ const LEGACY_EDIT_PLAN_SCHEMA_VERSIONS: [&str; 2] = ["d2h.edit-plan/1.4", "d2h.e
 const DOTA2_SETTINGS_SCHEMA_VERSION: &str = "d2h.dota2-path/1.0";
 const DOTA2_SETTINGS_FILE: &str = "dota2-path.json";
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DesktopModule {
+    Highlights,
+    Wtf,
+}
+
+#[tauri::command]
+fn get_desktop_module(module: State<'_, DesktopModule>) -> DesktopModule {
+    *module
+}
+
 const fn default_true() -> bool {
     true
 }
@@ -44,14 +58,13 @@ const fn default_story_pre_roll_seconds() -> f32 {
 #[derive(Clone)]
 struct AppState {
     jobs_root: PathBuf,
-    analysis_export_directory: PathBuf,
     dota2_runtime: Arc<Mutex<Dota2Runtime>>,
     dota2_settings_path: PathBuf,
+    video_output: video_output::Settings,
     ffmpeg_exe: Option<PathBuf>,
     ffprobe_exe: Option<PathBuf>,
     render_runtime: Arc<Mutex<RenderRuntime>>,
     activities: Activities,
-    exported_packages: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 #[derive(Clone)]
@@ -122,10 +135,10 @@ struct Capabilities {
     dota2_found: bool,
     render_reason: Option<String>,
     jobs_root: String,
-    recommended_analysis_export_directory: String,
     recommended_replay_directory: Option<String>,
     dota2_path: Option<String>,
     dota2_path_source: Dota2PathSource,
+    video_output_directory: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -201,6 +214,8 @@ struct EditPlanSlotInput {
 struct EditPlanClipInput {
     clip_id: String,
     candidate_id: String,
+    #[serde(default)]
+    imported: Option<timestamp_import::ImportedClip>,
     view_hero: Option<String>,
     #[serde(default)]
     camera_mode: ClipCameraMode,
@@ -243,6 +258,8 @@ struct EditPlanClip {
     #[serde(default)]
     clip_id: String,
     candidate_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    imported: Option<timestamp_import::ImportedClip>,
     view_hero: Option<String>,
     #[serde(default)]
     camera_mode: ClipCameraMode,
@@ -312,6 +329,7 @@ struct LoadedEditPlanSlot {
 struct LoadedEditPlanClip {
     clip_id: String,
     candidate_id: String,
+    imported: Option<timestamp_import::ImportedClip>,
     view_hero: Option<String>,
     camera_mode: ClipCameraMode,
     take_group_id: Option<String>,
@@ -400,10 +418,6 @@ fn capabilities_for_state(state: &AppState) -> Capabilities {
         dota2_found,
         render_reason,
         jobs_root: state.jobs_root.display().to_string(),
-        recommended_analysis_export_directory: state
-            .analysis_export_directory
-            .display()
-            .to_string(),
         recommended_replay_directory: dota2_runtime
             .executable
             .as_deref()
@@ -413,6 +427,7 @@ fn capabilities_for_state(state: &AppState) -> Capabilities {
             .executable
             .map(|path| path.display().to_string()),
         dota2_path_source: dota2_runtime.source,
+        video_output_directory: state.video_output.current(),
     }
 }
 
@@ -458,27 +473,6 @@ fn resolve_replay_by_id(
 }
 
 #[tauri::command]
-fn export_replay_analysis_package(
-    request: AnalysisPackageExportRequest,
-    state: State<'_, AppState>,
-) -> Result<AnalysisPackageExportResult, String> {
-    if !valid_job_id(&request.job_id) {
-        return Err("任务编号无效，请重新打开分析结果。".to_string());
-    }
-    let _lease = state.activities.begin(Activity::Export)?;
-    let result = export_analysis_package(&state.jobs_root, request)?;
-    // Only a directory produced by this process grants an external open receipt.
-    if let Ok(path) = fs::canonicalize(&result.package_path) {
-        state
-            .exported_packages
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(path);
-    }
-    Ok(result)
-}
-
-#[tauri::command]
 fn get_recent_jobs(state: State<'_, AppState>) -> Result<Vec<RecentJob>, String> {
     let mut jobs = Vec::new();
     let entries = match fs::read_dir(&state.jobs_root) {
@@ -498,8 +492,17 @@ fn get_recent_jobs(state: State<'_, AppState>) -> Result<Vec<RecentJob>, String>
         };
         let highlights =
             read_json::<HighlightDocument>(&job_dir.join("timeline").join("highlights.json")).ok();
-        let director =
-            read_json::<DirectorDocument>(&job_dir.join("director").join("plan.json")).ok();
+        let duration_seconds = highlights
+            .as_ref()
+            .map(|document| {
+                document
+                    .candidates
+                    .iter()
+                    .filter(|candidate| candidate.kind == "hero_kill_sequence")
+                    .map(|candidate| candidate.end_seconds - candidate.start_seconds)
+                    .sum()
+            })
+            .unwrap_or_default();
         let last_opened_unix_seconds =
             read_json::<RecentJobActivity>(&job_dir.join("recent-activity.json"))
                 .map(|activity| activity.last_opened_unix_seconds)
@@ -511,12 +514,15 @@ fn get_recent_jobs(state: State<'_, AppState>) -> Result<Vec<RecentJob>, String>
             byte_length: manifest.source.byte_length,
             candidate_count: highlights
                 .as_ref()
-                .map(|document| document.candidates.len())
+                .map(|document| {
+                    document
+                        .candidates
+                        .iter()
+                        .filter(|candidate| candidate.kind == "hero_kill_sequence")
+                        .count()
+                })
                 .unwrap_or_default(),
-            duration_seconds: director
-                .as_ref()
-                .map(|document| document.total_duration_seconds)
-                .unwrap_or_default(),
+            duration_seconds,
             created_unix_seconds: manifest.created_unix_seconds,
             last_opened_unix_seconds,
         });
@@ -527,6 +533,44 @@ fn get_recent_jobs(state: State<'_, AppState>) -> Result<Vec<RecentJob>, String>
     });
     jobs.truncate(12);
     Ok(jobs)
+}
+
+#[tauri::command]
+async fn preview_timestamp_plan(
+    request: timestamp_import::PreviewRequest,
+    state: State<'_, AppState>,
+) -> Result<timestamp_import::Preview, String> {
+    if !valid_job_id(&request.job_id) {
+        return Err("任务编号无效。".into());
+    }
+    let lease = state.activities.begin(Activity::Export)?;
+    let root = state.jobs_root.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lease = lease;
+        let job = root.join(&request.job_id);
+        let manifest: JobManifest =
+            read_json(&job.join("manifest.json")).map_err(|_| "请先载入录像。")?;
+        let timeline: TimelineDocument = read_json(&job.join("timeline/combat-events.json"))
+            .map_err(|_| "本局分析数据不完整。")?;
+        let (text, name) = match (request.path, request.text) {
+            (Some(path), None) => (
+                timestamp_import::read_text(Path::new(&path))?,
+                source_name(&path),
+            ),
+            (None, Some(text)) => (text, "粘贴的时间表".into()),
+            _ => return Err("请选择一个文件，或粘贴一整块时间表。".into()),
+        };
+        timestamp_import::build_preview(
+            &text,
+            &name,
+            &manifest.source,
+            &timeline,
+            request.hero.as_deref(),
+            request.time_basis.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -541,7 +585,7 @@ async fn analyze_dem(
     let jobs_root = state.jobs_root.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _lease = lease;
-        let summary = analyze_dem_with_progress(&dem_path, &jobs_root, |progress| {
+        let summary = analyze_highlights_with_progress(&dem_path, &jobs_root, |progress| {
             let _ = on_progress.send(progress);
         })
         .map_err(|error| error.to_string())?;
@@ -567,6 +611,8 @@ fn archive_edit_plan_for_reanalysis(
     if !source.is_file() {
         return Ok(None);
     }
+    let mut preserved: serde_json::Value = read_json(&source)?;
+    let wtf = preserved_wtf_slot(&preserved)?;
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -585,7 +631,18 @@ fn archive_edit_plan_for_reanalysis(
         }
         suffix += 1;
     };
-    fs::rename(&source, &backup).map_err(|error| format!("备份当前剪辑方案失败：{error}"))?;
+    if let Some(wtf) = wtf {
+        fs::copy(&source, &backup).map_err(|error| format!("备份当前剪辑方案失败：{error}"))?;
+        preserved["plans"] = serde_json::json!([wtf]);
+        preserved["active_mode"] = serde_json::json!("default");
+        preserved["clips"] = serde_json::json!([]);
+        preserved["settings"] =
+            serde_json::to_value(RenderSettings::default()).map_err(|error| error.to_string())?;
+        d2_highlights_core::write_json_pretty(&source, &preserved)
+            .map_err(|error| format!("保存旧方案保留副本失败：{error}"))?;
+    } else {
+        fs::rename(&source, &backup).map_err(|error| format!("备份当前剪辑方案失败：{error}"))?;
+    }
     Ok(Some(backup))
 }
 
@@ -598,11 +655,24 @@ fn save_edit_plan(
         return Err("任务编号无效，请重新打开分析结果。".to_string());
     }
     let _lease = state.activities.begin(Activity::Save)?;
-    if request.plans.len() != 2 {
-        return Err("剪辑方案必须同时包含默认剪辑和 WTF 导演。".to_string());
+    save_edit_plan_to(&state.jobs_root, request)
+}
+
+fn save_edit_plan_to(
+    jobs_root: &Path,
+    request: SaveEditPlanRequest,
+) -> Result<SaveEditPlanResult, String> {
+    if !valid_job_id(&request.job_id) {
+        return Err("任务编号无效。".into());
+    }
+    if request.active_mode != EditPlanMode::Default
+        || request.plans.len() != 1
+        || request.plans[0].mode != EditPlanMode::Default
+    {
+        return Err("剪辑助手只保存高光方案，旧的其他方案会保留。".to_string());
     }
 
-    let job_dir = state.jobs_root.join(&request.job_id);
+    let job_dir = jobs_root.join(&request.job_id);
     let manifest = read_json::<JobManifest>(&job_dir.join("manifest.json"))
         .map_err(|_| "任务数据不存在，请重新分析录像。".to_string())?;
     let highlights =
@@ -612,36 +682,29 @@ fn save_edit_plan(
         read_json::<TimelineDocument>(&job_dir.join("timeline").join("combat-events.json"))
             .map_err(|_| "回放阵容数据不完整，请重新分析录像。".to_string())?;
 
-    let mut has_default = false;
-    let mut has_wtf = false;
-    let mut plans = Vec::with_capacity(request.plans.len());
-    let mut active_duration_seconds = 0.0;
-    for input in request.plans {
-        match input.mode {
-            EditPlanMode::Default if has_default => {
-                return Err("剪辑方案包含重复的默认剪辑。".to_string());
-            }
-            EditPlanMode::Wtf if has_wtf => {
-                return Err("剪辑方案包含重复的 WTF 导演。".to_string());
-            }
-            EditPlanMode::Default => has_default = true,
-            EditPlanMode::Wtf => has_wtf = true,
+    let output_path = job_dir.join("director/edit-plan.json");
+    let preserved_wtf = if output_path.is_file() {
+        let previous: serde_json::Value = read_json(&output_path)?;
+        if previous["job_id"] != request.job_id
+            || previous["source_sha256"] != manifest.source.sha256
+        {
+            return Err("已保存草稿与本局录像不一致，原文件已保留。".into());
         }
-        let (plan, duration_seconds) = build_edit_plan_slot(input, &highlights, &timeline)?;
-        if plan.mode == request.active_mode {
-            active_duration_seconds = duration_seconds;
-        }
-        plans.push(plan);
-    }
-    if !has_default || !has_wtf {
-        return Err("剪辑方案必须同时包含默认剪辑和 WTF 导演。".to_string());
-    }
-    let active_plan = plans
-        .iter()
-        .find(|plan| plan.mode == request.active_mode)
-        .ok_or_else(|| "找不到当前剪辑方案。".to_string())?;
-    let active_clips = active_plan.clips.clone();
-    let active_settings = active_plan.settings.clone();
+        preserved_wtf_slot(&previous)?
+    } else {
+        None
+    };
+    let (plan, active_duration_seconds) = build_edit_plan_slot(
+        request
+            .plans
+            .into_iter()
+            .next()
+            .expect("one highlight plan"),
+        &highlights,
+        &timeline,
+    )?;
+    let active_clips = plan.clips.clone();
+    let active_settings = plan.settings.clone();
     let selected_clip_count = active_clips.len();
 
     let document = EditPlanDocument {
@@ -649,8 +712,8 @@ fn save_edit_plan(
         source_sha256: manifest.source.sha256,
         job_id: request.job_id,
         active_mode: request.active_mode,
-        plans,
-        mode: "dual".to_string(),
+        plans: vec![plan],
+        mode: "highlight".to_string(),
         updated_unix_seconds: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| error.to_string())?
@@ -660,7 +723,11 @@ fn save_edit_plan(
     };
     let director_dir = job_dir.join("director");
     fs::create_dir_all(&director_dir).map_err(|error| error.to_string())?;
-    let output_path = director_dir.join("edit-plan.json");
+    let mut document = serde_json::to_value(document).map_err(|error| error.to_string())?;
+    if let Some(preserved) = preserved_wtf {
+        // Keep the old slot opaque: unknown future fields and stale candidates belong to its backup.
+        document["plans"].as_array_mut().unwrap().push(preserved);
+    }
     d2_highlights_core::write_json_pretty(&output_path, &document)
         .map_err(|error| format!("保存剪辑方案失败：{error}"))?;
 
@@ -668,6 +735,23 @@ fn save_edit_plan(
         selected_clip_count,
         total_duration_seconds: active_duration_seconds,
     })
+}
+
+fn preserved_wtf_slot(document: &serde_json::Value) -> Result<Option<serde_json::Value>, String> {
+    let schema = document["schema_version"].as_str().unwrap_or_default();
+    if !is_dual_edit_plan_schema(schema) && !LEGACY_EDIT_PLAN_SCHEMA_VERSIONS.contains(&schema) {
+        return Err("已保存草稿的版本不受支持，原文件已保留，请勿覆盖。".into());
+    }
+    let slots: Vec<_> = document["plans"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|slot| slot["mode"] == "wtf")
+        .collect();
+    if slots.len() > 1 {
+        return Err("已保存草稿包含重复的旧方案，原文件已保留。".into());
+    }
+    Ok(slots.first().map(|slot| (*slot).clone()))
 }
 
 fn build_edit_plan_slot(
@@ -705,13 +789,15 @@ fn build_edit_plan_slot(
         if !seen.insert(clip.clip_id.clone()) {
             return Err("剪辑方案包含重复的片段编号。".to_string());
         }
-        let Some(candidate) = highlights
+        let candidate = highlights
             .candidates
             .iter()
-            .find(|candidate| candidate.id == clip.candidate_id)
-        else {
+            .find(|candidate| candidate.id == clip.candidate_id);
+        if let Some(imported) = &clip.imported {
+            timestamp_import::validate_anchor(imported, &clip.candidate_id, timeline)?;
+        } else if candidate.is_none() {
             return Err(format!("找不到候选片段 {}。", clip.candidate_id));
-        };
+        }
         if !clip.source_start_seconds.is_finite()
             || !clip.source_end_seconds.is_finite()
             || clip.source_start_seconds < 0.0
@@ -748,8 +834,10 @@ fn build_edit_plan_slot(
         }
         if let Some(hero) = clip.view_hero.as_deref() {
             let valid_hero = if timeline.replay.players.is_empty() {
-                candidate.participants.iter().any(|value| value == hero)
-                    || candidate.primary_hero.as_deref() == Some(hero)
+                candidate.is_some_and(|c| {
+                    c.participants.iter().any(|value| value == hero)
+                        || c.primary_hero.as_deref() == Some(hero)
+                })
             } else {
                 timeline
                     .replay
@@ -771,6 +859,7 @@ fn build_edit_plan_slot(
         clips.push(EditPlanClip {
             clip_id: clip.clip_id,
             candidate_id: clip.candidate_id,
+            imported: clip.imported,
             view_hero: clip.view_hero,
             camera_mode: normalize_user_camera_mode(clip.camera_mode),
             take_group_id: clip.take_group_id,
@@ -901,37 +990,263 @@ fn get_edit_plan(
     }
     let path = state
         .jobs_root
-        .join(job_id)
+        .join(&job_id)
         .join("director")
         .join("edit-plan.json");
     if !path.is_file() {
         return Ok(None);
     }
+    load_highlight_plan_at(&path, &state.jobs_root.join(&job_id))
+}
 
-    let document = read_json::<EditPlanDocument>(&path)?;
+fn load_highlight_plan_at(path: &Path, job_dir: &Path) -> Result<Option<LoadedEditPlan>, String> {
+    let value: serde_json::Value = read_json(path)?;
+    if is_dual_edit_plan_schema(value["schema_version"].as_str().unwrap_or_default())
+        && value["plans"]
+            .as_array()
+            .is_some_and(|slots| !slots.iter().any(|slot| slot["mode"] == "default"))
+    {
+        return Ok(None);
+    }
+    let document = decode_highlight_document(value)?;
+    validate_imported_document(&document, job_dir)?;
     load_edit_plan(document)
         .map(Some)
         .ok_or_else(|| "已保存草稿的版本或结构不受支持，原文件已保留，请勿覆盖。".to_string())
 }
 
+fn decode_highlight_document(mut value: serde_json::Value) -> Result<EditPlanDocument, String> {
+    if is_dual_edit_plan_schema(value["schema_version"].as_str().unwrap_or_default()) {
+        let slots = value["plans"]
+            .as_array()
+            .ok_or("已保存草稿结构无效，原文件已保留。")?;
+        // Old creative drafts are retained on disk without loading their editing/runtime code.
+        value["plans"] = serde_json::Value::Array(
+            slots
+                .iter()
+                .filter(|slot| slot["mode"] == "default")
+                .cloned()
+                .collect(),
+        );
+        value["active_mode"] = serde_json::json!("default");
+        value["clips"] = serde_json::json!([]);
+    }
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+fn validate_imported_document(document: &EditPlanDocument, job_dir: &Path) -> Result<(), String> {
+    let imported: Vec<_> = document
+        .plans
+        .iter()
+        .filter(|p| p.mode == EditPlanMode::Default)
+        .flat_map(|p| &p.clips)
+        .chain(
+            document
+                .clips
+                .iter()
+                .filter(|_| !is_dual_edit_plan_schema(&document.schema_version)),
+        )
+        .filter(|c| c.imported.is_some())
+        .collect();
+    if imported.is_empty() {
+        return Ok(());
+    }
+    let timeline: TimelineDocument = read_json(&job_dir.join("timeline/combat-events.json"))?;
+    if document.source_sha256 != timeline.source_sha256 {
+        return Err("导入草稿与本局录像不一致，原文件已保留。".into());
+    }
+    for clip in imported {
+        timestamp_import::validate_anchor(
+            clip.imported.as_ref().unwrap(),
+            &clip.candidate_id,
+            &timeline,
+        )?;
+    }
+    Ok(())
+}
+
+/// Local file handoff for Codex; uses the same read-only analysis, validation and atomic draft writer as the UI.
+pub fn import_timestamp_file(
+    replay: &Path,
+    plan_path: &Path,
+    jobs_root: &Path,
+) -> Result<serde_json::Value, String> {
+    let summary = analyze_highlights_with_progress(replay, jobs_root, |_| {})
+        .map_err(|error| error.to_string())?;
+    let dir = jobs_root.join(&summary.job_id);
+    let manifest: JobManifest = read_json(&dir.join("manifest.json"))?;
+    let timeline: TimelineDocument = read_json(&dir.join("timeline/combat-events.json"))?;
+    let text = timestamp_import::read_text(plan_path)?;
+    let preview = timestamp_import::build_preview(
+        &text,
+        &plan_path.display().to_string(),
+        &manifest.source,
+        &timeline,
+        None,
+        None,
+    )?;
+    let mut receipt = append_timestamp_preview(jobs_root, &summary.job_id, preview)?;
+    receipt["analysisWarnings"] =
+        serde_json::to_value(summary.analysis_warnings).map_err(|error| error.to_string())?;
+    Ok(receipt)
+}
+
+fn append_timestamp_preview(
+    jobs_root: &Path,
+    job_id: &str,
+    preview: timestamp_import::Preview,
+) -> Result<serde_json::Value, String> {
+    if !valid_job_id(job_id) {
+        return Err("任务编号无效。".into());
+    }
+    let extended = preview.schema_version == "d2h.timestamp-plan/1.2";
+    let path = jobs_root.join(job_id).join("director/edit-plan.json");
+    let previous = if path.is_file() {
+        load_highlight_plan_at(&path, &jobs_root.join(job_id))?
+    } else {
+        None
+    };
+    let mut input: EditPlanSlotInput =
+        match previous.and_then(|loaded| loaded.plans.into_iter().next()) {
+            Some(slot) => serde_json::from_value(
+                serde_json::to_value(slot).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?,
+            None => EditPlanSlotInput {
+                mode: EditPlanMode::Default,
+                selected_hero: Some(preview.hero),
+                highlight_rule_ids: Vec::new(),
+                selected_clip_id: None,
+                source_story_id: None,
+                clips: Vec::new(),
+                settings: RenderSettings::default(),
+            },
+        };
+    let mut seen: HashSet<_> = input
+        .clips
+        .iter()
+        .filter_map(|clip| clip.imported.as_ref().map(|meta| meta.source_id.clone()))
+        .collect();
+    let mut added = Vec::new();
+    let mut corrected = Vec::new();
+    let mut updated = Vec::new();
+    let order: Vec<_> = preview
+        .clips
+        .iter()
+        .map(|clip| clip.imported.source_id.clone())
+        .collect();
+    for (index, clip) in preview.clips.into_iter().enumerate() {
+        if !seen.insert(clip.imported.source_id.clone()) {
+            if let Some(existing) = input.clips.iter_mut().find(|existing| {
+                existing
+                    .imported
+                    .as_ref()
+                    .is_some_and(|meta| meta.source_id == clip.imported.source_id)
+            }) {
+                if existing.view_hero.as_deref() != Some(clip.hero.as_str()) {
+                    corrected.push(existing.clip_id.clone());
+                    existing.view_hero = Some(clip.hero.clone());
+                }
+                if extended {
+                    existing.candidate_id = clip.id;
+                    existing.imported = Some(clip.imported);
+                    existing.view_hero = Some(clip.hero);
+                    existing.camera_mode = clip.camera_mode;
+                    existing.take_group_id = clip.take_group_id;
+                    existing.take_role = clip.take_role;
+                    existing.include_in_final = clip.include_in_final;
+                    existing.duration_mode = ClipDurationMode::Short;
+                    existing.story_pre_roll_seconds = 60.0;
+                    existing.short_source_start_seconds = clip.start_seconds;
+                    existing.short_source_end_seconds = clip.end_seconds;
+                    existing.source_start_seconds = clip.start_seconds;
+                    existing.source_end_seconds = clip.end_seconds;
+                    updated.push(existing.clip_id.clone());
+                }
+            }
+            continue;
+        }
+        let clip_id = format!("clip-time-{}", clip.imported.source_id);
+        added.push(clip_id.clone());
+        let insertion = order[index + 1..].iter().find_map(|source_id| {
+            input.clips.iter().position(|existing| {
+                existing
+                    .imported
+                    .as_ref()
+                    .is_some_and(|meta| &meta.source_id == source_id)
+            })
+        });
+        input.clips.insert(
+            insertion.unwrap_or(input.clips.len()),
+            EditPlanClipInput {
+                clip_id,
+                candidate_id: clip.id,
+                imported: Some(clip.imported),
+                view_hero: Some(clip.hero),
+                camera_mode: clip.camera_mode,
+                take_group_id: clip.take_group_id,
+                take_role: clip.take_role,
+                include_in_final: clip.include_in_final,
+                duration_mode: ClipDurationMode::Short,
+                story_pre_roll_seconds: 60.0,
+                short_source_start_seconds: clip.start_seconds,
+                short_source_end_seconds: clip.end_seconds,
+                source_start_seconds: clip.start_seconds,
+                source_end_seconds: clip.end_seconds,
+            },
+        );
+    }
+    if input.selected_clip_id.is_none() {
+        input.selected_clip_id = added.first().cloned();
+    }
+    let total_count = input.clips.len();
+    let saved = save_edit_plan_to(
+        jobs_root,
+        SaveEditPlanRequest {
+            job_id: job_id.into(),
+            active_mode: EditPlanMode::Default,
+            plans: vec![input],
+        },
+    )?;
+    Ok(
+        serde_json::json!({"jobId":job_id,"draftPath":path,"addedClipIds":added,
+        "correctedHeroClipIds":corrected,"updatedClipIds":updated,"totalClipCount":total_count,
+        "totalDurationSeconds":saved.total_duration_seconds,"module":"highlights"}),
+    )
+}
+
+#[tauri::command]
+fn get_startup_replay() -> Option<String> {
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--replay" {
+            return args.next().filter(|p| {
+                Path::new(p).is_file()
+                    && Path::new(p)
+                        .extension()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("dem"))
+            });
+        }
+    }
+    None
+}
+
 fn load_edit_plan(document: EditPlanDocument) -> Option<LoadedEditPlan> {
     if is_dual_edit_plan_schema(&document.schema_version) {
-        let has_default = document
+        let default_count = document
             .plans
             .iter()
-            .any(|plan| plan.mode == EditPlanMode::Default);
-        let has_wtf = document
-            .plans
-            .iter()
-            .any(|plan| plan.mode == EditPlanMode::Wtf);
-        if !has_default || !has_wtf || document.plans.len() != 2 {
+            .filter(|plan| plan.mode == EditPlanMode::Default)
+            .count();
+        if default_count != 1 {
             return None;
         }
         return Some(LoadedEditPlan {
-            active_mode: document.active_mode,
+            active_mode: EditPlanMode::Default,
             plans: document
                 .plans
                 .into_iter()
+                .filter(|plan| plan.mode == EditPlanMode::Default)
                 .map(load_edit_plan_slot)
                 .collect(),
         });
@@ -943,26 +1258,15 @@ fn load_edit_plan(document: EditPlanDocument) -> Option<LoadedEditPlan> {
     let selected_clip_id = document.clips.first().map(|clip| legacy_clip_id(clip, 0));
     Some(LoadedEditPlan {
         active_mode: EditPlanMode::Default,
-        plans: vec![
-            load_edit_plan_slot(EditPlanSlot {
-                mode: EditPlanMode::Default,
-                selected_hero: None,
-                highlight_rule_ids: Vec::new(),
-                selected_clip_id,
-                source_story_id: None,
-                clips: document.clips,
-                settings: document.settings,
-            }),
-            load_edit_plan_slot(EditPlanSlot {
-                mode: EditPlanMode::Wtf,
-                selected_hero: None,
-                highlight_rule_ids: Vec::new(),
-                selected_clip_id: None,
-                source_story_id: None,
-                clips: Vec::new(),
-                settings: RenderSettings::default(),
-            }),
-        ],
+        plans: vec![load_edit_plan_slot(EditPlanSlot {
+            mode: EditPlanMode::Default,
+            selected_hero: None,
+            highlight_rule_ids: Vec::new(),
+            selected_clip_id,
+            source_story_id: None,
+            clips: document.clips,
+            settings: document.settings,
+        })],
     })
 }
 
@@ -988,6 +1292,7 @@ fn load_edit_plan_slot(plan: EditPlanSlot) -> LoadedEditPlanSlot {
             .map(|(index, clip)| LoadedEditPlanClip {
                 clip_id: legacy_clip_id(&clip, index),
                 candidate_id: clip.candidate_id,
+                imported: clip.imported,
                 view_hero: clip.view_hero,
                 camera_mode: normalize_user_camera_mode(clip.camera_mode),
                 take_group_id: clip.take_group_id,
@@ -1012,6 +1317,7 @@ fn load_edit_plan_slot(plan: EditPlanSlot) -> LoadedEditPlanSlot {
 #[tauri::command]
 fn get_latest_render(
     job_id: String,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<RenderResult>, String> {
     if !valid_job_id(&job_id) {
@@ -1019,6 +1325,12 @@ fn get_latest_render(
     }
     let job_dir = state.jobs_root.join(&job_id);
     let output_dir = job_dir.join("output");
+    if let Some(result) = video_output::latest_highlight(&job_dir) {
+        app.asset_protocol_scope()
+            .allow_file(&result.output_path)
+            .map_err(|e| e.to_string())?;
+        return Ok(Some(result));
+    }
     if !output_dir.is_dir() {
         return Ok(None);
     }
@@ -1162,12 +1474,52 @@ async fn start_render(
     job_id: String,
     on_progress: Channel<RenderProgress>,
     resume_fingerprint: Option<String>,
+    output_directory: Option<String>,
+    app: AppHandle,
+    state: State<'_, AppState>,
+    desktop_module: State<'_, DesktopModule>,
+) -> Result<RenderResult, String> {
+    if *desktop_module != DesktopModule::Highlights {
+        return Err(
+            "请先交给高光剪辑，并在高光剪辑中确认开始录制。WTF模块不会直接启动游戏。".into(),
+        );
+    }
+    if !valid_job_id(&job_id) {
+        return Err("任务编号无效，请重新打开分析结果。".into());
+    }
+    // The renderer's own log starts after preflight. Keep a job-local attempt
+    // record as well, so validation and final delivery errors remain available.
+    let attempt = diagnostics::begin_attempt(&state.jobs_root, &job_id);
+    let result = start_render_inner(
+        job_id,
+        on_progress,
+        resume_fingerprint,
+        output_directory,
+        app,
+        state,
+    )
+    .await;
+    if let Some(attempt) = attempt {
+        attempt.finish(result.as_ref().err().map(String::as_str));
+    }
+    result
+}
+
+async fn start_render_inner(
+    job_id: String,
+    on_progress: Channel<RenderProgress>,
+    resume_fingerprint: Option<String>,
+    output_directory: Option<String>,
+    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RenderResult, String> {
     if !valid_job_id(&job_id) {
         return Err("任务编号无效，请重新打开分析结果。".to_string());
     }
     let lease = state.activities.begin(Activity::Render)?;
+    let output_directory = video_output::validate_directory(
+        output_directory.or_else(|| state.video_output.current()),
+    )?;
     let cancellation = register_render_cancellation(&state.activities, &state.render_runtime)?;
 
     let worker_state = state.inner().clone();
@@ -1181,6 +1533,14 @@ async fn start_render(
                 let _ = progress_channel.send(progress);
             })
             .map_err(|error| error.to_string())
+            .and_then(|result| {
+                video_output::deliver_highlight(
+                    &worker_state,
+                    &job_id,
+                    output_directory.as_deref(),
+                    result,
+                )
+            })
         });
         if let Err(error) = &result {
             let _ = progress_channel.send(RenderProgress {
@@ -1195,7 +1555,14 @@ async fn start_render(
         result.map_err(|error| error.to_string())
     })
     .await;
-    joined.map_err(|error| error.to_string())?
+    joined
+        .map_err(|error| error.to_string())?
+        .and_then(|result| {
+            app.asset_protocol_scope()
+                .allow_file(&result.output_path)
+                .map_err(|e| e.to_string())?;
+            Ok(result)
+        })
 }
 
 #[tauri::command]
@@ -1213,33 +1580,20 @@ fn cancel_render(state: State<'_, AppState>) -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn open_local_path(path: String, state: State<'_, AppState>) -> Result<(), String> {
+fn open_local_path(
+    path: String,
+    state: State<'_, AppState>,
+    exported: State<'_, diagnostics::ExportedPackages>,
+) -> Result<(), String> {
     let target = fs::canonicalize(PathBuf::from(path))
         .map_err(|_| "输出文件不存在，可能已被移动。".to_string())?;
     let jobs_root = fs::canonicalize(&state.jobs_root).map_err(|error| error.to_string())?;
-    if !target.starts_with(&jobs_root) {
+    if !target.starts_with(&jobs_root)
+        && !video_output::recorded_highlight_path(&jobs_root, &target)
+        && !exported.allows_directory(&target)
+    {
         return Err("只能打开猫猫任务目录中的输出文件。".to_string());
     }
-    open_output_path(&target)
-}
-
-fn resolve_exported_package(path: &Path, receipts: &HashSet<PathBuf>) -> Result<PathBuf, String> {
-    let target = fs::canonicalize(path).map_err(|_| "分析包目录不存在，可能已被移动。")?;
-    if !target.is_dir() || !receipts.contains(&target) {
-        return Err("只能打开本次应用已成功导出的分析包目录。".into());
-    }
-    Ok(target)
-}
-
-#[tauri::command]
-fn open_exported_analysis_package(path: String, state: State<'_, AppState>) -> Result<(), String> {
-    let target = {
-        let receipts = state
-            .exported_packages
-            .lock()
-            .map_err(|_| "导出记录不可用。")?;
-        resolve_exported_package(Path::new(&path), &receipts)?
-    };
     open_output_path(&target)
 }
 
@@ -1396,8 +1750,22 @@ fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest,
     let timeline =
         read_json::<TimelineDocument>(&job_dir.join("timeline").join("combat-events.json"))
             .map_err(|_| "回放时间轴不完整，请重新分析录像。".to_string())?;
-    let edit_plan = read_json::<EditPlanDocument>(&job_dir.join("director").join("edit-plan.json"))
-        .map_err(|_| "请先保存剪辑方案，再开始生成成片。".to_string())?;
+    let edit_plan = decode_highlight_document(
+        read_json(&job_dir.join("director/edit-plan.json"))
+            .map_err(|_| "请先保存剪辑方案，再开始生成成片。".to_string())?,
+    )?;
+    build_render_from_documents(job_id, state, manifest, timeline, highlights, edit_plan)
+}
+
+fn build_render_from_documents(
+    job_id: &str,
+    state: &AppState,
+    manifest: JobManifest,
+    timeline: TimelineDocument,
+    highlights: HighlightDocument,
+    edit_plan: EditPlanDocument,
+) -> Result<RenderRequest, String> {
+    let job_dir = state.jobs_root.join(job_id);
     if edit_plan.source_sha256 != manifest.source.sha256
         || timeline.source_sha256 != manifest.source.sha256
         || highlights.source_sha256 != manifest.source.sha256
@@ -1409,7 +1777,7 @@ fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest,
         let active_plan = edit_plan
             .plans
             .iter()
-            .find(|plan| plan.mode == edit_plan.active_mode)
+            .find(|plan| plan.mode == EditPlanMode::Default)
             .ok_or_else(|| "当前剪辑方案不存在，请重新保存。".to_string())?;
         if active_plan.clips.is_empty() {
             return Err("当前剪辑方案没有可导出的片段。".to_string());
@@ -1426,10 +1794,17 @@ fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest,
         let candidate = highlights
             .candidates
             .iter()
-            .find(|candidate| candidate.id == clip.candidate_id)
-            .ok_or_else(|| format!("找不到候选片段 {}。", clip.candidate_id))?;
+            .find(|candidate| candidate.id == clip.candidate_id);
+        let (anchor_seconds, anchor_tick) = if let Some(imported) = &clip.imported {
+            timestamp_import::validate_anchor(imported, &clip.candidate_id, &timeline)?;
+            (imported.anchor_seconds, imported.anchor_tick)
+        } else {
+            let candidate =
+                candidate.ok_or_else(|| format!("找不到候选片段 {}。", clip.candidate_id))?;
+            (candidate.peak_seconds, candidate.anchor_tick)
+        };
         let inset = ((clip.source_end_seconds - clip.source_start_seconds) * 0.1).min(0.25);
-        let style_peak = candidate.peak_seconds.clamp(
+        let style_peak = anchor_seconds.clamp(
             clip.source_start_seconds + inset,
             clip.source_end_seconds - inset,
         );
@@ -1439,7 +1814,7 @@ fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest,
             view_hero: clip
                 .view_hero
                 .clone()
-                .or_else(|| candidate.primary_hero.clone()),
+                .or_else(|| candidate.and_then(|c| c.primary_hero.clone())),
             camera_mode: normalize_user_camera_mode(clip.camera_mode.clone()),
             take_group_id: clip.take_group_id.clone(),
             take_role: clip.take_role,
@@ -1447,8 +1822,8 @@ fn build_render_request(job_id: &str, state: &AppState) -> Result<RenderRequest,
             source_start_seconds: clip.source_start_seconds,
             source_peak_seconds: style_peak,
             source_end_seconds: clip.source_end_seconds,
-            anchor_seconds: candidate.peak_seconds,
-            anchor_tick: candidate.anchor_tick,
+            anchor_seconds,
+            anchor_tick,
         });
     }
 
@@ -1778,32 +2153,24 @@ fn project_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn resolve_analysis_export_directory(executable_dir: &Path) -> PathBuf {
-    let portable_root = executable_dir.ancestors().find(|candidate| {
-        candidate.join("jobs").is_dir()
-            && (candidate.join("Cargo.toml").is_file() || candidate.join("release").is_dir())
-    });
-    let app_root = portable_root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| executable_dir.to_path_buf());
-
-    if let Some(parent) = app_root.parent() {
-        let video_project_inbox = parent.join("dota2视频剪辑").join("assets").join("incoming");
-        if video_project_inbox.is_dir() {
-            return video_project_inbox;
-        }
-    }
-
-    app_root
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    run_with_module(DesktopModule::Highlights);
+}
+
+/// Independent entry point: its own process and jobs, sharing only infrastructure.
+pub fn run_wtf() {
+    run_with_module(DesktopModule::Wtf);
+}
+
+fn run_with_module(module: DesktopModule) {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(PendingUpdate::default())
-        .setup(|app| {
+        .manage(diagnostics::ExportedPackages::default())
+        .manage(module)
+        .setup(move |app| {
             let root = project_root();
             let executable_dir = env::current_exe()
                 .ok()
@@ -1811,21 +2178,27 @@ pub fn run() {
                 .unwrap_or_else(|| root.clone());
             let resource_dir = app.path().resource_dir()?;
             let app_local_data_dir = app.path().app_local_data_dir()?;
-            let jobs_root =
-                if let Some(configured_root) = env::var_os("D2H_PROJECT_ROOT").map(PathBuf::from) {
-                    configured_root.join("jobs")
-                } else if executable_dir.join("Cargo.toml").is_file()
-                    || executable_dir.join("jobs").is_dir()
-                {
-                    executable_dir.join("jobs")
-                } else if cfg!(debug_assertions) {
-                    root.join("jobs")
-                } else {
-                    app_local_data_dir.join("jobs")
-                };
+            let jobs_root = if module == DesktopModule::Wtf {
+                app_local_data_dir.join("wtf").join("jobs")
+            } else if let Some(configured_root) = env::var_os("D2H_PROJECT_ROOT").map(PathBuf::from)
+            {
+                configured_root.join("jobs")
+            } else if executable_dir.join("Cargo.toml").is_file()
+                || executable_dir.join("jobs").is_dir()
+            {
+                executable_dir.join("jobs")
+            } else if cfg!(debug_assertions) {
+                root.join("jobs")
+            } else {
+                app_local_data_dir.join("jobs")
+            };
             fs::create_dir_all(&jobs_root)?;
             fs::create_dir_all(&app_local_data_dir)?;
-            let analysis_export_directory = resolve_analysis_export_directory(&executable_dir);
+            if module == DesktopModule::Wtf
+                && let Some(window) = app.get_webview_window("main")
+            {
+                window.set_title("WTF 剪辑")?;
+            }
             app.asset_protocol_scope()
                 .allow_directory(&jobs_root, true)?;
             let ffmpeg_exe = find_media_tool(
@@ -1845,34 +2218,45 @@ pub fn run() {
             let dota2_settings_path = app_local_data_dir.join(DOTA2_SETTINGS_FILE);
             app.manage(AppState {
                 jobs_root,
-                analysis_export_directory,
                 dota2_runtime: Arc::new(Mutex::new(resolve_dota2_runtime(&dota2_settings_path))),
                 dota2_settings_path,
+                video_output: video_output::Settings::load(
+                    app_local_data_dir.join(video_output::FILE),
+                ),
                 ffmpeg_exe,
                 ffprobe_exe,
                 render_runtime: Arc::new(Mutex::new(RenderRuntime::default())),
                 activities: Activities::default(),
-                exported_packages: Arc::new(Mutex::new(HashSet::new())),
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_desktop_module,
+            wtf::analyze_wtf_dem,
+            wtf::get_wtf_draft,
+            wtf::save_wtf_draft,
+            wtf::export_wtf_plan,
+            wtf::handoff_wtf_plan,
             get_capabilities,
+            get_startup_replay,
             set_dota2_executable,
+            video_output::set_video_output_directory,
             resolve_replay_by_id,
+            replay_library::list_replays,
+            external_modules::open_external_tool,
             get_recent_jobs,
             analyze_dem,
-            export_replay_analysis_package,
             save_edit_plan,
+            preview_timestamp_plan,
             get_edit_plan,
             get_latest_render,
             get_render_resume,
+            diagnostics::export_render_diagnostics,
             cache_cleanup::inspect_render_cache,
             cache_cleanup::clean_render_cache,
             start_render,
             cancel_render,
             open_local_path,
-            open_exported_analysis_package,
             close_app_after_cleanup,
             check_for_app_update,
             install_app_update
@@ -1900,6 +2284,8 @@ pub fn run() {
 }
 
 #[cfg(test)]
+mod highlight_plan_tests;
+#[cfg(test)]
 mod resume_tests;
 
 #[cfg(test)]
@@ -1909,9 +2295,8 @@ mod tests {
         Dota2PathSource, EDIT_PLAN_SCHEMA_VERSION, EditPlanClip, EditPlanDocument, EditPlanMode,
         EditPlanSlot, archive_edit_plan_for_reanalysis, configured_dota2_runtime, load_edit_plan,
         manual_render_settings, mark_job_recent, normalize_user_camera_mode, persist_dota2_path,
-        replay_directory_from_dota2, resolve_analysis_export_directory, resolve_replay_by_id,
-        sanitize_update_notes, valid_clip_id, valid_job_id, valid_replay_id,
-        validate_dota2_executable, validate_edit_plan_take_groups,
+        replay_directory_from_dota2, resolve_replay_by_id, sanitize_update_notes, valid_clip_id,
+        valid_job_id, valid_replay_id, validate_dota2_executable, validate_edit_plan_take_groups,
     };
     use d2_highlights_renderer::{
         BgmMode, CameraStyle, ClipCameraMode, RenderSettings, RenderTakeRole,
@@ -1965,25 +2350,7 @@ mod tests {
     }
 
     #[test]
-    fn external_open_requires_exact_successful_package_receipt() {
-        let root = tempdir().unwrap();
-        let exported = root.path().join("exported-package");
-        let other = root.path().join("unrelated");
-        fs::create_dir_all(exported.join("nested")).unwrap();
-        fs::create_dir(&other).unwrap();
-        let canonical = fs::canonicalize(&exported).unwrap();
-        let receipts = std::collections::HashSet::from([canonical.clone()]);
-        assert_eq!(
-            super::resolve_exported_package(&exported, &receipts).unwrap(),
-            canonical
-        );
-        assert!(super::resolve_exported_package(&other, &receipts).is_err());
-        assert!(super::resolve_exported_package(&exported.join("nested"), &receipts).is_err());
-        assert!(super::resolve_exported_package(&root.path().join("missing"), &receipts).is_err());
-    }
-
-    #[test]
-    fn empty_dual_drafts_round_trip_without_render_requirements() {
+    fn old_dual_drafts_load_only_the_highlight_workspace() {
         let value = serde_json::json!({
             "schema_version": EDIT_PLAN_SCHEMA_VERSION,
             "source_sha256": "source",
@@ -1998,14 +2365,14 @@ mod tests {
         });
         let document: EditPlanDocument = serde_json::from_value(value).unwrap();
         let loaded = load_edit_plan(document).unwrap();
-        assert_eq!(loaded.plans.len(), 2);
+        assert_eq!(loaded.plans.len(), 1);
         assert!(loaded.plans.iter().all(|plan| plan.clips.is_empty()));
     }
 
     #[test]
     fn edit_plan_job_id_stays_inside_jobs_root() {
-        assert!(valid_job_id("d2h-0000000000000000"));
-        assert!(!valid_job_id("../d2h-0000000000000000"));
+        assert!(valid_job_id("d2h-ff5145119d7415b3"));
+        assert!(!valid_job_id("../d2h-ff5145119d7415b3"));
         assert!(!valid_job_id("d2h-.."));
         assert!(!valid_job_id("other-job"));
     }
@@ -2013,7 +2380,7 @@ mod tests {
     #[test]
     fn recent_job_activity_is_persisted_inside_the_job() {
         let root = tempdir().expect("create recent jobs root");
-        let job_id = "d2h-0000000000000000";
+        let job_id = "d2h-ff5145119d7415b3";
         fs::create_dir_all(root.path().join(job_id)).expect("create job directory");
 
         mark_job_recent(root.path(), job_id).expect("mark job recent");
@@ -2028,17 +2395,21 @@ mod tests {
     #[test]
     fn reanalysis_archives_the_existing_edit_plan_without_deleting_it() {
         let root = tempdir().expect("create jobs root");
-        let job_id = "d2h-0000000000000000";
+        let job_id = "d2h-ff5145119d7415b3";
         let director = root.path().join(job_id).join("director");
         fs::create_dir_all(&director).expect("create director directory");
-        fs::write(director.join("edit-plan.json"), b"saved plan").expect("write edit plan");
+        let saved = serde_json::to_vec(&serde_json::json!({
+            "schema_version": EDIT_PLAN_SCHEMA_VERSION, "plans": [{"mode":"default"}]
+        }))
+        .unwrap();
+        fs::write(director.join("edit-plan.json"), &saved).expect("write edit plan");
 
         let backup = archive_edit_plan_for_reanalysis(root.path(), job_id)
             .expect("archive edit plan")
             .expect("backup path");
 
         assert!(!director.join("edit-plan.json").exists());
-        assert_eq!(fs::read(backup).expect("read backup"), b"saved plan");
+        assert_eq!(fs::read(backup).expect("read backup"), saved);
         assert!(
             archive_edit_plan_for_reanalysis(root.path(), job_id)
                 .expect("archive absent plan")
@@ -2057,11 +2428,11 @@ mod tests {
 
     #[test]
     fn replay_ids_are_digits_only_and_path_safe() {
-        assert!(valid_replay_id("1000000001"));
+        assert!(valid_replay_id("1234567890"));
         assert!(valid_replay_id("1"));
         assert!(!valid_replay_id(""));
-        assert!(!valid_replay_id("1000000001.dem"));
-        assert!(!valid_replay_id("../1000000001"));
+        assert!(!valid_replay_id("1234567890.dem"));
+        assert!(!valid_replay_id("../1234567890"));
         assert!(!valid_replay_id("123456789012345678901"));
     }
 
@@ -2080,40 +2451,6 @@ mod tests {
         assert_eq!(
             replay_directory_from_dota2(&path),
             Some(game_directory.join("dota").join("replays"))
-        );
-    }
-
-    #[test]
-    fn analysis_export_prefers_video_project_then_highlight_root() {
-        let workspace = tempdir().expect("create workspace");
-        let highlight_root = workspace.path().join("dota2高光时刻");
-        let candidate_dir = highlight_root
-            .join("release")
-            .join("candidate")
-            .join("1.9.8");
-        let jobs_root = highlight_root.join("jobs");
-        fs::create_dir_all(&candidate_dir).expect("create candidate directory");
-        fs::create_dir_all(&jobs_root).expect("create jobs directory");
-
-        assert_eq!(
-            resolve_analysis_export_directory(&candidate_dir),
-            highlight_root
-        );
-
-        let incoming = workspace
-            .path()
-            .join("dota2视频剪辑")
-            .join("assets")
-            .join("incoming");
-        fs::create_dir_all(&incoming).expect("create video project inbox");
-        assert_eq!(resolve_analysis_export_directory(&candidate_dir), incoming);
-
-        let installed_workspace = tempdir().expect("create installed workspace");
-        let installed_dir = installed_workspace.path().join("installed-app");
-        fs::create_dir_all(&installed_dir).expect("create installed app directory");
-        assert_eq!(
-            resolve_analysis_export_directory(&installed_dir),
-            installed_dir
         );
     }
 
@@ -2156,17 +2493,17 @@ mod tests {
     #[test]
     fn replay_lookup_finds_a_valid_source2_dem() {
         let directory = tempdir().expect("create replay directory");
-        let replay_path = directory.path().join("1000000001.dem");
+        let replay_path = directory.path().join("1234567890.dem");
         let mut replay = fs::File::create(&replay_path).expect("create replay");
         replay.write_all(b"PBDEMS2\0fixture").expect("write replay");
 
         let result = resolve_replay_by_id(
             directory.path().display().to_string(),
-            "1000000001".to_string(),
+            "1234567890".to_string(),
         )
         .expect("resolve replay");
 
-        assert_eq!(result.replay_id, "1000000001");
+        assert_eq!(result.replay_id, "1234567890");
         assert_eq!(Path::new(&result.path), replay_path);
     }
 
@@ -2175,10 +2512,10 @@ mod tests {
         let directory = tempdir().expect("create replay directory");
         let error = resolve_replay_by_id(
             directory.path().display().to_string(),
-            "1000000002".to_string(),
+            "1234567891".to_string(),
         )
         .expect_err("missing replay must fail");
-        assert!(error.contains("1000000002.dem"));
+        assert!(error.contains("1234567891.dem"));
     }
 
     #[test]
@@ -2290,11 +2627,9 @@ mod tests {
         let loaded = load_edit_plan(legacy).expect("legacy plan should migrate");
 
         assert_eq!(loaded.active_mode, EditPlanMode::Default);
-        assert_eq!(loaded.plans.len(), 2);
+        assert_eq!(loaded.plans.len(), 1);
         assert_eq!(loaded.plans[0].mode, EditPlanMode::Default);
         assert_eq!(loaded.plans[0].clips.len(), 1);
-        assert_eq!(loaded.plans[1].mode, EditPlanMode::Wtf);
-        assert!(loaded.plans[1].clips.is_empty());
     }
 
     #[test]
@@ -2336,7 +2671,7 @@ mod tests {
     }
 
     #[test]
-    fn dual_edit_plan_preserves_active_mode_and_both_slots() {
+    fn old_dual_edit_plan_always_opens_the_highlight_slot() {
         let document = EditPlanDocument {
             schema_version: EDIT_PLAN_SCHEMA_VERSION.to_string(),
             source_sha256: "source".to_string(),
@@ -2382,14 +2717,9 @@ mod tests {
 
         let loaded = load_edit_plan(document).expect("dual plan should load");
 
-        assert_eq!(loaded.active_mode, EditPlanMode::Wtf);
-        assert_eq!(loaded.plans.len(), 2);
+        assert_eq!(loaded.active_mode, EditPlanMode::Default);
+        assert_eq!(loaded.plans.len(), 1);
         assert_eq!(loaded.plans[0].clips[0].clip_id, "clip-default");
-        assert_eq!(loaded.plans[1].clips[0].clip_id, "clip-wtf");
-        assert_eq!(
-            loaded.plans[1].source_story_id.as_deref(),
-            Some("story-001")
-        );
     }
 
     fn paired_clip(
@@ -2402,6 +2732,7 @@ mod tests {
         EditPlanClip {
             clip_id: clip_id.to_string(),
             candidate_id: "hk-001".to_string(),
+            imported: None,
             view_hero: Some("npc_dota_hero_mirana".to_string()),
             camera_mode: if take_role == RenderTakeRole::Primary {
                 ClipCameraMode::PlayerPerspective

@@ -78,6 +78,8 @@ pub enum ReplayControlError {
     CommandTooLong(usize),
     #[error("VConsole probe timed out before the echo marker was observed")]
     MarkerTimeout,
+    #[error("VConsole session lost synchronization; commands will not be resent")]
+    SessionUnavailable,
     #[error("VConsole reported a command failure: {0}")]
     CommandFailed(String),
     #[error("VConsole response format is invalid: {0}")]
@@ -386,33 +388,7 @@ pub fn validate_command(command: &str) -> Result<(), ReplayControlError> {
 }
 
 pub fn probe_vconsole(timeout: Duration) -> Result<VConsoleProbeReport, ReplayControlError> {
-    let started = Instant::now();
-    let mut stream = connect_vconsole(timeout)?;
-
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ReplayControlError::Clock)?
-        .as_nanos();
-    let marker = format!("D2H_VCONSOLE_PROBE_{nonce}");
-    stream.write_all(&build_cmnd_packet(&format!("echo {marker}"))?)?;
-
-    let marker_result = wait_for_marker(
-        &mut stream,
-        &marker,
-        None,
-        timeout,
-        started,
-        &mut ConsoleDecoder::default(),
-    )?;
-    Ok(VConsoleProbeReport {
-        host: Ipv4Addr::LOCALHOST.to_string(),
-        port: VCONSOLE_PORT,
-        connected: true,
-        marker_seen: true,
-        read_chunks: marker_result.read_chunks,
-        bytes_received: marker_result.bytes_received,
-        elapsed_milliseconds: started.elapsed().as_millis(),
-    })
+    VConsoleSession::connect(timeout)?.probe(timeout)
 }
 
 pub fn execute_vconsole_commands(
@@ -422,47 +398,197 @@ pub fn execute_vconsole_commands(
     for command in commands {
         validate_command(command)?;
     }
+    VConsoleSession::connect(timeout)?.execute(commands, timeout)
+}
 
-    let started = Instant::now();
-    let mut stream = connect_vconsole(timeout)?;
-    let mut decoder = ConsoleDecoder::default();
-    let initial_bytes_drained =
-        drain_initial_stream(&mut stream, Duration::from_secs(2), &mut decoder)?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| ReplayControlError::Clock)?
-        .as_nanos();
-    let marker = format!("D2H_VCONSOLE_ACK_{nonce}");
-    let start_marker = format!("D2H_VCONSOLE_BEGIN_{nonce}");
-    stream.write_all(&build_cmnd_packet(&format!("echo {start_marker}"))?)?;
-    for command in commands {
-        stream.write_all(&build_cmnd_packet(command)?)?;
-    }
-    stream.write_all(&build_cmnd_packet(&format!("echo {marker}"))?)?;
-    let marker_result = wait_for_marker(
-        &mut stream,
-        &marker,
-        Some(&start_marker),
-        timeout,
-        started,
-        &mut decoder,
-    )?;
+/// One connection owned by one offline client. Keep this alive until that
+/// client exits, avoiding repeated engine connection teardown while recording.
+/// A failed transaction must never be silently replayed.
+pub struct VConsoleSession {
+    stream: TcpStream,
+    decoder: ConsoleDecoder,
+    probe_marker: Option<String>,
+    failed: bool,
+}
 
-    let mut console_excerpt = marker_result.console_lines;
-    reject_console_errors(commands, &console_excerpt)?;
-    if console_excerpt.len() > 80 {
-        console_excerpt.drain(..console_excerpt.len() - 80);
+impl VConsoleSession {
+    pub fn connect(timeout: Duration) -> Result<Self, ReplayControlError> {
+        Ok(Self::from_stream(connect_vconsole(timeout)?))
     }
-    Ok(VConsoleExecutionReport {
-        host: Ipv4Addr::LOCALHOST.to_string(),
-        port: VCONSOLE_PORT,
-        commands: commands.to_vec(),
-        acknowledged: true,
-        initial_bytes_drained,
-        response_bytes_received: marker_result.bytes_received,
-        console_excerpt,
-        elapsed_milliseconds: started.elapsed().as_millis(),
-    })
+
+    fn from_stream(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            decoder: ConsoleDecoder::default(),
+            probe_marker: None,
+            failed: false,
+        }
+    }
+
+    fn ensure_usable(&self) -> Result<(), ReplayControlError> {
+        if self.failed {
+            Err(ReplayControlError::SessionUnavailable)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A short handshake wait may expire while the game initializes. Retry the
+    /// wait on this socket, with the same marker and partial frame buffer.
+    pub fn probe(&mut self, timeout: Duration) -> Result<VConsoleProbeReport, ReplayControlError> {
+        self.ensure_usable()?;
+        let started = Instant::now();
+        let result = (|| {
+            if self.probe_marker.is_none() {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| ReplayControlError::Clock)?
+                    .as_nanos();
+                let marker = format!("D2H_VCONSOLE_PROBE_{nonce}");
+                self.stream
+                    .write_all(&build_cmnd_packet(&format!("echo {marker}"))?)?;
+                self.probe_marker = Some(marker);
+            }
+            let marker = self.probe_marker.as_deref().expect("probe marker was sent");
+            let read = wait_for_marker(
+                &mut self.stream,
+                marker,
+                None,
+                timeout,
+                started,
+                &mut self.decoder,
+            )?;
+            Ok(VConsoleProbeReport {
+                host: Ipv4Addr::LOCALHOST.to_string(),
+                port: VCONSOLE_PORT,
+                connected: true,
+                marker_seen: true,
+                read_chunks: read.read_chunks,
+                bytes_received: read.bytes_received,
+                elapsed_milliseconds: started.elapsed().as_millis(),
+            })
+        })();
+        if result
+            .as_ref()
+            .is_err_and(|e| !matches!(e, ReplayControlError::MarkerTimeout))
+        {
+            self.failed = true;
+        }
+        result
+    }
+
+    pub fn execute(
+        &mut self,
+        commands: &[String],
+        timeout: Duration,
+    ) -> Result<VConsoleExecutionReport, ReplayControlError> {
+        self.ensure_usable()?;
+        for command in commands {
+            validate_command(command)?;
+        }
+        let result = self.execute_inner(commands, timeout);
+        if result
+            .as_ref()
+            .is_err_and(|e| !matches!(e, ReplayControlError::CommandFailed(_)))
+        {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn execute_inner(
+        &mut self,
+        commands: &[String],
+        timeout: Duration,
+    ) -> Result<VConsoleExecutionReport, ReplayControlError> {
+        let started = Instant::now();
+        self.stream.set_write_timeout(Some(timeout))?;
+        let initial_bytes_drained =
+            drain_initial_stream(&mut self.stream, Duration::from_secs(2), &mut self.decoder)?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ReplayControlError::Clock)?
+            .as_nanos();
+        let marker = format!("D2H_VCONSOLE_ACK_{nonce}");
+        let start_marker = format!("D2H_VCONSOLE_BEGIN_{nonce}");
+        self.stream
+            .write_all(&build_cmnd_packet(&format!("echo {start_marker}"))?)?;
+        for command in commands {
+            self.stream.write_all(&build_cmnd_packet(command)?)?;
+        }
+        self.stream
+            .write_all(&build_cmnd_packet(&format!("echo {marker}"))?)?;
+        let marker_result = wait_for_marker(
+            &mut self.stream,
+            &marker,
+            Some(&start_marker),
+            timeout,
+            started,
+            &mut self.decoder,
+        )?;
+
+        let mut console_excerpt = marker_result.console_lines;
+        reject_console_errors(commands, &console_excerpt)?;
+        if console_excerpt.len() > 80 {
+            console_excerpt.drain(..console_excerpt.len() - 80);
+        }
+        Ok(VConsoleExecutionReport {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port: VCONSOLE_PORT,
+            commands: commands.to_vec(),
+            acknowledged: true,
+            initial_bytes_drained,
+            response_bytes_received: marker_result.bytes_received,
+            console_excerpt,
+            elapsed_milliseconds: started.elapsed().as_millis(),
+        })
+    }
+
+    /// Drain unsolicited console traffic during long capture waits without
+    /// blocking frame collection or retaining unrelated console contents.
+    pub fn drain_pending(&mut self) -> Result<(), ReplayControlError> {
+        self.ensure_usable()?;
+        let result = (|| {
+            self.stream.set_nonblocking(true)?;
+            let read: Result<(), ReplayControlError> = (|| {
+                let started = Instant::now();
+                let mut bytes = [0_u8; 16 * 1024];
+                while started.elapsed() < Duration::from_millis(5) {
+                    match self.stream.read(&mut bytes) {
+                        Ok(0) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "VConsole peer closed the session",
+                            )
+                            .into());
+                        }
+                        Ok(n) => {
+                            self.decoder.push(&bytes[..n])?;
+                        }
+                        Err(e)
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Ok(())
+            })();
+            // Restore blocking reads even if decoding failed.
+            let reset = self.stream.set_nonblocking(false);
+            read?;
+            reset?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
 }
 
 fn reject_console_errors(commands: &[String], lines: &[String]) -> Result<(), ReplayControlError> {
@@ -590,7 +716,13 @@ fn wait_for_marker(
     let mut chunk = vec![0_u8; 16 * 1024];
     while started.elapsed() < timeout {
         let count = match stream.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "VConsole peer closed the session before acknowledgement",
+                )
+                .into());
+            }
             Ok(count) => count,
             Err(error)
                 if matches!(
@@ -860,6 +992,195 @@ mod tests {
         (TcpStream::connect(address).unwrap(), server)
     }
 
+    fn read_fixture_command(socket: &mut TcpStream) -> String {
+        let mut header = [0_u8; 12];
+        socket.read_exact(&mut header).unwrap();
+        assert_eq!(&header[..4], b"CMND");
+        let len = u32::from_be_bytes(header[6..10].try_into().unwrap()) as usize;
+        let mut body = vec![0; len - 12];
+        socket.read_exact(&mut body).unwrap();
+        assert_eq!(body.pop(), Some(0));
+        String::from_utf8(body).unwrap()
+    }
+
+    #[test]
+    fn session_reuses_handshake_socket_after_timeout_and_across_commands() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, resume) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            drop(listener); // Any attempted reconnect must fail this fixture.
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let probe = read_fixture_command(&mut socket);
+            assert!(probe.starts_with("echo D2H_VCONSOLE_PROBE_"));
+            let packet = console_packet(b"PRNT", probe.strip_prefix("echo ").unwrap());
+            socket.write_all(&packet[..18]).unwrap();
+            resume.recv_timeout(Duration::from_secs(3)).unwrap();
+            socket.write_all(&packet[18..]).unwrap();
+            let mut actions = Vec::new();
+            for _ in 0..6 {
+                let command = read_fixture_command(&mut socket);
+                if let Some(text) = command.strip_prefix("echo ") {
+                    socket.write_all(&console_packet(b"PRNT", text)).unwrap();
+                } else {
+                    actions.push(command);
+                    socket
+                        .write_all(&console_packet(
+                            b"PRNT",
+                            "Currently playing 9000 of 30000 ticks.",
+                        ))
+                        .unwrap();
+                }
+            }
+            actions
+        });
+        let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let mut session = VConsoleSession::from_stream(socket);
+        assert!(matches!(
+            session.probe(Duration::from_millis(40)),
+            Err(ReplayControlError::MarkerTimeout)
+        ));
+        release.send(()).unwrap();
+        assert!(session.probe(Duration::from_secs(1)).unwrap().marker_seen);
+        for command in ["demo_goto", "demo_pause"] {
+            let report = session
+                .execute(&[command.into()], Duration::from_secs(1))
+                .unwrap();
+            assert!(report.acknowledged);
+            assert_eq!(
+                report.console_excerpt,
+                ["Currently playing 9000 of 30000 ticks."]
+            );
+        }
+        assert_eq!(server.join().unwrap(), ["demo_goto", "demo_pause"]);
+    }
+
+    #[test]
+    fn session_probe_stops_when_peer_closes_instead_of_retrying_handshake() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let probe = read_fixture_command(&mut socket);
+            assert!(probe.starts_with("echo D2H_VCONSOLE_PROBE_"));
+            // Closing without a reply is a broken session, not slow startup.
+        });
+        let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let mut session = VConsoleSession::from_stream(socket);
+        assert!(matches!(
+            session.probe(Duration::from_secs(1)),
+            Err(ReplayControlError::Io(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        assert!(matches!(
+            session.probe(Duration::from_secs(1)),
+            Err(ReplayControlError::SessionUnavailable)
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn session_never_resends_a_command_after_missing_acknowledgement() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            drop(listener);
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let begin = read_fixture_command(&mut socket);
+            socket
+                .write_all(&console_packet(
+                    b"PRNT",
+                    begin.strip_prefix("echo ").unwrap(),
+                ))
+                .unwrap();
+            let action = read_fixture_command(&mut socket);
+            let _ack = read_fixture_command(&mut socket); // Deliberately never acknowledged.
+            let mut extra = [0_u8; 1];
+            assert_eq!(
+                socket.read(&mut extra).unwrap(),
+                0,
+                "No retry or cleanup command may be sent on an ambiguous transaction"
+            );
+            action
+        });
+        let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let mut session = VConsoleSession::from_stream(socket);
+        let commands = ["startmovie fixture jpg wav framerate 60".into()];
+        assert!(matches!(
+            session.execute(&commands, Duration::from_millis(80)),
+            Err(ReplayControlError::MarkerTimeout)
+        ));
+        assert!(matches!(
+            session.execute(&commands, Duration::from_secs(1)),
+            Err(ReplayControlError::SessionUnavailable)
+        ));
+        drop(session);
+        assert_eq!(server.join().unwrap(), commands[0]);
+    }
+
+    #[test]
+    fn session_idle_drain_preserves_partial_frames_and_discards_stale_feedback() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, initial) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let idle = console_packet(b"PRNT", "Currently playing 100 of 30000 ticks.");
+            socket.write_all(&idle[..10]).unwrap();
+            sent.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(3)).unwrap();
+            socket.write_all(&idle[10..]).unwrap();
+            for _ in 0..3 {
+                let command = read_fixture_command(&mut socket);
+                let text = command
+                    .strip_prefix("echo ")
+                    .unwrap_or("Currently playing 9000 of 30000 ticks.");
+                socket.write_all(&console_packet(b"PRNT", text)).unwrap();
+            }
+        });
+        let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        let mut session = VConsoleSession::from_stream(socket);
+        initial.recv_timeout(Duration::from_secs(3)).unwrap();
+        session.drain_pending().unwrap();
+        assert_eq!(session.decoder.pending.len(), 10);
+        release.send(()).unwrap();
+        let report = session
+            .execute(&["demo_goto".into()], Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            report.console_excerpt,
+            ["Currently playing 9000 of 30000 ticks."]
+        );
+        server.join().unwrap();
+        assert!(session.drain_pending().is_err());
+        assert!(matches!(
+            session.execute(&["demo_pause".into()], Duration::from_secs(1)),
+            Err(ReplayControlError::SessionUnavailable)
+        ));
+    }
+
     #[test]
     fn response_window_excludes_stale_ticks_and_waits_for_print_ack() {
         let mut wire = console_packet(b"PRNT", "Currently playing 100 of 30000 ticks.");
@@ -909,7 +1230,13 @@ mod tests {
             &mut ConsoleDecoder::default(),
         );
         server.join().unwrap();
-        assert!(matches!(result, Err(ReplayControlError::MarkerTimeout)));
+        // This fixture closes after the fake echoes. Neither is an ACK, so
+        // the observed EOF must remain a failure rather than a success.
+        assert!(matches!(
+            result,
+            Err(ReplayControlError::Io(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
     }
 
     #[test]

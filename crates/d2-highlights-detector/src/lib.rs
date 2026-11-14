@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const DETECTOR_NAME: &str = "rules-v2";
 pub const DETECTOR_VERSION: &str = "0.6.1";
+pub const HERO_KILLS_DETECTOR_NAME: &str = "rules-v2/hero-kills";
 const CLUSTER_GAP_SECONDS: f32 = 18.0;
 const SETUP_SECONDS: f32 = 12.0;
 const RESULT_SECONDS: f32 = 8.0;
@@ -29,6 +30,25 @@ const REPEATED_INTERACTION_BONUS: f32 = 140.0;
 const BUYBACK_DIEBACK_MAX_SECONDS: f32 = 90.0;
 const BUYBACK_DIEBACK_SETUP_SECONDS: f32 = 2.0;
 const BUYBACK_DIEBACK_RESULT_SECONDS: f32 = 4.0;
+
+/// The recorder only needs the original per-hero kill sequences. Keep their
+/// grouping, time boundaries and sequential IDs identical to the full detector.
+pub fn detect_hero_kill_highlights(timeline: &TimelineDocument) -> HighlightDocument {
+    let mut candidates = hero_kill_sequence_candidates(timeline);
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        candidate.rank = index + 1;
+        candidate.id = format!("hk-{:03}", index + 1);
+    }
+    HighlightDocument {
+        schema_version: HIGHLIGHT_SCHEMA_VERSION.to_string(),
+        source_sha256: timeline.source_sha256.clone(),
+        detector: DetectorIdentity {
+            name: HERO_KILLS_DETECTOR_NAME.to_string(),
+            version: DETECTOR_VERSION.to_string(),
+        },
+        candidates,
+    }
+}
 
 pub fn detect_highlights(
     timeline: &TimelineDocument,
@@ -1218,6 +1238,16 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(sequences.len(), 2);
+        let mut expected = sequences
+            .iter()
+            .map(|candidate| (*candidate).clone())
+            .collect::<Vec<_>>();
+        for (index, candidate) in expected.iter_mut().enumerate() {
+            candidate.rank = index + 1;
+        }
+        let recorder = detect_hero_kill_highlights(&replay);
+        assert_eq!(recorder.candidates, expected);
+        assert_eq!(recorder.detector.name, HERO_KILLS_DETECTOR_NAME);
         assert_eq!(
             sequences[0].primary_hero.as_deref(),
             Some("npc_dota_hero_mirana")

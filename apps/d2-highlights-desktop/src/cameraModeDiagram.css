@@ -1,0 +1,98 @@
+.camera-mode-diagram {
+  margin: 12px 0 0;
+  padding: 9px 10px;
+  border: 1px solid #f3e2eb;
+  border-radius: 9px;
+  background: #fffbfd;
+}
+
+.camera-mode-diagram-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #6f5565;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.camera-mode-diagram-heading small {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.camera-mode-diagram svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin-top: 3px;
+  overflow: visible;
+}
+
+.camera-mode-diagram text {
+  fill: var(--muted);
+  font-family: inherit;
+  font-size: 10px;
+}
+
+.camera-mode-diagram .camera-diagram-ground {
+  fill: none;
+  stroke: #f2eaf0;
+  stroke-width: 1;
+}
+
+.camera-mode-diagram .camera-diagram-frame {
+  fill: #e9f6ff;
+  fill-opacity: 0.58;
+  stroke: #77bee9;
+  stroke-width: 1.5;
+}
+
+.camera-mode-diagram .camera-diagram-previous {
+  fill: none;
+  stroke: #d7d5df;
+  stroke-width: 1;
+  stroke-dasharray: 4 4;
+}
+
+.camera-mode-diagram .camera-diagram-center,
+.camera-mode-diagram .camera-diagram-follow,
+.camera-mode-diagram .camera-diagram-legend-frame {
+  fill: none;
+  stroke: #489dce;
+  stroke-width: 1.5;
+}
+
+.camera-mode-diagram .camera-diagram-hero-halo {
+  fill: #fff;
+  fill-opacity: 0.88;
+}
+
+.camera-mode-diagram .camera-diagram-hero,
+.camera-mode-diagram .camera-diagram-arrow {
+  fill: #f381a1;
+}
+
+.camera-mode-diagram .camera-diagram-motion {
+  fill: none;
+  stroke: #eeb0c1;
+  stroke-width: 2;
+  stroke-dasharray: 4 3;
+}
+
+.camera-mode-diagram .camera-diagram-frame-label,
+.camera-mode-diagram .camera-diagram-follow-label {
+  fill: #4588b3;
+}
+
+.camera-mode-diagram .camera-diagram-hero-label {
+  fill: #b75e7b;
+}
+
+.camera-mode-diagram figcaption {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}

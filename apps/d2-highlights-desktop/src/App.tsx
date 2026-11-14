@@ -1,5 +1,9 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { CacheCleanupPanel } from "./CacheCleanupPanel";
+import { VideoOutputLocation } from "./VideoOutputLocation";
+import { VideoOutputSetting } from "./VideoOutputSetting";
+import { ExternalToolDialog } from "./ExternalToolDialog";
+import { CameraModeDiagram } from "./CameraModeDiagram";
 import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { DraftWriter, EditorOperationGate } from "./editorSession";
@@ -22,6 +26,7 @@ import {
   Download,
   Eye,
   FileUp,
+  FileText,
   FileVideo2,
   Film,
   FolderOpen,
@@ -47,7 +52,6 @@ import {
   Square,
   Swords,
   Trash2,
-  Trees,
   UserRound,
   Video,
   X,
@@ -78,12 +82,10 @@ import {
   DEFAULT_HIGHLIGHT_RULE_IDS,
   HERO_KILL_RULE_ID,
   HIGHLIGHT_RULES,
-  VERIFIED_TREE_CUT_RULE_ID,
   filterHeroHighlightCandidates,
   formatHighlightRuleSelection,
   inferHighlightSelection,
   normalizeHighlightRuleIds,
-  parseHighlightRuleQuery,
 } from "./highlightRules";
 import type { HighlightRuleId } from "./highlightRules";
 import {
@@ -96,36 +98,40 @@ import {
 } from "./storyDuration";
 import type {
   AnalysisProgress,
-  AnalysisPackageExportResult,
   AnalysisSummary,
   Capabilities,
   ClipCameraMode,
   ClipDurationMode,
   EditPlanSlot,
-  EditorPlanMode,
   EditPlanClip,
   HighlightCandidate,
-  HighlightStory,
+  ImportedClip,
   LoadedEditPlan,
   RecentJob,
   ReplayLookupResult,
+  ReplayLibraryFile,
+  ReplayLibrarySnapshot,
   ReplayPlayer,
+  RenderDiagnosticArchive,
   RenderProgress,
   RenderResult,
   RenderResumeSummary,
   RenderSettings,
   SaveEditPlanResult,
   StageStatus,
-  StoryCategory,
   StoryTakeRole,
 } from "./types";
-import { preferredAnalysisExportDirectory } from "./analysisExportDirectory";
-import { presentRenderError } from "./renderError";
+import { presentRenderError, renderErrorReport } from "./renderError";
+import { RenderDiagnosticExporter } from "./diagnosticExport";
 import { resumeAction } from "./renderResume";
+import { canLaunchExternalTool, externalToolNotice } from "./externalTools";
+import type { ExternalToolId } from "./externalTools";
+import { displayReplayDirectory, formatReplayDownloadTime, rememberResolvedReplayDirectory, replayTimeDescription, ReplayLibraryRefresher } from "./replayLibrary";
+import "./replayLibrary.css";
 
 type View = "workbench" | "library";
 type TitlebarPanel = "notifications" | "settings" | null;
-type InspectorTab = "story" | "hero" | "edit" | "camera";
+type InspectorTab = "hero" | "edit" | "camera";
 
 interface AppNotice {
   kind: "success" | "error";
@@ -136,6 +142,7 @@ interface AppNotice {
 interface ClipEditState {
   clipId: string;
   candidateId: string;
+  imported?: ImportedClip | null;
   viewHero: string;
   cameraMode: ClipCameraMode;
   takeGroupId: string | null;
@@ -156,13 +163,12 @@ interface EditorPlanSnapshot {
   selectedClipId: string;
   highlightHero: string;
   highlightRuleIds: HighlightRuleId[];
-  sourceStoryId: string | null;
   renderSettings: RenderSettings;
 }
 
 interface EditPlanWorkspaceRequest {
   jobId: string;
-  activeMode: EditorPlanMode;
+  activeMode: "default";
   plans: EditPlanSlot[];
 }
 
@@ -170,7 +176,6 @@ interface ReanalysisReset {
   hero: string;
   ruleIds: HighlightRuleId[];
   renderSettings: RenderSettings;
-  wtfPlan: EditorPlanSnapshot;
 }
 
 const isTauriRuntime = "__TAURI_INTERNALS__" in window;
@@ -179,8 +184,7 @@ const developmentFixtureEnabled =
   import.meta.env.DEV &&
   new URLSearchParams(window.location.search).get("fixture") === "mirana";
 const replayDirectoryStorageKey = "cat-cut-replay-directory";
-const analysisExportDirectoryStorageKey = "cat-cut-analysis-export-directory";
-const fallbackAppVersion = "2.0.0";
+const fallbackAppVersion = "2.5.0";
 
 const emptyCapabilities: Capabilities = {
   analysisReady: true,
@@ -190,7 +194,6 @@ const emptyCapabilities: Capabilities = {
   dota2Found: false,
   renderReason: null,
   jobsRoot: "",
-  recommendedAnalysisExportDirectory: "",
   recommendedReplayDirectory: null,
   dota2Path: null,
   dota2PathSource: "missing",
@@ -213,20 +216,10 @@ const pipelineStages = [
   { id: "ingest", label: "校验" },
   { id: "parse", label: "解析" },
   { id: "detect", label: "高光" },
-  { id: "direct", label: "编排" },
 ] as const;
 
-const storyCategoryOptions: Array<{
-  id: StoryCategory | "all";
-  label: string;
-}> = [
-  { id: "all", label: "全部" },
-  { id: "comedy", label: "趣味" },
-  { id: "skill", label: "精彩" },
-  { id: "mistake", label: "失误" },
-];
-
 function App() {
+
   const [view, setView] = useState<View>("workbench");
   const [capabilities, setCapabilities] =
     useState<Capabilities>(emptyCapabilities);
@@ -237,10 +230,11 @@ function App() {
   const [progress, setProgress] = useState<AnalysisProgress | null>(null);
   const [completedStages, setCompletedStages] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
-  const [exportingAnalysis, setExportingAnalysis] = useState(false);
+
   const [error, setError] = useState("");
   const [dragActive, setDragActive] = useState(false);
   const [notice, setNotice] = useState<AppNotice | null>(null);
+  const [externalNotice, setExternalNotice] = useState<ReturnType<typeof externalToolNotice> | null>(null);
   const [appVersion, setAppVersion] = useState(fallbackAppVersion);
   const [appUpdate, setAppUpdate] = useState<AppUpdateState>(
     isTauriRuntime ? { phase: "checking" } : { phase: "unavailable" },
@@ -256,11 +250,7 @@ function App() {
   const [renderSettings, setRenderSettings] = useState<RenderSettings>(
     defaultRenderSettings,
   );
-  const [editorMode, setEditorMode] = useState<EditorPlanMode>("default");
-  const [sourceStoryId, setSourceStoryId] = useState<string | null>(null);
-  const [planSlots, setPlanSlots] = useState<
-    Record<EditorPlanMode, EditorPlanSnapshot>
-  >(() => createEmptyPlanWorkspace());
+
   const [rendering, setRendering] = useState(false);
   const renderCancelRequested = useRef(false);
   const [renderProgress, setRenderProgress] = useState<RenderProgress | null>(
@@ -268,6 +258,8 @@ function App() {
   );
   const [renderResult, setRenderResult] = useState<RenderResult | null>(null);
   const [renderError, setRenderError] = useState("");
+  const [videoOutputDirectory, setVideoOutputDirectory] = useState<string|null>(null);
+  useEffect(()=>setVideoOutputDirectory(null),[result?.job_id]);
   const [renderResume, setRenderResume] = useState<RenderResumeSummary | null>(null);
   const [checkingResume, setCheckingResume] = useState(false);
   const [resumeCheckError, setResumeCheckError] = useState("");
@@ -278,9 +270,14 @@ function App() {
   const [replayDirectory, setReplayDirectory] = useState(
     () => localStorage.getItem(replayDirectoryStorageKey) ?? "",
   );
-  const [analysisExportDirectory, setAnalysisExportDirectory] = useState(
-    () => localStorage.getItem(analysisExportDirectoryStorageKey) ?? "",
-  );
+  const [replayLibrary, setReplayLibrary] = useState<ReplayLibrarySnapshot | null>(null);
+  const [replayLibraryLoading, setReplayLibraryLoading] = useState(false);
+  const [replayLibraryError, setReplayLibraryError] = useState("");
+  const replayLibraryRefresh = useRef<(() => Promise<void>) | null>(null);
+  const replayLibraryReadStarted = useRef(false);
+  const replayLibraryQueryKey = `${capabilities.dota2Path ?? ""}\0${replayDirectory.trim()}`;
+  const replayLibraryQueryRef = useRef(replayLibraryQueryKey);
+  replayLibraryQueryRef.current = replayLibraryQueryKey;
   const [replayId, setReplayId] = useState("");
   const [replayLookupBusy, setReplayLookupBusy] = useState(false);
   const [replayLookupError, setReplayLookupError] = useState("");
@@ -292,19 +289,16 @@ function App() {
   const activeJobRef = useRef<string | null>(null);
   activeJobRef.current = result?.job_id ?? null;
   const updating = appUpdate.phase === "downloading" || appUpdate.phase === "installing";
-  const interactionBlocked = busy || rendering || checkingResume || updating || closing || exportingAnalysis;
+  const interactionBlocked = busy || rendering || checkingResume || updating || closing;
   const draftWriter = useRef(new DraftWriter<EditPlanWorkspaceRequest, SaveEditPlanResult>(
     (request) => invoke<SaveEditPlanResult>("save_edit_plan", { request }),
   ));
   const draftRequest = useMemo<EditPlanWorkspaceRequest | null>(() => {
     if (!result || !planReady) return null;
-    const workspace = { ...planSlots, [editorMode]: {
-      clipEdits, selectedClipId, highlightHero, highlightRuleIds, sourceStoryId, renderSettings,
-    } };
-    return { jobId: result.job_id, activeMode: editorMode,
-      plans: (["default", "wtf"] as const).map((mode) => toEditPlanSlot(mode, workspace[mode])) };
-  }, [result, planReady, planSlots, editorMode, clipEdits, selectedClipId,
-    highlightHero, highlightRuleIds, sourceStoryId, renderSettings]);
+    return { jobId: result.job_id, activeMode: "default", plans: [toEditPlanSlot("default", {
+      clipEdits, selectedClipId, highlightHero, highlightRuleIds, renderSettings,
+    })] };
+  }, [result, planReady, clipEdits, selectedClipId, highlightHero, highlightRuleIds, renderSettings]);
   const latestDraftRef = useRef(draftRequest);
   latestDraftRef.current = draftRequest;
   const autoSaveTimerRef = useRef<number | null>(null);
@@ -360,6 +354,18 @@ function App() {
           if (!disposed) {
             setSelectedPath(miranaDevelopmentSummary.source.path);
             const resumeFixture = new URLSearchParams(window.location.search).get("resume");
+            const exportLayoutFixture = new URLSearchParams(window.location.search).get("exportLayout");
+            if (exportLayoutFixture === "ready" || exportLayoutFixture === "complete") {
+              setCapabilities({ ...emptyCapabilities, renderReady: true });
+              setMovieSetupOpen(true);
+              setPlanFeedback("剪辑草稿已保存，可开始导出。");
+              if (exportLayoutFixture === "complete") {
+                setRenderResult({ outputPath: "fixture/export.mp4", qcReportPath: "fixture/quality.json",
+                  sourceAssetsDir: "fixture/assets", sourceAssets: [], durationSeconds: 30,
+                  width: 1920, height: 1080, segmentCount: 2, sourceAssetCount: 2,
+                  warnings: ["素材文件已保存，请查看视频确认目标英雄和事件。"] });
+              }
+            }
             if (resumeFixture === "interrupted" || resumeFixture === "compose") {
               setClipEdits((existing) => Array.from({ length: 25 }, (_, index) => ({
                 ...existing[0]!, clipId: `fixture-resume-${index}`, takeGroupId: null,
@@ -369,7 +375,7 @@ function App() {
                 completedClips: complete ? 25 : 22, remainingClips: complete ? 0 : 3,
                 firstPendingClip: complete ? null : 23, unverifiedCameraClips: complete ? 25 : 22,
                 completedDirectory: "fixture/segments" });
-              setCapabilities({ ...emptyCapabilities, renderReady: true });
+              setCapabilities({ ...emptyCapabilities, renderReady: true, videoOutputDirectory: JSON.parse(localStorage.getItem("cat-cut-dev-video-output")||"null") });
               setRenderError("Dota 2 回放控制失败：VConsole I/O error: 远程主机强迫关闭了一个现有的连接。 (os error 10054)");
               setMovieSetupOpen(true);
             }
@@ -400,23 +406,18 @@ function App() {
       invoke<Capabilities>("get_capabilities"),
       invoke<RecentJob[]>("get_recent_jobs"),
       getVersion(),
+      invoke<string|null>("get_startup_replay"),
     ])
-      .then(([capabilityResult, jobs, version]) => {
+      .then(([capabilityResult, jobs, version, startupReplay]) => {
         setCapabilities(capabilityResult);
         setRecentJobs(jobs);
         setAppVersion(version);
+        if (startupReplay) { setSelectedPath(startupReplay); void runAnalysis(startupReplay); }
         setReplayDirectory(
           (current) =>
             current.trim() ||
             capabilityResult.recommendedReplayDirectory ||
             "",
-        );
-        setAnalysisExportDirectory(
-          (current) =>
-            preferredAnalysisExportDirectory(
-              current,
-              capabilityResult.recommendedAnalysisExportDirectory,
-            ) ?? "",
         );
       })
       .catch((reason: unknown) => setError(toErrorMessage(reason)));
@@ -449,13 +450,49 @@ function App() {
   }, [replayDirectory]);
 
   useEffect(() => {
-    const directory = analysisExportDirectory.trim();
-    if (directory) {
-      localStorage.setItem(analysisExportDirectoryStorageKey, directory);
-    } else {
-      localStorage.removeItem(analysisExportDirectoryStorageKey);
+    replayLibraryReadStarted.current = false;
+    setReplayLibrary(null);
+    setReplayLibraryLoading(false);
+    setReplayLibraryError("");
+    if ((!isTauriRuntime && !developmentFixtureEnabled) ||
+        (!developmentFixtureEnabled && !replayDirectory.trim() && !capabilities.dota2Path)) {
+      replayLibraryRefresh.current = null;
+      return;
     }
-  }, [analysisExportDirectory]);
+    const refresh = new ReplayLibraryRefresher(
+      async () => {
+        if (developmentFixtureEnabled) {
+          const { replayLibraryDevelopmentSnapshot } = await import("./devReplayLibrary");
+          return replayLibraryDevelopmentSnapshot(replayDirectory.trim());
+        }
+        return invoke<ReplayLibrarySnapshot>("list_replays", { directory: replayDirectory.trim() || null });
+      },
+      (snapshot) => {
+        if (replayLibraryQueryRef.current !== replayLibraryQueryKey) return;
+        setReplayLibrary(snapshot);
+        setReplayLibraryError("");
+        setReplayDirectory((current) => rememberResolvedReplayDirectory(current, snapshot.directory));
+      },
+      (reason) => {
+        if (replayLibraryQueryRef.current !== replayLibraryQueryKey) return;
+        setReplayLibrary(null); setReplayLibraryError(toErrorMessage(reason));
+      },
+      (loading) => { if (replayLibraryQueryRef.current === replayLibraryQueryKey) setReplayLibraryLoading(loading); },
+    );
+    replayLibraryRefresh.current = () => refresh.refresh();
+    return () => { refresh.dispose(); replayLibraryRefresh.current = null; };
+  }, [replayDirectory, capabilities.dota2Path]);
+
+  useEffect(() => {
+    if (view !== "library" || replayLibraryReadStarted.current) return;
+    if (replayLibraryRefresh.current) {
+      // One initial read per directory. Later reads require the refresh button.
+      replayLibraryReadStarted.current = true;
+      void replayLibraryRefresh.current();
+    } else setReplayLibraryError(isTauriRuntime
+      ? "请先选择录像目录，或在设置中指定 Dota 2 位置。"
+      : "请在桌面应用中读取本地录像目录。");
+  }, [view, replayDirectory, capabilities.dota2Path]);
 
   useEffect(() => {
     if (!isTauriRuntime) {
@@ -503,7 +540,7 @@ function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [interactionBlocked]);
+  }, [interactionBlocked,result]);
 
   useEffect(() => {
     const first = clipEdits[0];
@@ -524,14 +561,12 @@ function App() {
       : createClipEdits(summary);
     const selection = reset ? { hero: reset.hero, ruleIds: reset.ruleIds }
       : inferHighlightSelection(summary.highlights.candidates, initialClips);
-    const initialWorkspace: Record<EditorPlanMode, EditorPlanSnapshot> = {
-      default: { clipEdits: initialClips, selectedClipId: initialClips[0]?.clipId ?? "",
-        highlightHero: selection.hero, highlightRuleIds: selection.ruleIds,
-        sourceStoryId: null, renderSettings: reset?.renderSettings ?? defaultRenderSettings },
-      wtf: reset?.wtfPlan ?? createEmptyPlanSnapshot(),
+    const initialSnapshot: EditorPlanSnapshot = {
+      clipEdits: initialClips, selectedClipId: initialClips[0]?.clipId ?? "",
+      highlightHero: selection.hero, highlightRuleIds: selection.ruleIds,
+      renderSettings: reset?.renderSettings ?? defaultRenderSettings,
     };
-    let workspace = initialWorkspace;
-    let mode: EditorPlanMode = "default";
+    let snapshot = initialSnapshot;
     let latest: RenderResult | null = null;
     let conflictingCandidates: string[] = [];
     if (isTauriRuntime) {
@@ -540,26 +575,22 @@ function App() {
         invoke<RenderResult | null>("get_latest_render", { jobId: summary.job_id }).catch(() => null),
       ]);
       if (saved) {
-        workspace = createSavedPlanWorkspace(summary, saved, initialWorkspace.default);
-        mode = saved.activeMode;
+        snapshot = createSavedDefaultPlan(summary, saved, initialSnapshot);
         const candidateIds = new Set(summary.highlights.candidates.map((candidate) => candidate.id));
-        conflictingCandidates = [...new Set(saved.plans.flatMap((plan) => plan.clips)
-          .filter((clip) => !candidateIds.has(clip.candidateId)).map((clip) => clip.candidateId))];
+        const savedDefault = saved.plans.find((plan) => plan.mode === "default");
+        conflictingCandidates = [...new Set((savedDefault?.clips ?? [])
+          .filter((clip) => !clip.imported && !candidateIds.has(clip.candidateId)).map((clip) => clip.candidateId))];
       }
       latest = reset ? null : previousRender;
       if (reset) {
-        // The backend archived edit-plan.json; a matching cached signature must
-        // not suppress recreating the active file after reanalysis.
         draftWriter.current.invalidateSavedSnapshot();
-        await draftWriter.current.persist({ jobId: summary.job_id, activeMode: mode,
-          plans: (["default", "wtf"] as const).map((slot) => toEditPlanSlot(slot, workspace[slot])) });
+        await draftWriter.current.persist({ jobId: summary.job_id, activeMode: "default",
+          plans: [toEditPlanSlot("default", snapshot)] });
       }
     }
     if (closePending.current) return;
     setResult(summary);
-    setPlanSlots(workspace);
-    setEditorMode(mode);
-    applyPlanSnapshot(workspace[mode]);
+    applyPlanSnapshot(snapshot);
     setMovieSetupOpen(false);
     const conflict = conflictingCandidates.length > 0;
     setPlanReady(!conflict);
@@ -606,36 +637,7 @@ function App() {
     setSelectedClipId(snapshot.selectedClipId);
     setHighlightHero(snapshot.highlightHero);
     setHighlightRuleIds(snapshot.highlightRuleIds);
-    setSourceStoryId(snapshot.sourceStoryId);
     setRenderSettings(snapshot.renderSettings);
-  }
-
-  function currentPlanSnapshot(): EditorPlanSnapshot {
-    return {
-      clipEdits,
-      selectedClipId,
-      highlightHero,
-      highlightRuleIds,
-      sourceStoryId,
-      renderSettings,
-    };
-  }
-
-  function switchEditorMode(nextMode: EditorPlanMode) {
-    if (!planReady || operationGate.current.blocked) return;
-    if (nextMode === editorMode) {
-      return;
-    }
-    const nextWorkspace = {
-      ...planSlots,
-      [editorMode]: currentPlanSnapshot(),
-    };
-    setPlanSlots(nextWorkspace);
-    setEditorMode(nextMode);
-    applyPlanSnapshot(nextWorkspace[nextMode]);
-    setPlanFeedback("");
-    setRenderResult(null);
-    setRenderError("");
   }
 
   const selectedClip = useMemo(
@@ -650,6 +652,21 @@ function App() {
       ) ?? null,
     [result, selectedClip],
   );
+
+  async function openExternalTool(id: ExternalToolId) {
+    if (operationGate.current.blocked) return;
+    const notice = externalToolNotice(id);
+    if (!canLaunchExternalTool(id) || !isTauriRuntime) {
+      setExternalNotice(notice);
+      return;
+    }
+    try {
+      const opened = await invoke<{ status: "opened" | "missing" }>("open_external_tool", { toolId: id });
+      setExternalNotice(opened.status === "opened" ? null : notice);
+    } catch (reason: unknown) {
+      setExternalNotice({ title: "暂时无法打开独立软件", message: toErrorMessage(reason) });
+    }
+  }
 
   function openImportDialog() {
     if (operationGate.current.blocked) return;
@@ -669,6 +686,7 @@ function App() {
   async function chooseReplayDirectory() {
     if (!isTauriRuntime) {
       setReplayLookupError("请从桌面应用中选择录像目录。");
+      if (view === "library") setReplayLibraryError("请从桌面应用中选择录像目录。");
       return;
     }
     setReplayLookupError("");
@@ -681,9 +699,12 @@ function App() {
       });
       if (typeof picked === "string") {
         setReplayDirectory(picked);
+        setReplayLibraryError("");
+        if (picked === replayDirectory) void replayLibraryRefresh.current?.();
       }
     } catch (reason: unknown) {
       setReplayLookupError(toErrorMessage(reason));
+      if (view === "library") setReplayLibraryError(toErrorMessage(reason));
     }
   }
 
@@ -745,14 +766,8 @@ function App() {
       hero: highlightHero || (result ? inferHighlightSelection(result.highlights.candidates, clipEdits).hero : "") ||
         result?.replay.players[0]?.hero_name || "",
       ruleIds: normalizeHighlightRuleIds(highlightRuleIds), renderSettings,
-      wtfPlan: editorMode === "wtf" ? currentPlanSnapshot() : planSlots.wtf,
     } : null;
-    if (reset && planConflict && result) {
-      const ids = new Set(result.highlights.candidates.map((candidate) => candidate.id));
-      if (reset.wtfPlan.clipEdits.some((clip) => !ids.has(clip.candidateId))) {
-        reset.wtfPlan = createEmptyPlanSnapshot();
-      }
-    }
+
     setBusy(true);
     setError("");
     try {
@@ -810,8 +825,8 @@ function App() {
     }
     const confirmed = window.confirm(
       planConflict
-        ? "旧候选事件已变化。将先备份两套完整旧草稿，再重建默认高光；包含失效候选的 WTF 方案会清空，无冲突的 WTF 方案保留。是否继续？"
-        : "重新分析会先保存并备份当前两套剪辑草稿，再恢复当前主角的完整高光候选并替换默认删减方案。是否继续？",
+        ? "旧候选事件已变化。将先备份完整旧草稿，再重建当前主角的高光。是否继续？"
+        : "重新分析会先保存并备份当前剪辑草稿，再恢复当前主角的完整高光候选并替换删减方案。是否继续？",
     );
     if (confirmed) {
       void runAnalysis(selectedPath, true);
@@ -822,64 +837,6 @@ function App() {
     await runAnalysis(job.sourcePath);
   }
 
-  async function exportAnalysisPackage() {
-    if (!isTauriRuntime || !result || !highlightHero || exportingAnalysis) return;
-    const token = operationGate.current.begin("analysis");
-    if (!token) return;
-    setExportingAnalysis(true);
-    setError("");
-    try {
-      await flushCurrentDraft();
-      const destination = await open({
-        multiple: false,
-        directory: true,
-        title: "选择分析包保存位置",
-        defaultPath: preferredAnalysisExportDirectory(
-          analysisExportDirectory,
-          capabilities.recommendedAnalysisExportDirectory,
-        ),
-      });
-      if (typeof destination !== "string") {
-        return;
-      }
-      setAnalysisExportDirectory(destination);
-      setExportingAnalysis(true);
-      const exported = await invoke<AnalysisPackageExportResult>(
-        "export_replay_analysis_package",
-        {
-          request: {
-            jobId: result.job_id,
-            protagonistHero: highlightHero,
-            protagonistLabel: heroLabel(highlightHero),
-            destinationDirectory: destination,
-          },
-        },
-      );
-      setNotice({
-        kind: "success",
-        title: "分析包已导出",
-        message: `${heroLabel(highlightHero)} · ${exported.eventCount} 条事实事件 · ${exported.incidentCount} 个候选`,
-      });
-      try {
-        await invoke("open_exported_analysis_package", { path: exported.packagePath });
-      } catch (reason: unknown) {
-        setNotice({ kind: "success", title: "分析包已导出",
-          message: `已保存至 ${exported.packagePath}；自动打开未完成：${toErrorMessage(reason)}` });
-      }
-    } catch (reason: unknown) {
-      const message = toErrorMessage(reason);
-      setError(message);
-      setNotice({
-        kind: "error",
-        title: "分析包导出失败",
-        message,
-      });
-    } finally {
-      operationGate.current.finish(token);
-      setExportingAnalysis(false);
-    }
-  }
-
   function updateClipEdit(clipId: string, patch: Partial<ClipEditState>) {
     if (!planReady || operationGate.current.blocked) return;
     setClipEdits((current) => {
@@ -888,6 +845,8 @@ function App() {
         return current;
       }
       const enrichedPatch: Partial<ClipEditState> = { ...patch };
+      const changesCandidate = patch.candidateId !== undefined && patch.candidateId !== selected.candidateId;
+      if (changesCandidate) enrichedPatch.imported = null;
       if (selected.durationMode === "short") {
         if (patch.startSeconds !== undefined) {
           enrichedPatch.shortStartSeconds = patch.startSeconds;
@@ -909,11 +868,13 @@ function App() {
           return { ...clip, ...enrichedPatch };
         }
         if (
-          synchronizesTime &&
+          (synchronizesTime || changesCandidate) &&
+          Boolean(selected?.takeGroupId) &&
           clip.takeGroupId === selected?.takeGroupId
         ) {
           return {
             ...clip,
+            ...(changesCandidate ? { candidateId: enrichedPatch.candidateId!, imported: null } : {}),
             ...(enrichedPatch.startSeconds === undefined
               ? {}
               : { startSeconds: enrichedPatch.startSeconds }),
@@ -953,7 +914,7 @@ function App() {
     setClipEdits(extended.clips);
     setPlanFeedback(extended.changedScenes
       ? `已为 ${extended.changedScenes} 个场次补足击杀前铺垫，保留当前片段选择和出点。`
-      : "当前片段已保留足够铺垫，剧情时长和自定义片段保持原样。");
+      : "当前片段已保留足够铺垫，完整交战时长和自定义片段保持原样。");
   }
 
   function applyHeroHighlightSelection(
@@ -998,21 +959,11 @@ function App() {
 
   function selectHeroHighlights(hero: string) {
     if (!planReady || operationGate.current.blocked) return;
-    if (editorMode === "wtf") {
-      setHighlightHero(hero);
-      setPlanFeedback(
-        `正在查看 ${heroLabel(hero)} 的可用故事，现有 WTF 素材不会被覆盖。`,
-      );
-      return;
-    }
     applyHeroHighlightSelection(hero, highlightRuleIds, true);
   }
 
   function updateHighlightRules(ruleIds: HighlightRuleId[]) {
     if (!planReady || operationGate.current.blocked) return;
-    if (editorMode === "wtf") {
-      return;
-    }
     const normalizedRules = normalizeHighlightRuleIds(ruleIds);
     if (normalizedRules.length === 0) {
       return;
@@ -1021,39 +972,6 @@ function App() {
     if (result && highlightHero) {
       applyHeroHighlightSelection(highlightHero, normalizedRules, false);
     }
-  }
-
-  function applyStoryPlan(storyId: string) {
-    if (!planReady || operationGate.current.blocked) return;
-    if (!result || editorMode !== "wtf") {
-      return;
-    }
-    const story = result.stories.stories.find((item) => item.id === storyId);
-    if (!story) {
-      return;
-    }
-    const next = createStoryClips(story, result.replay.playback_time_seconds);
-    setHighlightHero(story.primary_hero);
-    setSourceStoryId(story.id);
-    setClipEdits(next);
-    setSelectedClipId(
-      next.find((clip) => clip.includeInFinal)?.clipId ??
-        next[0]?.clipId ??
-        "",
-    );
-    setRenderResult(null);
-    setRenderError("");
-    const message = `已采用“${storyTitle(story)}”：${storySceneCount(
-      story,
-    )} 个场次、${next.length} 份独立素材，默认成片 ${formatDuration(
-      storyDefaultDuration(story),
-    )}`;
-    setPlanFeedback(message);
-    setNotice({
-      kind: "success",
-      title: "导演素材方案已采用",
-      message,
-    });
   }
 
   function addClip() {
@@ -1083,6 +1001,7 @@ function App() {
     const clip: ClipEditState = {
       clipId: createClipId(),
       candidateId,
+      imported: copyImportedMetadata(selected?.imported),
       viewHero: hero,
       cameraMode: "player_perspective",
       takeGroupId: null,
@@ -1184,6 +1103,7 @@ function App() {
     const copy = {
       ...source,
       clipId: createClipId(),
+      imported: copyImportedMetadata(source.imported),
       takeGroupId: null,
       takeRole: "primary" as const,
       includeInFinal: true,
@@ -1328,7 +1248,7 @@ function App() {
         setRenderProgress(message);
         if (message.status === "failed") setRenderError(message.message);
       };
-      const completed = await invoke<RenderResult>("start_render", { jobId, onProgress: channel, resumeFingerprint });
+      const completed = await invoke<RenderResult>("start_render", { jobId, onProgress: channel, resumeFingerprint, outputDirectory: videoOutputDirectory });
       if (!current()) return;
       setRenderResult(completed);
       setRenderResume(null);
@@ -1502,9 +1422,11 @@ function App() {
         activeView={view}
         capabilities={capabilities}
         recentJobs={recentJobs}
+        replayCount={replayLibrary?.files.length}
         busy={interactionBlocked}
         onImport={openImportDialog}
         onViewChange={setView}
+        onOpenExternalTool={openExternalTool}
         onOpenRecent={(job) => void openRecent(job)}
       />
 
@@ -1513,22 +1435,18 @@ function App() {
           selectedPath={selectedPath}
           result={result}
           busy={interactionBlocked}
-          exportingAnalysis={exportingAnalysis}
-          analysisExportReady={Boolean(result && highlightHero)}
           renderReady={capabilities.renderReady}
           onImport={openImportDialog}
           onAnalyze={confirmReanalysis}
-          onExportAnalysis={() => void exportAnalysisPackage()}
           onOpenMovieSetup={() => void openMovieSetup()}
         />
 
         {view === "library" ? (
-          <LibraryView
-            jobs={recentJobs}
-            busy={interactionBlocked}
-            onOpen={(job) => void openRecent(job)}
-            onImport={openImportDialog}
-          />
+          <LibraryView snapshot={replayLibrary} directory={replayDirectory} busy={interactionBlocked}
+            loading={replayLibraryLoading} error={replayLibraryError}
+            onOpen={(file) => void runAnalysis(file.path)} onImport={openImportDialog}
+            onRefresh={() => { if (replayLibraryRefresh.current) void replayLibraryRefresh.current(); }}
+            onChooseDirectory={() => void chooseReplayDirectory()} />
         ) : busy || progress?.status === "failed" ? (
           <AnalysisState
             path={selectedPath}
@@ -1545,15 +1463,11 @@ function App() {
             selectedCandidate={selectedCandidate}
             highlightHero={highlightHero}
             highlightRuleIds={highlightRuleIds}
-            editorMode={editorMode}
-            sourceStoryId={sourceStoryId}
             renderSettings={renderSettings}
-            onChangeEditorMode={switchEditorMode}
             onSelectClip={setSelectedClipId}
             onUpdateClip={updateClipEdit}
             onSelectHighlightHero={selectHeroHighlights}
             onUpdateHighlightRules={updateHighlightRules}
-            onApplyStory={applyStoryPlan}
             onUpdateRenderSettings={updateRenderSettings}
             onAddClip={addClip}
             onExtendKillSetups={extendCurrentKillSetups}
@@ -1577,6 +1491,7 @@ function App() {
           capabilities={capabilities}
         />
       </main>
+      <ExternalToolDialog notice={externalNotice} onClose={() => setExternalNotice(null)} />
       {dragActive && (
         <div className="drop-overlay" aria-live="polite">
           <div className="drop-overlay-content">
@@ -1612,9 +1527,9 @@ function App() {
       )}
       {movieSetupOpen && result && (
         <MovieSetupDialog
+          version={appVersion}
           result={result}
           clipEdits={clipEdits}
-          editorMode={editorMode}
           capabilities={capabilities}
           renderSettings={renderSettings}
           saving={savingPlan}
@@ -1622,6 +1537,9 @@ function App() {
           renderProgress={renderProgress}
           renderResult={renderResult}
           renderError={renderError}
+          outputDirectory={videoOutputDirectory}
+          onOutputDirectoryChange={setVideoOutputDirectory}
+          onOutputError={setRenderError}
           resume={renderResume}
           checkingResume={checkingResume}
           resumeCheckError={resumeCheckError}
@@ -1953,6 +1871,7 @@ function Titlebar({
                 <small className="dota-path-feedback error">{dota2PathError}</small>
               )}
             </div>
+            <VideoOutputSetting capabilities={capabilities} blocked={configurationBlocked} native={isTauriRuntime} onChange={onCapabilitiesChange}/>
             <label className="setting-row">
               <span>
                 <strong>分析完成提醒</strong>
@@ -2053,9 +1972,11 @@ interface SidebarProps {
   activeView: View;
   capabilities: Capabilities;
   recentJobs: RecentJob[];
+  replayCount?: number;
   busy: boolean;
   onImport: () => void;
   onViewChange: (view: View) => void;
+  onOpenExternalTool: (id: ExternalToolId) => void;
   onOpenRecent: (job: RecentJob) => void;
 }
 
@@ -2063,9 +1984,11 @@ function Sidebar({
   activeView,
   capabilities,
   recentJobs,
+  replayCount,
   busy,
   onImport,
   onViewChange,
+  onOpenExternalTool,
   onOpenRecent,
 }: SidebarProps) {
   return (
@@ -2078,14 +2001,35 @@ function Sidebar({
       <nav className="primary-nav" aria-label="主导航">
         <NavButton
           icon={<Clapperboard />}
-          label="制作台"
+          label="高光时刻"
           active={activeView === "workbench"}
           onClick={() => onViewChange("workbench")}
         />
         <NavButton
+          icon={<Sparkles />}
+          label="WTF 剪辑"
+          active={false}
+          disabled={busy}
+          onClick={() => onOpenExternalTool("wtf")}
+        />
+        <NavButton
+          icon={<FileText />}
+          label="剧情剪辑"
+          active={false}
+          disabled={busy}
+          onClick={() => onOpenExternalTool("story")}
+        />
+        <NavButton
+          icon={<FileText />}
+          label="录像分析"
+          active={false}
+          disabled={busy}
+          onClick={() => onOpenExternalTool("analysis")}
+        />
+        <NavButton
           icon={<Library />}
           label="录像库"
-          count={recentJobs.length}
+          count={replayCount}
           active={activeView === "library"}
           onClick={() => onViewChange("library")}
         />
@@ -2114,7 +2058,7 @@ function Sidebar({
             </button>
           ))}
           {recentJobs.length === 0 && (
-            <div className="no-recent">还没有分析记录</div>
+            <div className="no-recent">还没有剪辑任务</div>
           )}
         </div>
       </div>
@@ -2184,12 +2128,9 @@ interface ProjectHeaderProps {
   selectedPath: string;
   result: AnalysisSummary | null;
   busy: boolean;
-  exportingAnalysis: boolean;
-  analysisExportReady: boolean;
   renderReady: boolean;
   onImport: () => void;
   onAnalyze: () => void;
-  onExportAnalysis: () => void;
   onOpenMovieSetup: () => void;
 }
 
@@ -2197,12 +2138,9 @@ function ProjectHeader({
   selectedPath,
   result,
   busy,
-  exportingAnalysis,
-  analysisExportReady,
   renderReady,
   onImport,
   onAnalyze,
-  onExportAnalysis,
   onOpenMovieSetup,
 }: ProjectHeaderProps) {
   const sourceName = selectedPath ? fileName(selectedPath) : "等待导入录像";
@@ -2250,25 +2188,6 @@ function ProjectHeader({
           </button>
         )}
         <button
-          className="secondary-button"
-          disabled={busy || !analysisExportReady || exportingAnalysis}
-          title={
-            analysisExportReady
-              ? "导出当前所选主角的 evidence.json 和 report.md"
-              : result
-                ? "请先选择高光主角"
-                : "请先分析一份录像"
-          }
-          onClick={onExportAnalysis}
-        >
-          {exportingAnalysis ? (
-            <LoaderCircle className="spinning" />
-          ) : (
-            <Download />
-          )}
-          <span>{exportingAnalysis ? "正在导出" : "导出分析包"}</span>
-        </button>
-        <button
           className="primary-button"
           disabled={!result || busy}
           title={
@@ -2308,7 +2227,7 @@ function EmptyWorkbench({
           <img src={mascot} alt="戴着耳机、拿着场记板的猫猫助手" />
         </div>
         <div className="empty-copy">
-          <span className="eyebrow">本地录像分析</span>
+          <span className="eyebrow">本地高光剪辑</span>
           <h2>把 DEM 交给猫猫</h2>
           <p>录像只在这台电脑处理，原文件不会被修改。</p>
         </div>
@@ -2327,7 +2246,7 @@ function EmptyWorkbench({
         <div className="panel-heading">
           <div>
             <span className="eyebrow">继续工作</span>
-            <h2>最近分析</h2>
+            <h2>最近任务</h2>
           </div>
           <Clock3 />
         </div>
@@ -2588,15 +2507,11 @@ interface ResultsViewProps {
   selectedCandidate: HighlightCandidate | null;
   highlightHero: string;
   highlightRuleIds: HighlightRuleId[];
-  editorMode: EditorPlanMode;
-  sourceStoryId: string | null;
   renderSettings: RenderSettings;
-  onChangeEditorMode: (mode: EditorPlanMode) => void;
   onSelectClip: (id: string) => void;
   onUpdateClip: (clipId: string, patch: Partial<ClipEditState>) => void;
   onSelectHighlightHero: (hero: string) => void;
   onUpdateHighlightRules: (ruleIds: HighlightRuleId[]) => void;
-  onApplyStory: (storyId: string) => void;
   onUpdateRenderSettings: (patch: Partial<RenderSettings>) => void;
   onAddClip: () => void;
   onExtendKillSetups: () => void;
@@ -2613,15 +2528,11 @@ function ResultsView({
   selectedCandidate,
   highlightHero,
   highlightRuleIds,
-  editorMode,
-  sourceStoryId,
   renderSettings,
-  onChangeEditorMode,
   onSelectClip,
   onUpdateClip,
   onSelectHighlightHero,
   onUpdateHighlightRules,
-  onApplyStory,
   onUpdateRenderSettings,
   onAddClip,
   onExtendKillSetups,
@@ -2631,11 +2542,7 @@ function ResultsView({
   onMoveClip,
 }: ResultsViewProps) {
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>("hero");
-  const [storyCategory, setStoryCategory] = useState<
-    StoryCategory | "all"
-  >("all");
-  const [selectedStoryId, setSelectedStoryId] = useState("");
-  const [highlightQuery, setHighlightQuery] = useState("");
+
   const [highlightQueryFeedback, setHighlightQueryFeedback] = useState<{
     kind: "success" | "error";
     message: string;
@@ -2666,7 +2573,7 @@ function ResultsView({
   const filteredAnchorCandidates = highlightHero
     ? heroHighlightCandidates(result, highlightHero, highlightRuleIds)
     : result.highlights.candidates.filter(
-        (candidate) => candidate.kind !== "hero_kill_sequence",
+        (candidate) => candidate.kind === "hero_kill_sequence",
       );
   const anchorCandidates =
     selectedCandidate &&
@@ -2677,41 +2584,10 @@ function ResultsView({
           (left, right) => left.peak_seconds - right.peak_seconds,
         )
       : filteredAnchorCandidates;
-  const heroStories = highlightHero
-    ? result.stories.stories.filter(
-        (story) => story.primary_hero === highlightHero,
-      )
-    : result.stories.stories;
-  const visibleStories =
-    storyCategory === "all"
-      ? heroStories
-      : heroStories.filter((story) => story.category === storyCategory);
-  const selectedStory =
-    visibleStories.find((story) => story.id === selectedStoryId) ??
-    visibleStories[0] ??
-    null;
-  const selectedStoryAssetLabels = selectedStory
-    ? storyAssetLabels(selectedStory)
-    : new Map<string, string>();
 
   useEffect(() => {
-    setHighlightQuery("");
     setHighlightQueryFeedback(null);
-    setStoryCategory("all");
-    setSelectedStoryId("");
   }, [result.job_id]);
-
-  useEffect(() => {
-    setInspectorTab(editorMode === "wtf" ? "story" : "hero");
-  }, [editorMode]);
-
-  useEffect(() => {
-    setSelectedStoryId((current) =>
-      visibleStories.some((story) => story.id === current)
-        ? current
-        : (visibleStories[0]?.id ?? ""),
-    );
-  }, [highlightHero, storyCategory, result.job_id]);
 
   useEffect(() => {
     if (highlightQueryFeedback) {
@@ -2747,50 +2623,13 @@ function ResultsView({
     });
   }
 
-  function applyHighlightQuery(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const parsed = parseHighlightRuleQuery(highlightQuery);
-    if (parsed.status === "empty") {
-      setHighlightQueryFeedback({
-        kind: "error",
-        message: "请输入想保留的内容。",
-      });
-      return;
-    }
-    if (parsed.status === "unknown") {
-      setHighlightQueryFeedback({
-        kind: "error",
-        message: `暂不认识“${parsed.unknownText}”，本次没有更改筛选。`,
-      });
-      return;
-    }
-    if (parsed.status === "none") {
-      setHighlightQueryFeedback({
-        kind: "error",
-        message: "没有选出可用类型，请至少保留击杀或砍树。",
-      });
-      return;
-    }
-    onUpdateHighlightRules(parsed.ruleIds);
-    setHighlightQueryFeedback({
-      kind: "success",
-      message: highlightHero
-        ? `已按“${formatHighlightRuleSelection(
-            parsed.ruleIds,
-          )}”更新${heroLabel(highlightHero)}高光。`
-        : `已识别“${formatHighlightRuleSelection(
-            parsed.ruleIds,
-          )}”，再选择高光主角。`,
-    });
-  }
-
   return (
     <div className="results-workspace precision-workspace">
       <section className="candidate-panel">
         <div className="result-summary">
           <SummaryStat
             icon={<ListChecks />}
-            label={editorMode === "wtf" ? "WTF 素材" : "默认素材"}
+            label="默认素材"
             value={`${clipEdits.length}`}
             tone="pink"
           />
@@ -2828,11 +2667,7 @@ function ResultsView({
         <div className="candidate-table-header">
           <div>
             <span className="eyebrow">
-              {editorMode === "wtf"
-                ? sourceStoryId
-                  ? "WTF 导演方案 · 按场次排列"
-                  : "WTF 导演方案 · 尚未采用故事"
-                : highlightHero
+              {highlightHero
                 ? `${heroLabel(highlightHero)} · ${selectedRuleLabel} · 按时间排列`
                 : "按导出顺序排列"}
             </span>
@@ -2865,7 +2700,7 @@ function ResultsView({
                 role="button"
                 tabIndex={0}
                 aria-label={`${assetLabels.get(clip.clipId) ?? `素材 ${index + 1}`}，${
-                  candidate ? candidateTitle(candidate) : "自定义片段"
+                  candidate ? candidateTitle(candidate) : clip.imported?.title ?? "自定义片段"
                 }`}
                 onClick={() => onSelectClip(clip.clipId)}
                 onKeyDown={(event) => {
@@ -2884,7 +2719,7 @@ function ResultsView({
                     </span>
                     {candidate
                       ? candidateTitle(candidate)
-                      : `自定义片段 ${index + 1}`}
+                      : clip.imported?.title ?? `自定义片段 ${index + 1}`}
                   </strong>
                   <small>
                     {clip.includeInFinal
@@ -2960,30 +2795,24 @@ function ResultsView({
                 highlightHero ? "filtered" : ""
               }`}
             >
-              {editorMode === "wtf" ? (
-                <Sparkles />
-              ) : highlightHero ? (
+              {highlightHero ? (
                 <SearchX />
               ) : (
                 <Clapperboard />
               )}
               <strong>
-                {editorMode === "wtf"
-                  ? "还没有采用 WTF 故事"
-                  : highlightHero
+                {highlightHero
                   ? "本局没有符合筛选的片段"
                   : "还没有剪辑片段"}
               </strong>
               <span>
-                {editorMode === "wtf"
-                  ? "在右侧故事页选择一个方案；默认剪辑仍会完整保留。"
-                  : highlightHero
+                {highlightHero
                   ? `${heroLabel(
                       highlightHero,
                     )}没有检测到“${selectedRuleLabel}”高光。`
                   : "新增一段后即可设置时间和镜头。"}
               </span>
-              {editorMode === "default" && !highlightHero && (
+              {!highlightHero && (
                 <button className="primary-button" onClick={onAddClip}>
                   <Plus />
                   <span>新增片段</span>
@@ -2995,30 +2824,7 @@ function ResultsView({
       </section>
 
       <aside className="result-inspector">
-        <div className="plan-mode-switch" aria-label="剪辑方案">
-          <span>
-            <small>当前方案</small>
-            <strong>{editorModeLabel(editorMode)}</strong>
-          </span>
-          <div>
-            <button
-              className={editorMode === "default" ? "active" : ""}
-              type="button"
-              aria-pressed={editorMode === "default"}
-              onClick={() => onChangeEditorMode("default")}
-            >
-              默认剪辑
-            </button>
-            <button
-              className={editorMode === "wtf" ? "active" : ""}
-              type="button"
-              aria-pressed={editorMode === "wtf"}
-              onClick={() => onChangeEditorMode("wtf")}
-            >
-              WTF 导演
-            </button>
-          </div>
-        </div>
+        <div className="inspector-toolbar">
         <div className="display-mode-switch" aria-label="画面显示模式">
           <span>
             <small>画面显示</small>
@@ -3048,16 +2854,9 @@ function ResultsView({
           </div>
         </div>
         <div
-          className={`inspector-tabs ${editorMode === "wtf" ? "four-tabs" : ""}`}
+          className="inspector-tabs"
         >
-          {editorMode === "wtf" && (
-            <button
-              className={inspectorTab === "story" ? "active" : ""}
-              onClick={() => setInspectorTab("story")}
-            >
-              故事
-            </button>
-          )}
+
           <button
             className={inspectorTab === "hero" ? "active" : ""}
             onClick={() => setInspectorTab("hero")}
@@ -3077,240 +2876,8 @@ function ResultsView({
             机位
           </button>
         </div>
-        {editorMode === "wtf" && inspectorTab === "story" && (
-          <>
-            <div className="inspector-section story-heading">
-              <div className="section-row">
-                <span>
-                  <span className="eyebrow">可解释导演</span>
-                  <h2>
-                    {highlightHero
-                      ? `${heroLabel(highlightHero)}的故事`
-                      : "整局故事"}
-                  </h2>
-                </span>
-                <span className="story-count">
-                  {heroStories.length}
-                </span>
-              </div>
-              <div
-                className="story-category-control"
-                aria-label="故事类型"
-              >
-                {storyCategoryOptions.map((option) => {
-                  const count =
-                    option.id === "all"
-                      ? heroStories.length
-                      : heroStories.filter(
-                          (story) => story.category === option.id,
-                        ).length;
-                  return (
-                    <button
-                      className={
-                        storyCategory === option.id ? "active" : ""
-                      }
-                      key={option.id}
-                      type="button"
-                      aria-pressed={storyCategory === option.id}
-                      onClick={() => setStoryCategory(option.id)}
-                    >
-                      <span>{option.label}</span>
-                      <small>{count}</small>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+        </div>
 
-            {visibleStories.length > 0 ? (
-              <>
-                <div className="story-selector" role="listbox">
-                  {visibleStories.slice(0, 20).map((story) => (
-                    <button
-                      className={
-                        selectedStory?.id === story.id ? "selected" : ""
-                      }
-                      key={story.id}
-                      type="button"
-                      role="option"
-                      aria-selected={selectedStory?.id === story.id}
-                      onClick={() => setSelectedStoryId(story.id)}
-                    >
-                      <span
-                        className={`story-category-icon ${story.category}`}
-                      >
-                        {story.category === "comedy" ? (
-                          <Trees />
-                        ) : story.category === "skill" ? (
-                          <Swords />
-                        ) : story.category === "mistake" ? (
-                          <CircleAlert />
-                        ) : (
-                          <Sparkles />
-                        )}
-                      </span>
-                      <span>
-                        <strong>{storyTitle(story)}</strong>
-                        <small>
-                          {storyCategoryLabel(story.category)} ·{" "}
-                          {storySceneCount(story)} 场 ·{" "}
-                          {story.shots.length} 份素材 ·{" "}
-                          {formatDuration(storyDefaultDuration(story))}
-                        </small>
-                      </span>
-                      <ChevronRight />
-                    </button>
-                  ))}
-                </div>
-
-                {selectedStory && (
-                  <>
-                    <div className="inspector-section story-detail">
-                      <div className="story-status-line">
-                        <span
-                          className={`story-confidence ${selectedStory.confidence.level}`}
-                        >
-                          {storyConfidenceLabel(
-                            selectedStory.confidence.level,
-                          )}
-                        </span>
-                        {selectedStory.review_required && (
-                          <span className="story-review-required">
-                            需人工复核
-                          </span>
-                        )}
-                      </div>
-                      <h2>{storyTitle(selectedStory)}</h2>
-                      <p>{storyEvidenceSummary(selectedStory)}</p>
-                      <div className="story-facts">
-                        <span>
-                          <strong>{selectedStory.evidence.length}</strong>
-                          <small>证据</small>
-                        </span>
-                        <span>
-                          <strong>{storySceneCount(selectedStory)}</strong>
-                          <small>场次</small>
-                        </span>
-                        <span>
-                          <strong>{selectedStory.shots.length}</strong>
-                          <small>源素材</small>
-                        </span>
-                      </div>
-                      <button
-                        className={`story-apply-button ${
-                          sourceStoryId === selectedStory.id ? "adopted" : ""
-                        }`}
-                        type="button"
-                        onClick={() => onApplyStory(selectedStory.id)}
-                      >
-                        {sourceStoryId === selectedStory.id ? (
-                          <CheckCircle2 />
-                        ) : (
-                          <Clapperboard />
-                        )}
-                        <span>
-                          {sourceStoryId === selectedStory.id
-                            ? "当前 WTF 方案"
-                            : "使用此 WTF 方案"}
-                        </span>
-                      </button>
-                    </div>
-
-                    <div className="inspector-section story-beat-section">
-                      <div className="section-row">
-                        <span className="section-title">故事节拍</span>
-                        <span className="section-note">
-                          {selectedStory.beats.length} 段
-                        </span>
-                      </div>
-                      <div className="story-beat-list">
-                        {selectedStory.beats.map((beat, index) => (
-                          <div key={beat.id}>
-                            <span>{index + 1}</span>
-                            <span>
-                              <strong>{storyBeatLabel(beat.kind)}</strong>
-                              <small>
-                                {formatTimecode(
-                                  beat.source_start_seconds,
-                                )}{" "}
-                                -{" "}
-                                {formatTimecode(beat.source_end_seconds)} ·{" "}
-                                {beat.evidence_ids.length} 条证据
-                              </small>
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="inspector-section story-shot-section">
-                      <div className="section-row">
-                        <span className="section-title">分场素材表</span>
-                        <span className="section-note">
-                          同场次时间码一致
-                        </span>
-                      </div>
-                      <div className="story-shot-list">
-                        {selectedStory.shots.map((shot) => {
-                          const switchWindow =
-                            selectedStory.switch_windows.find(
-                              (window) =>
-                                window.alternate_shot_id === shot.id,
-                            );
-                          return (
-                            <div key={shot.id}>
-                              <span>
-                                {selectedStoryAssetLabels.get(shot.id) ??
-                                  shot.order}
-                              </span>
-                              <span>
-                                <strong>
-                                  {takeRoleLabel(shot.take_role)} ·{" "}
-                                  {storyCameraModeLabel(shot.camera_mode)}
-                                </strong>
-                                <small>
-                                  {shot.include_in_default_cut
-                                    ? "默认入片"
-                                    : "备用素材"}{" "}
-                                  ·{" "}
-                                  {heroLabel(
-                                    shot.target_hero ??
-                                      selectedStory.primary_hero,
-                                  )}{" "}
-                                  ·{" "}
-                                  {formatTimecode(
-                                    shot.source_start_seconds,
-                                  )}{" "}
-                                  -{" "}
-                                  {formatTimecode(shot.source_end_seconds)}
-                                  {switchWindow
-                                    ? ` · 建议切换 ${formatTimecode(
-                                        switchWindow.source_start_seconds,
-                                      )}-${formatTimecode(
-                                        switchWindow.source_end_seconds,
-                                      )}`
-                                    : ""}
-                                </small>
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  </>
-                )}
-              </>
-            ) : (
-              <div className="inspector-empty story-empty">
-                <Sparkles />
-                <strong>当前筛选没有故事</strong>
-                <span>
-                  只展示具备录像证据的结果，不补猜玩家意图。
-                </span>
-              </div>
-            )}
-          </>
-        )}
         {selectedClip && inspectorTab === "edit" && (
           <>
             <div className="inspector-section">
@@ -3320,7 +2887,7 @@ function ResultsView({
               <h2>
                 {selectedCandidate
                   ? candidateTitle(selectedCandidate)
-                  : "自定义片段"}
+                  : selectedClip.imported?.title ?? "自定义片段"}
               </h2>
               <div className="template-meta">
                 <span>{formatDuration(selectedClip.endSeconds - selectedClip.startSeconds)}</span>
@@ -3328,66 +2895,6 @@ function ResultsView({
                 <span>{formatTimecode(selectedClip.endSeconds)}</span>
               </div>
             </div>
-
-            {selectedCandidate?.interaction?.pattern_id ===
-              "hoodwink_ground_acorn_quelling_blade" && (
-              <div className="interaction-evidence">
-                <div className="interaction-evidence-heading">
-                  <span className="interaction-evidence-icon">
-                    <Sparkles />
-                  </span>
-                  <span>
-                    <strong>已验证砍树</strong>
-                    <small>临时树实体已删除</small>
-                  </span>
-                </div>
-                <p>
-                  森海飞霞对地种树后{" "}
-                  {selectedCandidate.interaction.response_delay_seconds.toFixed(
-                    2,
-                  )}{" "}
-                  秒，{heroLabel(selectedCandidate.primary_hero)}
-                  {selectedCandidate.interaction.verification
-                    ? "用补刀斧砍掉了这棵临时树。"
-                    : "使用了补刀斧。"}
-                </p>
-                <div className="interaction-evidence-tags">
-                  <span>
-                    本局第 {selectedCandidate.interaction.occurrence_index}/
-                    {selectedCandidate.interaction.occurrence_count} 次
-                  </span>
-                  {selectedCandidate.interaction.verification
-                    ?.first_fifteen_occurrence_index && (
-                    <span>
-                      前 15 分钟第{" "}
-                      {
-                        selectedCandidate.interaction.verification
-                          .first_fifteen_occurrence_index
-                      }
-                      /
-                      {
-                        selectedCandidate.interaction.verification
-                          .first_fifteen_occurrence_count
-                      }{" "}
-                      次
-                    </span>
-                  )}
-                  {(selectedCandidate.interaction.verification
-                    ?.source_to_responder_salute_count ?? 0) > 0 && (
-                    <span>
-                      森海飞霞打赏{" "}
-                      {
-                        selectedCandidate.interaction.verification
-                          ?.source_to_responder_salute_count
-                      }{" "}
-                      次
-                    </span>
-                  )}
-                  {selectedCandidate.interaction.related_action ===
-                    "hoodwink_bushwhack" && <span>附近有捆人施法</span>}
-                </div>
-              </div>
-            )}
 
             {selectedCandidate?.kind === "hero_kill_sequence" &&
               selectedCandidate.kill_sequence && (
@@ -3455,7 +2962,7 @@ function ResultsView({
               <PrecisionTimeEditor
                 clip={selectedClip}
                 replayDuration={result.replay.playback_time_seconds}
-                peakSeconds={selectedCandidate?.peak_seconds ?? null}
+                peakSeconds={selectedCandidate?.peak_seconds ?? selectedClip.imported?.anchorSeconds ?? null}
                 onUpdate={(patch) => onUpdateClip(selectedClip.clipId, patch)}
               />
             )}
@@ -3475,6 +2982,11 @@ function ResultsView({
                   })
                 }
               >
+                {selectedClip.imported && !anchorCandidates.some(candidate => candidate.id === selectedClip.candidateId) && (
+                  <option value={selectedClip.candidateId}>
+                    {selectedClip.imported.title} · {formatTimecode(selectedClip.imported.anchorSeconds)}
+                  </option>
+                )}
                 {anchorCandidates.map((candidate) => (
                   <option value={candidate.id} key={candidate.id}>
                     {candidate.rank}. {candidateTitle(candidate)} ·{" "}
@@ -3500,13 +3012,11 @@ function ResultsView({
           <>
             <div className="inspector-section settings-heading">
               <span className="eyebrow">
-                {editorMode === "wtf" ? "故事主角筛选" : "英雄高光筛选"}
+                英雄高光筛选
               </span>
               <h2>选择主角</h2>
               <p>
-                {editorMode === "wtf"
-                  ? "选择后只筛选该英雄的故事，不会覆盖已经采用的 WTF 素材。"
-                  : "选择后，片段清单会重建为该英雄的击杀连续段与已验证技术互动。"}
+                选择后，片段清单会重建为该英雄的击杀连续段。
               </p>
             </div>
             <div className="inspector-section">
@@ -3514,9 +3024,7 @@ function ResultsView({
                 <span className="section-title">整局英雄阵容</span>
                 <span className="section-note">
                   {highlightHero
-                    ? editorMode === "wtf"
-                      ? heroLabel(highlightHero)
-                      : `${heroLabel(highlightHero)} · ${selectedRuleLabel}`
+                    ? `${heroLabel(highlightHero)} · ${selectedRuleLabel}`
                     : `已识别 ${rosterPlayers.length}/10`}
                 </span>
               </div>
@@ -3542,8 +3050,7 @@ function ResultsView({
                 ))}
               </div>
             </div>
-            {editorMode === "default" && (
-              <div className="inspector-section highlight-filter-section">
+            <div className="inspector-section highlight-filter-section">
               <div className="section-row">
                 <span className="section-title">高光内容</span>
                 <button
@@ -3589,7 +3096,7 @@ function ResultsView({
                       title={rule.description}
                       onClick={() => toggleHighlightRule(rule.id)}
                     >
-                      {rule.id === HERO_KILL_RULE_ID ? <Swords /> : <Trees />}
+                      <Swords />
                       <span>
                         <strong>{rule.label}</strong>
                         <small>{count === null ? "待选主角" : `${count} 段`}</small>
@@ -3599,29 +3106,6 @@ function ResultsView({
                   );
                 })}
               </div>
-              <form
-                className="highlight-query-form"
-                onSubmit={applyHighlightQuery}
-              >
-                <label htmlFor={`highlight-query-${result.job_id}`}>
-                  内容描述
-                </label>
-                <div>
-                  <input
-                    id={`highlight-query-${result.job_id}`}
-                    value={highlightQuery}
-                    onChange={(event) => {
-                      setHighlightQuery(event.target.value);
-                      setHighlightQueryFeedback(null);
-                    }}
-                    placeholder="例如：只要击杀 / 砍树和击杀"
-                  />
-                  <button type="submit" title="应用内容筛选">
-                    <Search />
-                    <span>应用</span>
-                  </button>
-                </div>
-              </form>
               {highlightQueryFeedback && (
                 <div
                   className={`highlight-query-feedback ${highlightQueryFeedback.kind}`}
@@ -3637,7 +3121,6 @@ function ResultsView({
                 </div>
               )}
               </div>
-            )}
           </>
         )}
         {inspectorTab === "camera" && (
@@ -3688,6 +3171,7 @@ function ResultsView({
                     <Check />
                   </button>
                 </div>
+                <CameraModeDiagram mode={selectedClip.cameraMode} />
               </div>
             )}
           </>
@@ -4087,14 +3571,14 @@ function KillDurationEditor({
           className={clip.durationMode === "story" ? "selected" : ""}
           onClick={selectStoryMode}
         >
-          剧情时长
+          完整交战
         </button>
       </div>
 
       {clip.durationMode === "story" && storyRange && (
         <div className="story-duration-controls">
           <label className="story-preroll-field">
-            <span>击杀前保留</span>
+            <span>交战铺垫</span>
             <input
               type="range"
               min={0}
@@ -4261,9 +3745,9 @@ function SettingSwitch({
 }
 
 function MovieSetupDialog({
+  version,
   result,
   clipEdits,
-  editorMode,
   capabilities,
   renderSettings,
   saving,
@@ -4271,6 +3755,9 @@ function MovieSetupDialog({
   renderProgress,
   renderResult,
   renderError,
+  outputDirectory,
+  onOutputDirectoryChange,
+  onOutputError,
   resume,
   checkingResume,
   resumeCheckError,
@@ -4281,9 +3768,9 @@ function MovieSetupDialog({
   onCancel,
   onOpenPath,
 }: {
+  version: string;
   result: AnalysisSummary;
   clipEdits: ClipEdits;
-  editorMode: EditorPlanMode;
   capabilities: Capabilities;
   renderSettings: RenderSettings;
   saving: boolean;
@@ -4291,6 +3778,9 @@ function MovieSetupDialog({
   renderProgress: RenderProgress | null;
   renderResult: RenderResult | null;
   renderError: string;
+  outputDirectory: string|null;
+  onOutputDirectoryChange: (value:string|null)=>void;
+  onOutputError: (message:string)=>void;
   resume: RenderResumeSummary | null;
   checkingResume: boolean;
   resumeCheckError: string;
@@ -4325,14 +3815,54 @@ function MovieSetupDialog({
   );
 
   const [cleaningCache, setCleaningCache] = useState(false);
-  const active = saving || rendering || checkingResume || cleaningCache;
+  const [exportingDiagnostics, setExportingDiagnostics] = useState(false);
+  const [diagnosticArchive, setDiagnosticArchive] = useState<RenderDiagnosticArchive | null>(null);
+  const [diagnosticExportError, setDiagnosticExportError] = useState("");
+  const diagnosticExporter = useRef(new RenderDiagnosticExporter());
+  const active = saving || rendering || checkingResume || cleaningCache || exportingDiagnostics;
   const resumeView = resumeAction(resume);
   const hasResumePanel = (!rendering || checkingResume) && (checkingResume || !!resumeView || !!resumeCheckError);
   const errorPresentation = renderError ? presentRenderError(renderError) : null;
+  const [diagnosticCopied,setDiagnosticCopied]=useState(false);
+  const lastProgress=useRef<RenderProgress|null>(null);
+  useEffect(()=>{if(renderProgress)lastProgress.current=renderProgress},[renderProgress]);
+  useEffect(()=>{
+    setDiagnosticCopied(false);
+    setDiagnosticArchive(null);
+    setDiagnosticExportError("");
+  },[renderError,result.job_id]);
+  function diagnosticReport(){
+    return renderErrorReport(renderError||"当前界面无失败原文，请参阅包内历史记录。",{version,module:"高光时刻",matchId:result.replay.match_id,jobId:result.job_id,
+      stage:lastProgress.current?.stage,currentClip:lastProgress.current?.currentClip,totalClips:clips.length,
+      logDirectory:`${capabilities.jobsRoot}\\${result.job_id}\\render\\logs`});
+  }
+  async function copyDiagnostic(){
+    try{
+      await navigator.clipboard.writeText(diagnosticReport());
+      setDiagnosticCopied(true);
+    }catch{setDiagnosticCopied(false)}
+  }
+  async function exportDiagnostic(){
+    if(active||diagnosticExporter.current.busy)return;
+    setExportingDiagnostics(true);
+    setDiagnosticExportError("");
+    const outcome=await diagnosticExporter.current.run(isTauriRuntime,{jobId:result.job_id,report:diagnosticReport()},
+      request=>invoke<RenderDiagnosticArchive|null>("export_render_diagnostics",{...request}));
+    if(outcome.status==="exported")setDiagnosticArchive(outcome.archive);
+    if(outcome.status==="failed")setDiagnosticExportError(outcome.message);
+    setExportingDiagnostics(false);
+  }
+  async function openDiagnosticDirectory(){
+    if(!isTauriRuntime||!diagnosticArchive)return;
+    try{
+      await invoke("open_local_path",{path:parentPath(diagnosticArchive.archivePath)});
+      setDiagnosticExportError("");
+    }catch(reason:unknown){setDiagnosticExportError(toErrorMessage(reason))}
+  }
   const previewSource =
     renderResult && isTauriRuntime
       ? convertFileSrc(renderResult.outputPath)
-      : "";
+      : renderResult && developmentFixtureEnabled ? "/export-layout-preview.mp4" : "";
   const expectedOutputName = fileName(result.source.path).replace(
     /\.dem$/i,
     ".mp4",
@@ -4368,7 +3898,7 @@ function MovieSetupDialog({
             <Film />
           </span>
           <span>
-            <small>{editorModeLabel(editorMode)}</small>
+            <small>默认剪辑</small>
             <h2 id="movie-dialog-title">导出视频</h2>
           </span>
           <button
@@ -4409,6 +3939,8 @@ function MovieSetupDialog({
           </span>
         </div>
 
+        <VideoOutputLocation capabilities={capabilities} jobId={result.job_id} matchId={result.replay.match_id} module="高光时刻" directory={outputDirectory} onChange={onOutputDirectoryChange} disabled={active} native={isTauriRuntime} onError={onOutputError}/>
+        <p className="dota-path-help movie-export-note">开始录制前，请先手动打开并登录 Steam，保持 Steam 运行。软件不会自动启动或登录 Steam。</p>
         <div className="movie-plan-summary">
           <div>
             <ListChecks />
@@ -4545,10 +4077,10 @@ function MovieSetupDialog({
                     {assetLabels.get(clip.clipId) ?? index + 1}
                   </span>
                   <span className="movie-plan-copy">
-                    <strong>
+                    <strong title={candidate?candidateTitle(candidate):clip.imported?.title??clip.candidateId}>
                       {candidate
                         ? candidateTitle(candidate)
-                        : clip.candidateId}
+                        : clip.imported?.title ?? clip.candidateId}
                     </strong>
                     <small>
                       {clip.includeInFinal ? "默认入片" : "备用素材"} ·{" "}
@@ -4559,7 +4091,7 @@ function MovieSetupDialog({
                   </span>
                   <span className="movie-plan-hero">
                     <UserRound />
-                    {heroLabel(clip.viewHero)}
+                    <span className="movie-plan-hero-name" title={heroLabel(clip.viewHero)}>{heroLabel(clip.viewHero)}</span>
                   </span>
                 </div>
               );
@@ -4586,7 +4118,17 @@ function MovieSetupDialog({
             <CircleAlert />
             <div className="export-error-content">
               <strong>{errorPresentation.title}</strong>
+              <small>错误编号：{errorPresentation.code}</small>
               <p>{errorPresentation.message}</p>
+              <ul>{errorPresentation.steps.map(step=><li key={step}>{step}</li>)}</ul>
+              <div className="diagnostic-export-actions">
+                <button className="secondary-button" type="button" onClick={()=>void copyDiagnostic()}>{diagnosticCopied?"排查信息已复制":"复制排查信息"}</button>
+                <button className="diagnostic-export-button" type="button" onClick={()=>void exportDiagnostic()} disabled={active||!isTauriRuntime}
+                  title={isTauriRuntime?"将本局日志与排查信息保存为 ZIP 文件":"请在桌面软件中导出排查包"}>
+                  {exportingDiagnostics?"正在导出排查包…":"导出排查包"}
+                </button>
+              </div>
+              {!isTauriRuntime&&<small className="diagnostic-export-note">浏览器预览无法导出排查包，请在桌面软件中操作。</small>}
               {errorPresentation.details && (
                 <details>
                   <summary>技术详情</summary>
@@ -4594,6 +4136,34 @@ function MovieSetupDialog({
                 </details>
               )}
             </div>
+          </div>
+        )}
+        {!errorPresentation&&!rendering&&(
+          <div className="dialog-feedback diagnostic-export-panel">
+            <FileText />
+            <div className="diagnostic-export-copy">
+              <button className="diagnostic-export-button" type="button" onClick={()=>void exportDiagnostic()} disabled={active||!isTauriRuntime}
+                title={isTauriRuntime?"保存本局日志，重新打开任务后也可导出":"请在桌面软件中导出排查包"}>
+                {exportingDiagnostics?"正在导出排查包…":"导出排查包"}
+              </button>
+              <small className="diagnostic-export-note">{isTauriRuntime?"遇到导出问题时，可将本局排查包发给维护者。":"浏览器预览无法导出排查包，请在桌面软件中操作。"}</small>
+            </div>
+          </div>
+        )}
+        {diagnosticArchive&&(
+          <div className="dialog-feedback" role="status">
+            <CheckCircle2 />
+            <div className="export-error-content">
+              <strong>排查包已保存（{diagnosticArchive.fileCount} 个文件）</strong>
+              <p>{diagnosticArchive.archivePath}</p>
+              {diagnosticArchive.warnings.map((warning,index)=><p key={`${index}:${warning}`}>{warning}</p>)}
+              <button className="secondary-button" type="button" onClick={()=>void openDiagnosticDirectory()} disabled={active}>打开所在文件夹</button>
+            </div>
+          </div>
+        )}
+        {diagnosticExportError&&(
+          <div className="dialog-feedback error" role="alert">
+            <CircleAlert /><span>排查包操作未完成：{diagnosticExportError}</span>
           </div>
         )}
         {feedback && !renderError && (
@@ -4718,60 +4288,87 @@ function SummaryStat({
 }
 
 function LibraryView({
-  jobs,
+  snapshot,
+  directory,
   busy,
+  loading,
+  error,
   onOpen,
   onImport,
+  onRefresh,
+  onChooseDirectory,
 }: {
-  jobs: RecentJob[];
+  snapshot: ReplayLibrarySnapshot | null;
+  directory: string;
   busy: boolean;
-  onOpen: (job: RecentJob) => void;
+  loading: boolean;
+  error: string;
+  onOpen: (file: ReplayLibraryFile) => void;
   onImport: () => void;
+  onRefresh: () => void;
+  onChooseDirectory: () => void;
 }) {
+  const files = snapshot?.files ?? [];
+  const displayDirectory = displayReplayDirectory(snapshot?.directory || directory);
   return (
-    <section className="library-view">
+    <section className="library-view replay-library">
       <div className="library-heading">
         <div>
-          <span className="eyebrow">本地任务</span>
+          <span className="eyebrow">本地录像 · 下载时间从新到旧</span>
           <h2>录像库</h2>
         </div>
-        <button className="primary-button" onClick={onImport}>
-          <FileUp />
-          <span>导入录像</span>
-        </button>
+        <div className="library-actions">
+          <button className="secondary-button" onClick={onChooseDirectory} disabled={busy}>
+            <FolderOpen /><span>选择目录</span>
+          </button>
+          <button className="secondary-button" onClick={onRefresh} disabled={loading}>
+            {loading ? <LoaderCircle className="spinning" /> : <RefreshCw />}<span>刷新</span>
+          </button>
+          <button className="primary-button" onClick={onImport} disabled={busy}>
+            <FileUp /><span>导入录像</span>
+          </button>
+        </div>
       </div>
+      <p className="replay-library-directory" title={displayDirectory || undefined}>
+        {displayDirectory || "尚未设置录像目录"}
+        {snapshot && <span className="library-count"> · {files.length} 个录像</span>}
+      </p>
+      {error && <p className="replay-library-error" role="alert">{error}</p>}
       <div className="library-table">
         <div className="library-table-head">
           <span>录像</span>
           <span>大小</span>
-          <span>候选</span>
-          <span>规划时长</span>
+          <span title="优先使用本机文件创建时间，缺失时使用修改时间。">下载时间 ↓</span>
+          <span>操作</span>
           <span />
         </div>
-        {jobs.map((job) => (
+        {files.map((file) => (
           <button
             className="library-row"
             disabled={busy}
-            key={job.jobId}
-            onClick={() => onOpen(job)}
+            key={file.path}
+            onClick={() => onOpen(file)}
+            title={`载入 ${file.name}`}
           >
             <span className="library-file">
               <FileVideo2 />
               <span>
-                <strong>{job.sourceName}</strong>
-                <small>{job.jobId}</small>
+                <strong>{file.name}</strong>
+                <small>Dota 2 本地录像</small>
               </span>
             </span>
-            <span>{formatBytes(job.byteLength)}</span>
-            <span>{job.candidateCount}</span>
-            <span>{formatDuration(job.durationSeconds)}</span>
+            <span>{formatBytes(file.byteLength)}</span>
+            <time title={replayTimeDescription(file.timeBasis)}>
+              {formatReplayDownloadTime(file.downloadedAtUnixMs)}
+            </time>
+            <span>载入高光</span>
             <ChevronRight />
           </button>
         ))}
-        {jobs.length === 0 && (
+        {files.length === 0 && (
           <div className="library-empty">
             <Library />
-            <span>还没有本地分析任务</span>
+            <span>{loading ? "正在读取本地录像…" : error ? "请检查目录后刷新，或重新选择目录。" : "此目录还没有 .dem 录像。"}</span>
           </div>
         )}
       </div>
@@ -4874,59 +4471,23 @@ function teamLabel(team: number | null) {
   return "阵容";
 }
 
-function createEmptyPlanSnapshot(): EditorPlanSnapshot {
-  return {
-    clipEdits: [],
-    selectedClipId: "",
-    highlightHero: "",
-    highlightRuleIds: [...DEFAULT_HIGHLIGHT_RULE_IDS],
-    sourceStoryId: null,
-    renderSettings: defaultRenderSettings,
-  };
-}
-
-function createEmptyPlanWorkspace(): Record<EditorPlanMode, EditorPlanSnapshot> {
-  return {
-    default: createEmptyPlanSnapshot(),
-    wtf: createEmptyPlanSnapshot(),
-  };
-}
-
-function createSavedPlanWorkspace(
+function createSavedDefaultPlan(
   result: AnalysisSummary,
   saved: LoadedEditPlan,
-  defaultFallback: EditorPlanSnapshot,
-): Record<EditorPlanMode, EditorPlanSnapshot> {
-  const workspace = createEmptyPlanWorkspace();
-  for (const mode of ["default", "wtf"] as const) {
-    const slot = saved.plans.find((plan) => plan.mode === mode);
-    if (!slot) {
-      workspace[mode] = mode === "default" ? defaultFallback : workspace[mode];
-      continue;
-    }
-    const clips = createClipEdits(result, slot);
-    const inferred = inferHighlightSelection(result.highlights.candidates, clips);
-    const savedRules = slot.highlightRuleIds.filter(isHighlightRuleId);
-    const selectedClipId =
-      slot.selectedClipId &&
-      clips.some((clip) => clip.clipId === slot.selectedClipId)
-        ? slot.selectedClipId
-        : (clips.find((clip) => clip.includeInFinal)?.clipId ??
-          clips[0]?.clipId ??
-          "");
-    workspace[mode] = {
-      clipEdits: clips,
-      selectedClipId,
-      highlightHero: slot.selectedHero ?? inferred.hero,
-      highlightRuleIds:
-        savedRules.length > 0
-          ? normalizeHighlightRuleIds(savedRules)
-          : inferred.ruleIds,
-      sourceStoryId: slot.sourceStoryId,
-      renderSettings: sanitizeRenderSettings(slot.settings),
-    };
-  }
-  return workspace;
+  fallback: EditorPlanSnapshot,
+): EditorPlanSnapshot {
+  const slot = saved.plans.find((plan) => plan.mode === "default");
+  if (!slot) return fallback;
+  const clips = createClipEdits(result, slot);
+  const inferred = inferHighlightSelection(result.highlights.candidates, clips);
+  const savedRules = slot.highlightRuleIds.filter(isHighlightRuleId);
+  const selectedClipId = slot.selectedClipId && clips.some((clip) => clip.clipId === slot.selectedClipId)
+    ? slot.selectedClipId : (clips.find((clip) => clip.includeInFinal)?.clipId ?? clips[0]?.clipId ?? "");
+  return {
+    clipEdits: clips, selectedClipId, highlightHero: slot.selectedHero ?? inferred.hero,
+    highlightRuleIds: savedRules.length > 0 ? normalizeHighlightRuleIds(savedRules) : inferred.ruleIds,
+    renderSettings: sanitizeRenderSettings(slot.settings),
+  };
 }
 
 function isHighlightRuleId(value: string): value is HighlightRuleId {
@@ -4934,7 +4495,7 @@ function isHighlightRuleId(value: string): value is HighlightRuleId {
 }
 
 function toEditPlanSlot(
-  mode: EditorPlanMode,
+  mode: "default",
   snapshot: EditorPlanSnapshot,
 ): EditPlanSlot {
   return {
@@ -4942,14 +4503,10 @@ function toEditPlanSlot(
     selectedHero: snapshot.highlightHero || null,
     highlightRuleIds: snapshot.highlightRuleIds,
     selectedClipId: snapshot.selectedClipId || null,
-    sourceStoryId: snapshot.sourceStoryId,
+    sourceStoryId: null,
     clips: planClips(snapshot.clipEdits),
     settings: snapshot.renderSettings,
   };
-}
-
-function editorModeLabel(mode: EditorPlanMode) {
-  return mode === "wtf" ? "WTF 导演" : "默认剪辑";
 }
 
 function createClipEdits(
@@ -4967,6 +4524,7 @@ function createClipEdits(
       return {
       clipId: clip.clipId || `clip-saved-${String(index + 1).padStart(2, "0")}`,
       candidateId: clip.candidateId,
+      imported: clip.imported ? { ...clip.imported } : null,
       viewHero:
         clip.viewHero ??
         result.replay.players[0]?.hero_name ??
@@ -4990,26 +4548,13 @@ function createClipEdits(
     );
   }
 
-  const segments = new Map(
-    result.director.segments.map((segment) => [
-      segment.candidate_id,
-      segment,
-    ]),
-  );
-  const sourceCandidates = result.director.segments.length
-    ? result.director.segments
-        .map((segment) =>
-          result.highlights.candidates.find(
-            (candidate) => candidate.id === segment.candidate_id,
-          ),
-        )
-        .filter((candidate): candidate is HighlightCandidate => Boolean(candidate))
-    : result.highlights.candidates.slice(0, 3);
+  const sourceCandidates = result.highlights.candidates
+    .filter((candidate) => candidate.kind === "hero_kill_sequence")
+    .slice(0, 3);
 
   return sourceCandidates.map((candidate, index) => {
-    const segment = segments.get(candidate.id);
-    const start = segment?.source_start_seconds ?? candidate.start_seconds;
-    const unclampedEnd = segment?.source_end_seconds ?? candidate.end_seconds;
+    const start = candidate.start_seconds;
+    const unclampedEnd = candidate.end_seconds;
     const end = Math.min(
       replayEndFrame(result.replay.playback_time_seconds),
       start + Math.min(90, Math.max(1, unclampedEnd - start)),
@@ -5018,7 +4563,6 @@ function createClipEdits(
       clipId: `clip-recommended-${String(index + 1).padStart(2, "0")}`,
       candidateId: candidate.id,
       viewHero:
-        segment?.primary_hero ??
         candidate.primary_hero ??
         candidate.participants[0] ??
         result.replay.players[0]?.hero_name ??
@@ -5068,135 +4612,6 @@ function createHeroHighlightClips(
   });
 }
 
-function createStoryClips(story: HighlightStory, replayDuration: number): ClipEdits {
-  return [...story.shots]
-    .sort((left, right) => left.order - right.order)
-    .map((shot) => {
-      const range = frameRangeWithinReplay(shot.source_start_seconds, shot.source_end_seconds, replayDuration);
-      return {
-        clipId: `clip-${shot.id}`,
-        candidateId: shot.candidate_id,
-        viewHero: shot.target_hero ?? story.primary_hero,
-        cameraMode: shot.camera_mode === "hero_chase" ? "hero_chase" : "player_perspective",
-        takeGroupId: shot.take_group_id,
-        takeRole: shot.take_role,
-        includeInFinal: shot.include_in_default_cut,
-        ...shortDurationState(range.startSeconds, range.endSeconds),
-        ...range,
-      };
-    });
-}
-
-function storyDefaultDuration(story: HighlightStory) {
-  return story.shots.reduce(
-    (total, shot) =>
-      total +
-      (shot.include_in_default_cut
-        ? Math.max(
-            0,
-            shot.source_end_seconds - shot.source_start_seconds,
-          )
-        : 0),
-    0,
-  );
-}
-
-function storySceneCount(story: HighlightStory) {
-  return new Set(story.shots.map((shot) => shot.take_group_id)).size;
-}
-
-function storyTitle(story: HighlightStory) {
-  if (
-    story.category === "comedy" &&
-    story.template_id === "hoodwink_ground_acorn_quelling_blade"
-  ) {
-    return `${heroLabel(story.primary_hero)}反复用补刀斧砍树`;
-  }
-  if (story.category === "skill") {
-    const kills = story.evidence.filter(
-      (evidence) => evidence.kind === "kill",
-    ).length;
-    return `${heroLabel(story.primary_hero)} · ${kills} 次击杀连续段`;
-  }
-  if (
-    story.category === "mistake" &&
-    story.template_id === "buyback_dieback_v1"
-  ) {
-    const setup = story.evidence.find(
-      (evidence) => evidence.action === "buyback",
-    );
-    const death = story.evidence.find(
-      (evidence) => evidence.kind === "kill",
-    );
-    const delay =
-      setup && death
-        ? Math.max(0, death.time_seconds - setup.time_seconds)
-        : null;
-    return `${heroLabel(story.primary_hero)}买活后${
-      delay === null ? "" : `${delay.toFixed(1)} 秒`
-    }再次阵亡`;
-  }
-  return `${heroLabel(story.primary_hero)} · ${storyCategoryLabel(
-    story.category,
-  )}故事`;
-}
-
-function storyCategoryLabel(category: StoryCategory) {
-  switch (category) {
-    case "comedy":
-      return "趣味互动";
-    case "skill":
-      return "精彩操作";
-    case "mistake":
-      return "失误与惩罚";
-    case "fight":
-      return "团战";
-    case "objective":
-      return "推进";
-  }
-}
-
-function storyConfidenceLabel(
-  level: HighlightStory["confidence"]["level"],
-) {
-  switch (level) {
-    case "high":
-      return "高置信";
-    case "medium":
-      return "中置信";
-    case "low":
-      return "低置信";
-  }
-}
-
-function storyBeatLabel(kind: HighlightStory["beats"][number]["kind"]) {
-  switch (kind) {
-    case "setup":
-      return "铺垫";
-    case "development":
-      return "发展";
-    case "turn":
-      return "转折";
-    case "payoff":
-      return "落点";
-    case "reaction":
-      return "反应";
-  }
-}
-
-function storyCameraModeLabel(
-  mode: HighlightStory["shots"][number]["camera_mode"],
-) {
-  switch (mode) {
-    case "player_perspective":
-      return "玩家视角";
-    case "hero_chase":
-      return "英雄跟随";
-    case "directed":
-      return "导播视角";
-  }
-}
-
 function takeRoleLabel(role: StoryTakeRole) {
   return role === "primary" ? "主机位" : "备用机位";
 }
@@ -5208,18 +4623,6 @@ function clipAssetLabels(clips: ClipEdits) {
       groupId: clip.takeGroupId,
       role: clip.takeRole,
     })),
-  );
-}
-
-function storyAssetLabels(story: HighlightStory) {
-  return buildAssetLabels(
-    [...story.shots]
-      .sort((left, right) => left.order - right.order)
-      .map((shot) => ({
-        id: shot.id,
-        groupId: shot.take_group_id,
-        role: shot.take_role,
-      })),
   );
 }
 
@@ -5268,39 +4671,6 @@ function takeCode(index: number) {
     value = Math.floor(value / 26);
   }
   return code;
-}
-
-function storyEvidenceSummary(story: HighlightStory) {
-  if (story.category === "comedy") {
-    const reactions = story.evidence.filter(
-      (evidence) => evidence.kind === "reaction",
-    ).length;
-    return `${story.candidate_ids.length} 次临时树创建、补刀斧指令与同树删除均已匹配${
-      reactions > 0 ? `，另有 ${reactions} 次打赏反应` : ""
-    }。`;
-  }
-  if (story.category === "skill") {
-    const kills = story.evidence.filter(
-      (evidence) => evidence.kind === "kill",
-    );
-    const actions = Array.from(
-      new Set(
-        story.evidence
-          .filter((evidence) => evidence.kind === "trigger")
-          .map((evidence) => actionLabel(evidence.action))
-          .filter(Boolean),
-      ),
-    );
-    return `${kills.length} 次英雄死亡归因明确${
-      actions.length > 0 ? `，起手包含 ${actions.join("、")}` : ""
-    }。`;
-  }
-  if (story.category === "mistake") {
-    return story.review_required
-      ? "买活与再次阵亡均已确认，但间隔较长，采用前需要人工判断剧情是否成立。"
-      : "买活后短时间内再次阵亡，因果时间紧密，可作为失误与惩罚故事。";
-  }
-  return `${story.evidence.length} 条录像证据，${story.beats.length} 个故事节拍。`;
 }
 
 function heroKillCount(result: AnalysisSummary, hero: string) {
@@ -5355,12 +4725,7 @@ function heroHighlightSummary(
   ) {
     return { label: "主角击杀", value: `${heroKillCount(result, hero)} 次` };
   }
-  if (
-    normalizedRules.length === 1 &&
-    normalizedRules[0] === VERIFIED_TREE_CUT_RULE_ID
-  ) {
-    return { label: "砍树高光", value: `${clipCount} 段` };
-  }
+
   return { label: "高光片段", value: `${clipCount} 段` };
 }
 
@@ -5368,6 +4733,7 @@ function planClips(clipEdits: ClipEdits): EditPlanClip[] {
   return clipEdits.map((clip) => ({
     clipId: clip.clipId,
     candidateId: clip.candidateId,
+    imported: clip.imported ? { ...clip.imported } : null,
     viewHero: clip.viewHero || null,
     cameraMode: clip.cameraMode,
     takeGroupId: clip.takeGroupId,
@@ -5402,6 +4768,16 @@ function sanitizeRenderSettings(
 
 function createClipId() {
   return `clip-${crypto.randomUUID()}`;
+}
+
+function copyImportedMetadata(imported: ImportedClip | null | undefined): ImportedClip | null {
+  if (!imported) return null;
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return {
+    ...imported,
+    sourceId: Array.from(bytes, value => value.toString(16).padStart(2, "0")).join(""),
+    candidateSourceId: imported.candidateSourceId ?? imported.sourceId,
+  };
 }
 
 function normalizeUserCameraMode(
@@ -5518,19 +4894,7 @@ function candidateTitle(candidate: HighlightCandidate) {
       target ? ` · ${heroLabel(target)}` : ""
     }`;
   }
-  if (
-    candidate.kind === "mechanical_counterplay" &&
-    candidate.interaction?.pattern_id ===
-      "hoodwink_ground_acorn_quelling_blade"
-  ) {
-    const { occurrenceIndex, occurrenceCount } = {
-      occurrenceIndex: candidate.interaction.occurrence_index,
-      occurrenceCount: candidate.interaction.occurrence_count,
-    };
-    return occurrenceCount > 1
-      ? `补刀斧砍树 · ${occurrenceIndex}/${occurrenceCount}`
-      : "补刀斧砍树";
-  }
+
   if (candidate.kind === "first_blood") {
     return "一血爆发";
   }

@@ -1,0 +1,15 @@
+{
+  "protocol": "maomao.module/1",
+  "id": "maomao.wtf-editor",
+  "toolId": "wtf",
+  "name": "WTF 剪辑",
+  "version": "2.5.0",
+  "entry": "WTF剪辑.exe",
+  "capabilities": [
+    "analyze.stories/1.2",
+    "edit.synchronized-takes/1.0",
+    "save.wtf-draft/1.0",
+    "export.timestamp-plan/1.2",
+    "handoff.clipper"
+  ]
+}

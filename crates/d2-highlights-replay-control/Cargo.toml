@@ -1,7 +1,6 @@
 [package]
 name = "d2-highlights-replay-control"
 version.workspace = true
-authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true

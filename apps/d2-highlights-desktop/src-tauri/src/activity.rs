@@ -40,7 +40,7 @@ impl Activities {
                 Activity::Render => "成片任务正在运行，请等待完成或先取消。",
                 Activity::Analysis => "录像正在分析，请等待完成。",
                 Activity::Save => "剪辑方案正在保存，请稍后重试。",
-                Activity::Export => "分析包正在导出，请等待完成。",
+                Activity::Export => "文件正在导出，请等待完成。",
             }
             .into());
         }

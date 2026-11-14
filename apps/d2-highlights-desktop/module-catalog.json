@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "modules": [
+    { "id": "wtf", "name": "WTF 剪辑", "released": false },
+    { "id": "story", "name": "剧情剪辑", "released": false },
+    { "id": "analysis", "name": "录像分析", "released": false }
+  ]
+}

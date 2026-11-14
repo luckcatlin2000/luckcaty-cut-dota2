@@ -140,7 +140,7 @@ export const miranaDevelopmentSummary: AnalysisSummary = {
       {
         slot: 9,
         hero_name: "npc_dota_hero_mirana",
-        player_name: "Player A",
+        player_name: "猫猫只用虎",
         game_team: 3,
         is_fake_client: false,
       },

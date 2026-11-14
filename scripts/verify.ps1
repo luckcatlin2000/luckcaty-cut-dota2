@@ -4,12 +4,12 @@ param()
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $desktopRoot = Join-Path $projectRoot 'apps\d2-highlights-desktop'
+$updaterVerifyScript = Join-Path $PSScriptRoot 'verify-updater.ps1'
 Push-Location -LiteralPath $projectRoot
 
 try {
-    $changelog = Get-Content -Raw -Encoding UTF8 -LiteralPath (
-        Join-Path $projectRoot 'CHANGELOG.md'
-    )
+    $changelogPath = Join-Path $projectRoot 'CHANGELOG.md'
+    $changelog = Get-Content -Raw -Encoding UTF8 -LiteralPath $changelogPath
     $authorWord = -join @([char]0x4F5C, [char]0x8005)
     $authorName = -join @(
         [char]0x732B,
@@ -43,23 +43,21 @@ try {
         throw "Runtime source must not read or retain Steam account data: $($locations -join ', ')"
     }
 
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (
-        Join-Path $projectRoot 'skills\dota2-replay-camera-director\scripts\validate-camera-plan.ps1'
-    ) -SelfTest
+    $cameraSkillValidator = Join-Path $projectRoot `
+        'skills\dota2-replay-camera-director\scripts\validate-camera-plan.ps1'
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $cameraSkillValidator -SelfTest
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (
-        Join-Path $PSScriptRoot "verify-updater.ps1"
-    )
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $updaterVerifyScript
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     & cargo fmt --all -- --check
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    & cargo test --locked --workspace
+    & cargo test --offline --workspace
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    & cargo clippy --locked --workspace --all-targets -- -D warnings
+    & cargo clippy --offline --workspace --all-targets -- -D warnings
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
     Push-Location -LiteralPath $desktopRoot

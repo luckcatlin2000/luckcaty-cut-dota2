@@ -24,7 +24,7 @@ if (-not (Test-Path -LiteralPath $timeline -PathType Leaf)) {
 Push-Location -LiteralPath $projectRoot
 try {
     if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
-        & cargo build --locked -p d2-highlights-cli
+        & cargo build --offline -p d2-highlights-cli
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 

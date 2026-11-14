@@ -1,9 +1,5 @@
 export const HERO_KILL_RULE_ID = "hero_kill_sequence";
-export const VERIFIED_TREE_CUT_RULE_ID = "verified_tree_cut";
-
-export type HighlightRuleId =
-  | typeof HERO_KILL_RULE_ID
-  | typeof VERIFIED_TREE_CUT_RULE_ID;
+export type HighlightRuleId = typeof HERO_KILL_RULE_ID;
 
 export interface HighlightRuleDefinition {
   id: HighlightRuleId;
@@ -20,10 +16,6 @@ export interface HighlightRuleQueryResult {
 
 interface CandidateLike {
   kind: string;
-  interaction?: {
-    pattern_id: string;
-    verification?: unknown;
-  };
 }
 
 interface HeroCandidateLike extends CandidateLike {
@@ -57,22 +49,6 @@ export const HIGHLIGHT_RULES: readonly HighlightRuleDefinition[] = [
       "人头",
       "kills",
       "kill",
-    ],
-  },
-  {
-    id: VERIFIED_TREE_CUT_RULE_ID,
-    label: "砍树",
-    description: "补刀斧砍掉森海飞霞生成的临时树",
-    aliases: [
-      "补刀斧砍树",
-      "压制之刃砍树",
-      "砍掉种树",
-      "砍种树",
-      "砍树",
-      "开树",
-      "补刀斧",
-      "压制之刃",
-      "种树",
     ],
   },
 ];
@@ -137,18 +113,11 @@ export function candidateHighlightRuleId(
   if (candidate.kind === HERO_KILL_RULE_ID) {
     return HERO_KILL_RULE_ID;
   }
-  if (
-    candidate.interaction?.pattern_id ===
-      "hoodwink_ground_acorn_quelling_blade" &&
-    Boolean(candidate.interaction.verification)
-  ) {
-    return VERIFIED_TREE_CUT_RULE_ID;
-  }
   return null;
 }
 
 export function normalizeHighlightRuleIds(
-  ruleIds: readonly HighlightRuleId[],
+  ruleIds: readonly string[],
 ): HighlightRuleId[] {
   const selected = new Set(ruleIds);
   return HIGHLIGHT_RULES.map((rule) => rule.id).filter((id) =>
@@ -182,18 +151,22 @@ export function inferHighlightSelection<
   clips: readonly C[],
 ): HighlightSelectionInference {
   const heroes = new Set(clips.map((clip) => clip.viewHero).filter(Boolean));
-  if (clips.length === 0 || heroes.size !== 1) {
+  if (clips.length === 0) {
     return {
       hero: "",
       ruleIds: [...DEFAULT_HIGHLIGHT_RULE_IDS],
     };
   }
 
+  if (heroes.size !== 1) {
+    return { hero: "", ruleIds: [] };
+  }
+
   const [hero] = heroes;
   if (!hero) {
     return {
       hero: "",
-      ruleIds: [...DEFAULT_HIGHLIGHT_RULE_IDS],
+      ruleIds: [],
     };
   }
 
@@ -209,7 +182,7 @@ export function inferHighlightSelection<
     if (!candidate || candidate.primary_hero !== hero || !ruleId) {
       return {
         hero: "",
-        ruleIds: [...DEFAULT_HIGHLIGHT_RULE_IDS],
+        ruleIds: [],
       };
     }
     ruleIds.push(ruleId);

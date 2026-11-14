@@ -38,6 +38,9 @@ jobs:
         working-directory: apps/d2-highlights-desktop
         run: npm ci
 
+      - name: Fetch locked Rust dependencies
+        run: cargo fetch --locked
+
       - name: Prepare FFmpeg resources
         shell: powershell
         run: |

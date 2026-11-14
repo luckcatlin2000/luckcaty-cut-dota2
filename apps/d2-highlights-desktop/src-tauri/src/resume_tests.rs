@@ -1,4 +1,4 @@
-// Read-only integration proof using the exact saved-plan-to-render conversion.
+// Read-only integration proof using the saved highlight plan.
 use super::*;
 
 #[test]
@@ -10,7 +10,6 @@ fn inspect_existing_recording_checkpoint_read_only() {
     let before_logs = fs::read_dir(&logs).unwrap().count();
     let state = AppState {
         jobs_root: job_dir.parent().unwrap().into(),
-        analysis_export_directory: PathBuf::new(),
         dota2_runtime: Arc::new(Mutex::new(Dota2Runtime {
             executable: Some(
                 std::env::var_os("D2H_DOTA2_EXE")
@@ -20,11 +19,11 @@ fn inspect_existing_recording_checkpoint_read_only() {
             source: Dota2PathSource::Custom,
         })),
         dota2_settings_path: PathBuf::new(),
+        video_output: video_output::Settings::default(),
         ffmpeg_exe: Some(std::env::var_os("D2H_FFMPEG").expect("FFmpeg").into()),
         ffprobe_exe: Some(std::env::var_os("D2H_FFPROBE").expect("FFprobe").into()),
         render_runtime: Arc::new(Mutex::new(RenderRuntime::default())),
         activities: Activities::default(),
-        exported_packages: Arc::new(Mutex::new(HashSet::new())),
     };
     let request = build_render_request(job_id, &state).unwrap();
     let summary = inspect_resume(&request, &CancellationToken::new()).unwrap();

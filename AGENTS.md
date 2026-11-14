@@ -2,9 +2,13 @@
 
 ## 目标
 
-维护一个 Windows 本地 Dota 2 DEM 可解释故事与精确剪辑工具：
+维护一个 Windows 本地 Dota 2 DEM 高光精确剪辑工具：
 
-`只读解析 -> 可解释故事/人工片段 -> 编号同步机位 -> Dota 2 离线导出 -> 游戏原声 MP4`
+`只读击杀解析 -> 高光/人工片段 -> 编号同步机位 -> Dota 2 离线导出 -> 游戏原声 MP4`
+
+当前桌面主程序仅内置高光，普通/干净画面保留。WTF剪辑为独立模块，与录像分析分开，高光中不再提供默认/WTF切换；剧情与录像分析通过外接入口衔接。通用接口约定见 `docs/RECORDING_INTEGRATION.md`，不得把占位按钮描述为已安装、已连接或已完成全部自动规则迁移。
+
+2.5.0为当前待用户验收候选，用户确认后再上传GitHub；原入口不因候选构建自动替换。当前GitHub交付范围只有高光时刻；WTF、剧情和录像分析均未正式提供，主程序按钮统一提示，不因本机存在内部候选而启动。发布状态由`apps/d2-highlights-desktop/module-catalog.json`统一管理；正式提供并开放对应状态后才按`maomao.module/1`发现已安装模块并打开，未安装时提示下载。既往高光验收不扩大为本轮所有机位、新分析场景或外部机器故障均已解决。
 
 ## 入口
 
@@ -15,6 +19,8 @@
 - 回放控制：`crates/d2-highlights-replay-control`
 - 渲染与 FFmpeg：`crates/d2-highlights-renderer`
 - 验证：`scripts/verify.ps1`
+- 当前基线：`docs/CURRENT_STATE.md`；本地归档与目录规则：`docs/LOCAL_WORKSPACE.md`
+- 本仓库为唯一日常开发入口；`.local/` 为本机恢复资料，禁止提交。
 
 ## 边界
 
@@ -44,7 +50,7 @@
 - `cargo test --workspace` 通过。
 - `cargo clippy --workspace --all-targets -- -D warnings` 通过。
 - 全部前端测试与生产构建通过。
-- 双方案切换、故事证据、同步素材编号、片段编辑、10 人英雄选择和导出预览有自动测试覆盖。
+- 默认高光、旧 WTF 草稿保全、同步素材编号、片段编辑、10 人英雄选择、外接提示和导出预览有自动测试覆盖。
 - 正式发布通过版本标签、候选哈希、完整验证和冷启动门禁。
 
 ```powershell

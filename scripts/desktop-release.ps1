@@ -7,6 +7,15 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $DesktopRoot = Join-Path $ProjectRoot "apps\d2-highlights-desktop"
 $ReleaseRoot = Join-Path $ProjectRoot "release"
+$CargoTargetRoot = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+    Join-Path $ProjectRoot "target"
+}
+elseif ([IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+    [IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+}
+else {
+    [IO.Path]::GetFullPath((Join-Path $ProjectRoot $env:CARGO_TARGET_DIR))
+}
 $VerifyScript = Join-Path $PSScriptRoot "verify.ps1"
 $TauriConfigPath = Join-Path $DesktopRoot "src-tauri\tauri.conf.json"
 $SigningRoot = if ([string]::IsNullOrWhiteSpace($SigningRootOverride)) {
@@ -99,7 +108,7 @@ finally {
     $SigningPassword = $null
 }
 
-$BuiltExecutable = Join-Path $ProjectRoot "target\release\cat-cut-assistant.exe"
+$BuiltExecutable = Join-Path $CargoTargetRoot "release\cat-cut-assistant.exe"
 $ExecutableBytes = [System.IO.File]::ReadAllBytes($BuiltExecutable)
 if ($ExecutableBytes.Length -lt 256 -or
     $ExecutableBytes[0] -ne 0x4D -or
@@ -123,7 +132,7 @@ if ([string]::IsNullOrWhiteSpace($ProductName)) {
     throw "The built executable does not define a product name."
 }
 
-$BundleRoot = Join-Path $ProjectRoot "target\release\bundle\nsis"
+$BundleRoot = Join-Path $CargoTargetRoot "release\bundle\nsis"
 $BuiltInstallers = @(
     Get-ChildItem -LiteralPath $BundleRoot -File |
         Where-Object { $_.Name -like "*_${Version}_x64-setup.exe" }

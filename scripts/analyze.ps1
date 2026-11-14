@@ -15,7 +15,7 @@ $binary = Join-Path $projectRoot 'target\debug\d2-highlights.exe'
 Push-Location -LiteralPath $projectRoot
 try {
     if (-not (Test-Path -LiteralPath $binary)) {
-        & cargo build --locked -p d2-highlights-cli
+        & cargo build --offline -p d2-highlights-cli
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 

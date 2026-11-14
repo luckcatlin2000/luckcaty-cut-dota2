@@ -7,6 +7,7 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license-file.workspace = true
+default-run = "cat-cut-assistant"
 
 [lib]
 name = "d2_highlights_desktop_lib"
@@ -15,6 +16,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [[bin]]
 name = "cat-cut-assistant"
 path = "src/main.rs"
+
+[[bin]]
+name = "maomao-wtf-director"
+path = "src/bin/wtf.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -25,9 +30,11 @@ d2-highlights-pipeline = { path = "../../../crates/d2-highlights-pipeline" }
 d2-highlights-renderer = { path = "../../../crates/d2-highlights-renderer" }
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2.10.1"
+zip = { version = "4.6.1", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true

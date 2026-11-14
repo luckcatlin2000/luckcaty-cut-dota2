@@ -10,8 +10,7 @@ use audio::write_original_bgm;
 use capture_files::CaptureFiles;
 use d2_highlights_core::TimelineDocument;
 use d2_highlights_replay_control::{
-    DEMO_STATUS_COMMAND, ReplayControlError, VConsoleExecutionReport, execute_vconsole_commands,
-    probe_vconsole,
+    DEMO_STATUS_COMMAND, ReplayControlError, VConsoleExecutionReport, VConsoleSession,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,7 +38,7 @@ use windows_sys::Win32::System::Diagnostics::Debug::{
 
 pub const RENDER_SCHEMA_VERSION: &str = "d2h.render/1.9";
 // Bump this whenever Dota capture commands or frame/audio encoding behavior changes.
-const CAPTURE_PIPELINE_VERSION: &str = "d2h.capture/1.9.13-native-quality-16";
+const CAPTURE_PIPELINE_VERSION: &str = "d2h.capture/2.3.8-selected-hero-switch-17";
 // Native capture/output cadence is independent of the 30 Hz editor time grid.
 const FRAME_RATE: u32 = 60;
 const NATIVE_JPEG_QUALITY: u32 = 100;
@@ -48,6 +47,8 @@ const VIDEO_CRF: &str = "16";
 // matrix/range at high precision; do not apply brightness or gamma filters.
 const NATIVE_VIDEO_FILTER: &str = "pad=ceil(iw/2)*2:ceil(ih/2)*2:color=black,zscale=matrixin=470bg:matrix=709:rangein=full:range=limited:dither=error_diffusion,format=yuv420p,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709";
 const CAPTURE_PREROLL_SECONDS: f32 = 1.0;
+const CAMERA_REASSERT_CAPTURE_FRAMES: usize = FRAME_RATE as usize / 2;
+const CAPTURE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const VCONSOLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -345,9 +346,9 @@ pub enum RenderError {
     #[error("Dota 2 已在运行。请先正常关闭客户端，再开始离线成片。")]
     DotaAlreadyRunning,
     #[error(
-        "Steam 未运行。普通画面的 Dota 2 原生玩家昵称会显示为‘未知’。请手动打开并登录 Steam，等待连接稳定后再重试；本软件不会自动启动或登录 Steam。"
+        "Steam 未运行。请手动打开并登录 Steam，保持运行后重试录制；本软件不会自动启动或登录 Steam。"
     )]
-    SteamRequiredForNativeNames,
+    SteamRequiredForRecording,
     #[error("找不到或无法运行 {0}。")]
     MissingTool(String),
     #[error("录像文件不存在：{0}")]
@@ -399,12 +400,15 @@ where
     if cancellation.is_cancelled() {
         result = Err(RenderError::Cancelled);
     }
-    execution::record(
+    let final_log_result = execution::record(
         "render_finished",
         serde_json::json!({
             "success": result.is_ok(), "error": result.as_ref().err().map(ToString::to_string),
         }),
-    )?;
+    );
+    if result.is_ok() {
+        final_log_result?;
+    }
     result
 }
 
@@ -473,12 +477,7 @@ where
         }
         segments
     } else {
-        if dota_is_running()? {
-            return Err(RenderError::DotaAlreadyRunning);
-        }
-        if native_player_names_require_steam(request.settings.clean_hud) && !steam_is_running()? {
-            return Err(RenderError::SteamRequiredForNativeNames);
-        }
+        validate_recording_clients(dota_is_running()?, steam_is_running()?)?;
         let movie_dir = dota_game_dir(&request.dota2_exe)?
             .join("dota")
             .join("movie");
@@ -504,7 +503,7 @@ where
             0,
             request.clips.len(),
         );
-        let mut owned_dota = OwnedDota(launch_dota(&request.dota2_exe)?);
+        let mut owned_dota = OwnedDota(launch_dota(&request.dota2_exe)?, None);
         // From successful spawn until verified shutdown there is no early return,
         // including a diagnostic-write failure or a cancelled capture session.
         let session_result = (|| {
@@ -522,10 +521,16 @@ where
                 &saved,
                 &cancellation,
                 &mut owned_dota.0,
+                &mut owned_dota.1,
                 &mut on_progress,
             )
         })();
-        finish_dota_session(&mut owned_dota.0, request.clips.len(), &mut on_progress);
+        finish_dota_session(
+            &mut owned_dota.0,
+            &mut owned_dota.1,
+            request.clips.len(),
+            &mut on_progress,
+        );
 
         session_result?
     };
@@ -867,12 +872,13 @@ fn run_dota_session<F>(
     saved: &BTreeMap<String, PathBuf>,
     cancellation: &CancellationToken,
     child: &mut Child,
+    control: &mut Option<VConsoleSession>,
     on_progress: &mut F,
 ) -> Result<Vec<PathBuf>, RenderError>
 where
     F: FnMut(RenderProgress),
 {
-    wait_for_vconsole(child, cancellation, |elapsed_seconds| {
+    wait_for_vconsole(child, control, cancellation, |elapsed_seconds| {
         emit(
             on_progress,
             "launch",
@@ -883,6 +889,7 @@ where
             request.clips.len(),
         );
     })?;
+    let control = control.as_mut().expect("VConsole handshake completed");
     check_cancelled(cancellation)?;
     emit(
         on_progress,
@@ -893,8 +900,14 @@ where
         0,
         request.clips.len(),
     );
-    send_commands(&[format!("playdemo {replay_reference}")])?;
-    wait_with_cancel(Duration::from_secs(12), cancellation, child, |_| {})?;
+    send_commands(control, &[format!("playdemo {replay_reference}")])?;
+    wait_with_cancel(
+        Duration::from_secs(12),
+        cancellation,
+        child,
+        control,
+        |_| {},
+    )?;
 
     let total = request.clips.len();
     let mut rendered_segments = Vec::with_capacity(total);
@@ -946,6 +959,7 @@ where
             &base_path,
             cancellation,
             child,
+            control,
             |elapsed, total_duration| {
                 let fraction = if total_duration > 0.0 {
                     (elapsed / total_duration).clamp(0.0, 1.0)
@@ -1026,6 +1040,7 @@ fn capture_clip<P>(
     base_path: &Path,
     cancellation: &CancellationToken,
     child: &mut Child,
+    control: &mut VConsoleSession,
     mut on_tick: P,
 ) -> Result<CaptureDiagnostics, RenderError>
 where
@@ -1046,17 +1061,28 @@ where
     let capture_start_tick = start_tick.saturating_sub(requested_preroll_ticks);
     let preroll_seconds = (start_tick - capture_start_tick) as f32 / ticks_per_second;
 
-    send_commands(&["demo_resume".to_string()])?;
+    send_commands(control, &["demo_resume".to_string()])?;
     thread::sleep(Duration::from_millis(350));
-    send_commands(&[format!("demo_goto {capture_start_tick} absolute pause")])?;
-    let observed_tick = wait_for_seek(capture_start_tick, cancellation, child)?;
+    send_commands(
+        control,
+        &[format!("demo_goto {capture_start_tick} absolute pause")],
+    )?;
+    let observed_tick = wait_for_seek(capture_start_tick, cancellation, child, control)?;
 
+    let camera_commands = camera_commands_for_clip(&request.timeline, clip);
     let mut setup_commands = vec!["demo_timescale 1.000".to_string()];
-    setup_commands.extend(camera_commands_for_clip(&request.timeline, clip));
     setup_commands.extend(hud_commands(request.settings.clean_hud));
-    send_commands(&setup_commands)?;
-    wait_with_cancel(Duration::from_millis(250), cancellation, child, |_| {})?;
-    let camera_report = execute_logged_commands(&["dota_camera_get_lookatpos".to_string()])?;
+    setup_commands.extend(camera_commands.iter().cloned());
+    send_commands(control, &setup_commands)?;
+    wait_with_cancel(
+        Duration::from_millis(250),
+        cancellation,
+        child,
+        control,
+        |_| {},
+    )?;
+    let camera_report =
+        execute_logged_commands(control, &["dota_camera_get_lookatpos".to_string()])?;
     let observed_look_at = camera_report
         .console_excerpt
         .iter()
@@ -1069,7 +1095,7 @@ where
     // A real position response proves only that the camera answered. It does
     // not prove the requested hero/mode is active. Never upgrade this to a
     // target-verified cache without a separately validated feedback contract.
-    wait_for_seek(capture_start_tick, cancellation, child)?;
+    wait_for_seek(capture_start_tick, cancellation, child, control)?;
     let mut diagnostics = CaptureDiagnostics {
         clip_id: clip.clip_id.clone(),
         requested_camera: clip.camera_mode.clone(),
@@ -1107,52 +1133,88 @@ where
     let output_frame_count = frame_count_for_duration(total_output_duration);
     let preroll_frame_count = frame_count_for_duration(preroll_seconds);
     let capture_frame_count = preroll_frame_count + output_frame_count;
+    diagnostics.expected_frames = capture_frame_count;
+    write_json(&clip_dir.join("capture-diagnostics.json"), &diagnostics)?;
+    let mut diagnostic_record = CaptureDiagnosticRecord {
+        path: clip_dir.join("capture-diagnostics.json"),
+        diagnostics: &mut diagnostics,
+    };
     let impact_start_frame = preroll_frame_count + frame_count_for_duration(impact_start);
     let impact_output_end_frame = preroll_frame_count
         + frame_count_for_duration(impact_start + (impact_end - impact_start) / slow_speed);
 
-    send_commands(&[
-        format!(
-            "startmovie {prefix} jpg wav jpeg_quality {NATIVE_JPEG_QUALITY} framerate {FRAME_RATE}"
-        ),
-        format!("demo_pauseatservertick {end_tick}"),
-        "demo_resume".to_string(),
-    ])?;
+    send_commands(
+        control,
+        &[
+            format!(
+                "startmovie {prefix} jpg wav jpeg_quality {NATIVE_JPEG_QUALITY} framerate {FRAME_RATE}"
+            ),
+            format!("demo_pauseatservertick {end_tick}"),
+            "demo_resume".to_string(),
+        ],
+    )?;
     let started = Instant::now();
+    // Apply the current clip's target again after playback has resumed. Keep
+    // this inside the existing discarded preroll; no source bounds or final
+    // duration change, and never substitute another camera mode or hero.
+    if let Some(target_frames) =
+        camera_reassert_frame_target(&clip.camera_mode, preroll_frame_count, capture_frame_count)
+    {
+        if target_frames > 0 {
+            wait_for_capture_frame_count(
+                &mut capture_files,
+                target_frames,
+                capture_frame_count,
+                started,
+                &mut diagnostic_record,
+                cancellation,
+                child,
+                control,
+                &mut on_tick,
+            )?;
+        }
+        send_commands(control, &camera_commands)?;
+    }
     if slow_speed < 1.0 && impact_end > impact_start {
         wait_for_capture_frame_count(
             &mut capture_files,
             impact_start_frame,
             capture_frame_count,
             started,
+            &mut diagnostic_record,
             cancellation,
             child,
+            control,
             &mut on_tick,
         )?;
         let impact_commands = vec![format!("demo_timescale {slow_speed:.3}")];
-        send_commands(&impact_commands)?;
+        send_commands(control, &impact_commands)?;
         wait_for_capture_frame_count(
             &mut capture_files,
             impact_output_end_frame,
             capture_frame_count,
             started,
+            &mut diagnostic_record,
             cancellation,
             child,
+            control,
             &mut on_tick,
         )?;
         let result_commands = vec!["demo_timescale 1.000".to_string()];
-        send_commands(&result_commands)?;
+        send_commands(control, &result_commands)?;
     }
     wait_for_capture_frame_count(
         &mut capture_files,
         capture_frame_count,
         capture_frame_count,
         started,
+        &mut diagnostic_record,
         cancellation,
         child,
+        control,
         &mut on_tick,
     )?;
-    send_commands(&["endmovie".to_string(), "demo_pause".to_string()])?;
+    send_commands(control, &["endmovie".to_string(), "demo_pause".to_string()])?;
 
     let raw_dir = clip_dir.join("raw");
     fs::create_dir_all(&raw_dir)?;
@@ -1842,7 +1904,9 @@ impl Drop for PreparedReplay {
     }
 }
 
-struct OwnedDota(Child);
+// The socket is retained until this exact child is confirmed exited, including
+// cancellation, errors and unwinding. Cleanup never opens another connection.
+struct OwnedDota(Child, Option<VConsoleSession>);
 
 impl Drop for OwnedDota {
     fn drop(&mut self) {
@@ -1851,7 +1915,13 @@ impl Drop for OwnedDota {
         // Also hold the owning stack during unwinding until the same Child is
         // confirmed stopped. A second failed best-effort attempt is not enough.
         wait_for_verified_cleanup(
-            || shutdown_dota(&mut self.0, std::mem::take(&mut first_attempt)),
+            || {
+                shutdown_dota(
+                    &mut self.0,
+                    std::mem::take(&mut first_attempt),
+                    self.1.as_mut(),
+                )
+            },
             |error| {
                 let _ = execution::record(
                     "cleanup_pending",
@@ -1890,6 +1960,7 @@ fn dota_launch_args() -> [&'static str; 4] {
 
 fn wait_for_vconsole(
     child: &mut Child,
+    control: &mut Option<VConsoleSession>,
     cancellation: &CancellationToken,
     mut on_wait: impl FnMut(u64),
 ) -> Result<(), RenderError> {
@@ -1902,14 +1973,32 @@ fn wait_for_vconsole(
             return Err(RenderError::DotaExited);
         }
         attempt += 1;
-        match probe_vconsole(Duration::from_secs(2)) {
+        // A refused connection may be retried before the port is ready. Once
+        // accepted, preserve the socket and decoder across handshake timeouts.
+        let connected = if control.is_none() {
+            VConsoleSession::connect(Duration::from_secs(2)).and_then(|session| {
+                *control = Some(session);
+                execution::record(
+                    "vconsole_connected",
+                    serde_json::json!({"attempt": attempt, "pid": child.id()}),
+                )?;
+                Ok(())
+            })
+        } else {
+            Ok(())
+        };
+        let result = connected.and_then(|_| {
+            control
+                .as_mut()
+                .expect("connected")
+                .probe(Duration::from_secs(2))
+        });
+        match result {
             Ok(report) => {
                 execution::record(
                     "vconsole_ready",
                     serde_json::json!({"attempt": attempt, "report": report}),
                 )?;
-                // Dota can fatally race a second VConsole connection while the probe socket closes.
-                thread::sleep(Duration::from_secs(1));
                 return Ok(());
             }
             Err(error) => {
@@ -1923,6 +2012,11 @@ fn wait_for_vconsole(
                     }),
                 )?;
                 on_wait(started.elapsed().as_secs());
+                // Only an unready port or an incomplete handshake can wait.
+                // An accepted socket with invalid/I/O feedback fails closed.
+                if control.is_some() && !matches!(error, ReplayControlError::MarkerTimeout) {
+                    return Err(RenderError::ReplayControl(last_error));
+                }
             }
         }
         thread::sleep(Duration::from_secs(1));
@@ -1963,6 +2057,7 @@ fn wait_for_seek(
     target_tick: u32,
     cancellation: &CancellationToken,
     child: &mut Child,
+    control: &mut VConsoleSession,
 ) -> Result<u32, RenderError> {
     let started = Instant::now();
     let mut previous_tick = None;
@@ -1973,7 +2068,7 @@ fn wait_for_seek(
         if child.try_wait()?.is_some() {
             return Err(RenderError::DotaExited);
         }
-        match execute_logged_commands(&[DEMO_STATUS_COMMAND.to_string()]) {
+        match execute_logged_commands(control, &[DEMO_STATUS_COMMAND.to_string()]) {
             Ok(report) => {
                 let current = report
                     .console_excerpt
@@ -1997,7 +2092,13 @@ fn wait_for_seek(
                 last_error = Some(error.to_string());
             }
         }
-        wait_with_cancel(Duration::from_millis(650), cancellation, child, |_| {})?;
+        wait_with_cancel(
+            Duration::from_millis(650),
+            cancellation,
+            child,
+            control,
+            |_| {},
+        )?;
     }
     execution::record(
         "seek_failed",
@@ -2033,8 +2134,11 @@ fn seek_failure_message(
     message
 }
 
-fn execute_logged_commands(commands: &[String]) -> Result<VConsoleExecutionReport, RenderError> {
-    let result = execute_vconsole_commands(commands, VCONSOLE_COMMAND_TIMEOUT);
+fn execute_logged_commands(
+    control: &mut VConsoleSession,
+    commands: &[String],
+) -> Result<VConsoleExecutionReport, RenderError> {
+    let result = control.execute(commands, VCONSOLE_COMMAND_TIMEOUT);
     execution::record(
         "vconsole_commands",
         serde_json::json!({
@@ -2046,8 +2150,8 @@ fn execute_logged_commands(commands: &[String]) -> Result<VConsoleExecutionRepor
     result.map_err(|error| RenderError::ReplayControl(error.to_string()))
 }
 
-fn send_commands(commands: &[String]) -> Result<(), RenderError> {
-    execute_logged_commands(commands).map(|_| ())
+fn send_commands(control: &mut VConsoleSession, commands: &[String]) -> Result<(), RenderError> {
+    execute_logged_commands(control, commands).map(|_| ())
 }
 
 fn wait_for_verified_cleanup(
@@ -2070,14 +2174,18 @@ fn wait_for_verified_cleanup(
     }
 }
 
-fn finish_dota_session<F>(child: &mut Child, total_clips: usize, on_progress: &mut F)
-where
+fn finish_dota_session<F>(
+    child: &mut Child,
+    control: &mut Option<VConsoleSession>,
+    total_clips: usize,
+    on_progress: &mut F,
+) where
     F: FnMut(RenderProgress),
 {
     let pid = child.id();
     let mut first_attempt = true;
     wait_for_verified_cleanup(
-        || shutdown_dota(child, std::mem::take(&mut first_attempt)),
+        || shutdown_dota(child, std::mem::take(&mut first_attempt), control.as_mut()),
         |error| {
             // A full disk or broken progress receiver must not bypass cleanup.
             let _ = execution::record(
@@ -2104,7 +2212,11 @@ where
     );
 }
 
-fn shutdown_dota(child: &mut Child, restore_session: bool) -> Option<String> {
+fn shutdown_dota(
+    child: &mut Child,
+    restore_session: bool,
+    control: Option<&mut VConsoleSession>,
+) -> Option<String> {
     match child.try_wait() {
         Ok(Some(_)) => return None,
         Ok(None) => {}
@@ -2115,15 +2227,17 @@ fn shutdown_dota(child: &mut Child, restore_session: bool) -> Option<String> {
         }
     }
     if restore_session {
-        let _ = execute_vconsole_commands(
-            &[
-                "endmovie".to_string(),
-                "demo_pause".to_string(),
-                "cl_drawhud 1".to_string(),
-                "dota_hide_cursor 0".to_string(),
-            ],
-            Duration::from_secs(2),
-        );
+        if let Some(control) = control {
+            let _ = control.execute(
+                &[
+                    "endmovie".to_string(),
+                    "demo_pause".to_string(),
+                    "cl_drawhud 1".to_string(),
+                    "dota_hide_cursor 0".to_string(),
+                ],
+                Duration::from_secs(2),
+            );
+        }
         let pid = child.id().to_string();
         #[cfg(windows)]
         {
@@ -2157,8 +2271,14 @@ fn dota_is_running() -> Result<bool, RenderError> {
     }
 }
 
-fn native_player_names_require_steam(clean_hud: bool) -> bool {
-    !clean_hud
+fn validate_recording_clients(dota_running: bool, steam_running: bool) -> Result<(), RenderError> {
+    if dota_running {
+        return Err(RenderError::DotaAlreadyRunning);
+    }
+    if !steam_running {
+        return Err(RenderError::SteamRequiredForRecording);
+    }
+    Ok(())
 }
 
 fn steam_is_running() -> Result<bool, RenderError> {
@@ -2268,25 +2388,39 @@ fn camera_commands_for_clip(timeline: &TimelineDocument, clip: &RenderClip) -> V
             let mut commands = Vec::new();
             if let Some(slot) = slot {
                 commands.push(format!("dota_spectator_hero_index {slot}"));
-            }
-            commands.push("dota_spectator_mode 2".to_string());
-            if let Some(slot) = slot {
                 commands.push(format!("dota_camera_focus_player {slot}"));
             }
+            // Focusing is a positioning operation; finish by selecting the
+            // requested follow mode so it remains the last camera action.
+            commands.push("dota_spectator_mode 2".to_string());
             commands
         }
         ClipCameraMode::PlayerPerspective => {
             let mut commands = Vec::new();
             if let Some(slot) = slot {
                 commands.push(format!("dota_spectator_hero_index {slot}"));
-            }
-            commands.push("dota_spectator_mode 3".to_string());
-            if let Some(slot) = slot {
                 commands.push(format!("dota_camera_focus_player {slot}"));
             }
+            commands.push("dota_spectator_mode 3".to_string());
             commands
         }
     }
+}
+
+fn camera_reassert_frame_target(
+    camera_mode: &ClipCameraMode,
+    preroll_frame_count: usize,
+    capture_frame_count: usize,
+) -> Option<usize> {
+    matches!(
+        camera_mode,
+        ClipCameraMode::PlayerPerspective | ClipCameraMode::HeroChase
+    )
+    .then(|| {
+        CAMERA_REASSERT_CAPTURE_FRAMES
+            .min(preroll_frame_count.saturating_sub(1))
+            .min(capture_frame_count)
+    })
 }
 
 fn hud_commands(clean_hud: bool) -> Vec<String> {
@@ -2338,14 +2472,112 @@ fn frame_count_for_duration(duration_seconds: f32) -> usize {
         .max(0.0) as usize
 }
 
+struct CaptureDiagnosticRecord<'a> {
+    path: PathBuf,
+    diagnostics: &'a mut CaptureDiagnostics,
+}
+
+/// Observations only: none of these clocks alter the capture deadline.
+struct CaptureWaitTelemetry {
+    target_frames: usize,
+    total_frames: usize,
+    captured_frames: usize,
+    wait_started_elapsed: Duration,
+    last_sample_elapsed: Duration,
+    last_frame_increase_elapsed: Duration,
+    timed_out: bool,
+}
+
+impl CaptureWaitTelemetry {
+    fn new(
+        target_frames: usize,
+        total_frames: usize,
+        captured_frames: usize,
+        elapsed: Duration,
+    ) -> Self {
+        Self {
+            target_frames,
+            total_frames,
+            captured_frames,
+            wait_started_elapsed: elapsed,
+            last_sample_elapsed: elapsed,
+            last_frame_increase_elapsed: elapsed,
+            timed_out: false,
+        }
+    }
+
+    fn observe(&mut self, captured_frames: usize, elapsed: Duration) {
+        if captured_frames > self.captured_frames {
+            self.last_frame_increase_elapsed = elapsed;
+        }
+        self.captured_frames = captured_frames;
+    }
+
+    fn sample_due(&mut self, elapsed: Duration) -> bool {
+        if elapsed.saturating_sub(self.last_sample_elapsed) < CAPTURE_PROGRESS_LOG_INTERVAL {
+            return false;
+        }
+        self.last_sample_elapsed = elapsed;
+        true
+    }
+
+    fn snapshot(&self, clip_id: &str, elapsed: Duration, timeout: Duration) -> serde_json::Value {
+        serde_json::json!({
+            "clipId": clip_id,
+            "targetFrames": self.target_frames,
+            "totalFrames": self.total_frames,
+            "capturedFrames": self.captured_frames,
+            "elapsedMilliseconds": elapsed.as_millis(),
+            "waitStartedElapsedMilliseconds": self.wait_started_elapsed.as_millis(),
+            "waitElapsedMilliseconds": elapsed.saturating_sub(self.wait_started_elapsed).as_millis(),
+            "lastFrameIncreaseElapsedMilliseconds": self.last_frame_increase_elapsed.as_millis(),
+            "stalledMilliseconds": elapsed.saturating_sub(self.last_frame_increase_elapsed).as_millis(),
+            "timeoutSeconds": timeout.as_secs_f32(),
+        })
+    }
+}
+
+fn finish_capture_wait(
+    telemetry: &CaptureWaitTelemetry,
+    diagnostic_record: &mut CaptureDiagnosticRecord<'_>,
+    elapsed: Duration,
+    timeout: Duration,
+    result: Result<(), RenderError>,
+) -> Result<(), RenderError> {
+    diagnostic_record.diagnostics.captured_frames = telemetry.captured_frames;
+    let mut details = telemetry.snapshot(&diagnostic_record.diagnostics.clip_id, elapsed, timeout);
+    details["status"] = serde_json::json!(match &result {
+        Ok(()) => "complete",
+        Err(RenderError::Cancelled) => "cancelled",
+        Err(_) => "failed",
+    });
+    details["error"] = serde_json::json!(result.as_ref().err().map(ToString::to_string));
+    let log_result = execution::record(
+        if telemetry.timed_out {
+            "capture_timeout"
+        } else {
+            "capture_wait_finished"
+        },
+        details,
+    );
+    let diagnostic_result = write_json(&diagnostic_record.path, diagnostic_record.diagnostics);
+    // Keep the primary capture error even if its final diagnostic writes fail.
+    // On a successful capture, retain the existing fail-closed logging policy.
+    result?;
+    log_result?;
+    diagnostic_result
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wait_for_capture_frame_count<P>(
     capture_files: &mut CaptureFiles,
     target_frames: usize,
     total_frames: usize,
     started: Instant,
+    diagnostic_record: &mut CaptureDiagnosticRecord<'_>,
     cancellation: &CancellationToken,
     child: &mut Child,
+    control: &mut VConsoleSession,
     on_tick: &mut P,
 ) -> Result<(), RenderError>
 where
@@ -2354,27 +2586,60 @@ where
     let total_seconds = total_frames as f32 / FRAME_RATE as f32;
     let timeout_seconds = (total_seconds * 6.0 + 30.0).clamp(45.0, 900.0);
     let timeout = Duration::from_secs_f32(timeout_seconds);
-    let mut captured_frames = 0;
-    while started.elapsed() < timeout {
-        check_cancelled(cancellation)?;
-        if child.try_wait()?.is_some() {
-            return Err(RenderError::DotaExited);
+    let mut telemetry = CaptureWaitTelemetry::new(
+        target_frames,
+        total_frames,
+        diagnostic_record.diagnostics.captured_frames,
+        started.elapsed(),
+    );
+    execution::record(
+        "capture_wait_start",
+        telemetry.snapshot(
+            &diagnostic_record.diagnostics.clip_id,
+            started.elapsed(),
+            timeout,
+        ),
+    )?;
+    let result = (|| {
+        while started.elapsed() < timeout {
+            check_cancelled(cancellation)?;
+            if child.try_wait()?.is_some() {
+                return Err(RenderError::DotaExited);
+            }
+            control.drain_pending()?;
+            let captured_frames = capture_files
+                .collect()?
+                .iter()
+                .filter(|(path, size)| is_jpeg(path) && **size > 0)
+                .count();
+            let elapsed = started.elapsed();
+            telemetry.observe(captured_frames, elapsed);
+            if telemetry.sample_due(elapsed) {
+                execution::record(
+                    "capture_progress",
+                    telemetry.snapshot(&diagnostic_record.diagnostics.clip_id, elapsed, timeout),
+                )?;
+            }
+            let captured_seconds = captured_frames.min(total_frames) as f32 / FRAME_RATE as f32;
+            on_tick(captured_seconds, total_seconds);
+            if captured_frames >= target_frames {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(250));
         }
-        captured_frames = capture_files
-            .collect()?
-            .iter()
-            .filter(|(path, size)| is_jpeg(path) && **size > 0)
-            .count();
-        let captured_seconds = captured_frames.min(total_frames) as f32 / FRAME_RATE as f32;
-        on_tick(captured_seconds, total_seconds);
-        if captured_frames >= target_frames {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(250));
-    }
-    Err(RenderError::Media(format!(
-        "Dota 2 原生逐帧导出超时：需要 {target_frames} 帧，只得到 {captured_frames} 帧"
-    )))
+        telemetry.timed_out = true;
+        Err(RenderError::Media(format!(
+            "Dota 2 原生逐帧导出超时：需要 {target_frames} 帧，只得到 {} 帧",
+            telemetry.captured_frames
+        )))
+    })();
+    finish_capture_wait(
+        &telemetry,
+        diagnostic_record,
+        started.elapsed(),
+        timeout,
+        result,
+    )
 }
 
 fn is_jpeg(path: &Path) -> bool {
@@ -2387,6 +2652,7 @@ fn wait_with_cancel<P>(
     duration: Duration,
     cancellation: &CancellationToken,
     child: &mut Child,
+    control: &mut VConsoleSession,
     mut on_tick: P,
 ) -> Result<(), RenderError>
 where
@@ -2398,6 +2664,7 @@ where
         if child.try_wait()?.is_some() {
             return Err(RenderError::DotaExited);
         }
+        control.drain_pending()?;
         on_tick(started.elapsed().as_secs_f32());
         thread::sleep(Duration::from_millis(250));
     }
@@ -2699,18 +2966,31 @@ fn path_arg(path: &Path) -> String {
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), RenderError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|error| json_io_error("创建记录目录", parent, error))?;
     }
     let temporary = path.with_extension(format!("pending-{}.json", unique_stamp()));
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&temporary)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
+        .open(&temporary)
+        .map_err(|error| json_io_error("创建临时记录", &temporary, error))?;
+    file.write_all(&serde_json::to_vec_pretty(value)?)
+        .map_err(|error| json_io_error("写入临时记录", &temporary, error))?;
+    file.sync_all()
+        .map_err(|error| json_io_error("刷新临时记录", &temporary, error))?;
     drop(file);
-    atomic_replace(&temporary, path)?;
+    atomic_replace(&temporary, path).map_err(|error| json_io_error("替换正式记录", path, error))?;
     Ok(())
+}
+
+fn json_io_error(operation: &str, path: &Path, error: io::Error) -> RenderError {
+    RenderError::Io(io::Error::new(
+        error.kind(),
+        format!(
+            "保存录制记录失败；操作：{operation}；路径：{}；原因：{error}",
+            path.display()
+        ),
+    ))
 }
 
 fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
@@ -2720,8 +3000,24 @@ fn atomic_replace(source: &Path, destination: &Path) -> io::Result<()> {
         use windows_sys::Win32::Storage::FileSystem::{
             MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
         };
-        let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination: Vec<u16> = destination
+        // Rust file writes support extended Windows paths, but a direct Win32
+        // rename also needs those absolute names. The new destination may not
+        // exist yet, so resolve its existing parent rather than the file.
+        let source_path = fs::canonicalize(source)?;
+        let destination_absolute = std::path::absolute(destination)?;
+        let parent = destination_absolute
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "记录路径没有父目录"))?;
+        let name = destination_absolute
+            .file_name()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "记录路径没有文件名"))?;
+        let destination_path = fs::canonicalize(parent)?.join(name);
+        let source: Vec<u16> = source_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let destination: Vec<u16> = destination_path
             .as_os_str()
             .encode_wide()
             .chain(Some(0))
@@ -3085,6 +3381,40 @@ mod tests {
         assert_eq!(std::fs::read(source).unwrap(), b"new data");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_json_atomic_replace_supports_long_chinese_paths() {
+        use std::os::windows::ffi::OsStrExt;
+        let temp = tempfile::tempdir().unwrap();
+        let mut directory = temp.path().to_path_buf();
+        while directory.as_os_str().encode_wide().count() < 280 {
+            directory = directory.join("剧情诊断_长路径兼容回归");
+        }
+        let path = directory.join("capture-diagnostics.json");
+        super::write_json(&path, &serde_json::json!({"frames": 0})).unwrap();
+        super::write_json(&path, &serde_json::json!({"frames": 1080})).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["frames"], 1080);
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn json_write_failure_reports_operation_and_exact_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_file = temp.path().join("不是文件夹");
+        std::fs::write(&parent_file, b"keep original").unwrap();
+        let error = super::write_json(
+            &parent_file.join("state.json"),
+            &serde_json::json!({"frames": 0}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("创建记录目录"));
+        assert!(error.contains(&parent_file.display().to_string()));
+        assert_eq!(std::fs::read(parent_file).unwrap(), b"keep original");
+    }
+
     #[test]
     fn corrupt_cache_state_is_preserved_and_rebuilt_atomically() {
         let temp = tempfile::tempdir().unwrap();
@@ -3169,16 +3499,18 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
     #[test]
     fn output_names_follow_the_replay_and_never_replace_existing_files() {
         let temp = tempfile::tempdir().unwrap();
-        let replay = std::path::Path::new("replays/1000000004.dem");
-        let stem = replay_output_stem(replay);
-        assert_eq!(stem, "1000000004");
-        assert_eq!(available_output_stem(temp.path(), &stem), "1000000004");
+        let replay = std::path::Path::new("fixtures")
+            .join("replays")
+            .join("1234567890.dem");
+        let stem = replay_output_stem(&replay);
+        assert_eq!(stem, "1234567890");
+        assert_eq!(available_output_stem(temp.path(), &stem), "1234567890");
 
-        std::fs::write(temp.path().join("1000000004.mp4"), b"old").unwrap();
-        assert_eq!(available_output_stem(temp.path(), &stem), "1000000004_2");
+        std::fs::write(temp.path().join("1234567890.mp4"), b"old").unwrap();
+        assert_eq!(available_output_stem(temp.path(), &stem), "1234567890_2");
 
-        std::fs::write(temp.path().join("1000000004_2_质量报告.json"), b"{}").unwrap();
-        assert_eq!(available_output_stem(temp.path(), &stem), "1000000004_3");
+        std::fs::write(temp.path().join("1234567890_2_质量报告.json"), b"{}").unwrap();
+        assert_eq!(available_output_stem(temp.path(), &stem), "1234567890_3");
     }
 
     #[test]
@@ -3186,6 +3518,176 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
         assert_eq!(frame_count_for_duration(0.0), 0);
         assert_eq!(frame_count_for_duration(1.0 / 30.0), 2);
         assert_eq!(frame_count_for_duration(8.0), 480);
+    }
+
+    #[test]
+    fn capture_progress_samples_are_throttled_without_losing_stall_observations() {
+        use std::time::Duration;
+        let mut telemetry = super::CaptureWaitTelemetry::new(2044, 2044, 0, Duration::ZERO);
+        telemetry.observe(10, Duration::from_millis(250));
+        assert!(!telemetry.sample_due(Duration::from_millis(4999)));
+        assert!(telemetry.sample_due(Duration::from_secs(5)));
+        assert!(!telemetry.sample_due(Duration::from_millis(5001)));
+        telemetry.observe(10, Duration::from_secs(9));
+        assert!(telemetry.sample_due(Duration::from_secs(10)));
+        assert!(!telemetry.sample_due(Duration::from_millis(10_001)));
+        let snapshot = telemetry.snapshot(
+            "clip-fixture",
+            Duration::from_secs(10),
+            Duration::from_millis(234_400),
+        );
+        assert_eq!(snapshot["capturedFrames"], 10);
+        assert_eq!(snapshot["lastFrameIncreaseElapsedMilliseconds"], 250);
+        assert_eq!(snapshot["stalledMilliseconds"], 9750);
+    }
+
+    #[test]
+    fn capture_wait_phases_keep_the_shared_capture_clock_and_previous_frame_count() {
+        use std::time::Duration;
+        let mut telemetry =
+            super::CaptureWaitTelemetry::new(2044, 2044, 30, Duration::from_secs(70));
+        telemetry.observe(40, Duration::from_secs(71));
+        telemetry.observe(40, Duration::from_secs(75));
+        let snapshot = telemetry.snapshot(
+            "clip-fixture",
+            Duration::from_secs(78),
+            Duration::from_millis(234_400),
+        );
+        assert_eq!(snapshot["elapsedMilliseconds"], 78_000);
+        assert_eq!(snapshot["waitStartedElapsedMilliseconds"], 70_000);
+        assert_eq!(snapshot["waitElapsedMilliseconds"], 8000);
+        assert_eq!(snapshot["lastFrameIncreaseElapsedMilliseconds"], 71_000);
+        assert_eq!(snapshot["stalledMilliseconds"], 7000);
+        assert_eq!(snapshot["targetFrames"], 2044);
+        assert_eq!(snapshot["totalFrames"], 2044);
+    }
+
+    fn fixture_capture_diagnostics() -> super::CaptureDiagnostics {
+        super::CaptureDiagnostics {
+            clip_id: "clip-fixture".into(),
+            requested_camera: ClipCameraMode::PlayerPerspective,
+            requested_hero: Some("npc_dota_hero_mirana".into()),
+            requested_slot: Some(0),
+            requested_tick: 9000,
+            observed_tick: 9000,
+            observed_look_at: [0.0; 3],
+            camera_target_verified: false,
+            verification_status: "camera_target_unverified".into(),
+            expected_frames: 2044,
+            captured_frames: 0,
+        }
+    }
+
+    #[test]
+    fn capture_timeout_retains_the_last_count_in_both_diagnostic_records() {
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("render.jsonl");
+        let _scope =
+            super::execution::Scope::enter(super::CancellationToken::new(), log_path.clone())
+                .unwrap();
+        let mut diagnostics = fixture_capture_diagnostics();
+        let diagnostic_path = temp.path().join("capture-diagnostics.json");
+        let mut record = super::CaptureDiagnosticRecord {
+            path: diagnostic_path.clone(),
+            diagnostics: &mut diagnostics,
+        };
+        let mut telemetry = super::CaptureWaitTelemetry::new(2044, 2044, 0, Duration::ZERO);
+        telemetry.observe(1651, Duration::from_secs(233));
+        telemetry.timed_out = true;
+        let primary_error = "fixture capture timeout";
+        let result = super::finish_capture_wait(
+            &telemetry,
+            &mut record,
+            Duration::from_millis(234_400),
+            Duration::from_millis(234_400),
+            Err(super::RenderError::Media(primary_error.into())),
+        );
+        assert!(result.unwrap_err().to_string().contains(primary_error));
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(diagnostic_path).unwrap()).unwrap();
+        assert_eq!(saved["expected_frames"], 2044);
+        assert_eq!(saved["captured_frames"], 1651);
+        let event: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(log_path).unwrap().trim()).unwrap();
+        assert_eq!(event["event"], "capture_timeout");
+        assert_eq!(event["details"]["capturedFrames"], 1651);
+        assert_eq!(event["details"]["targetFrames"], 2044);
+        assert_eq!(event["details"]["stalledMilliseconds"], 1400);
+        assert_eq!(event["details"]["status"], "failed");
+        assert!(
+            event["details"]["error"]
+                .as_str()
+                .unwrap()
+                .contains(primary_error)
+        );
+    }
+
+    #[test]
+    fn capture_cancellation_logs_the_last_count_without_replacing_its_error() {
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("render.jsonl");
+        let _scope =
+            super::execution::Scope::enter(super::CancellationToken::new(), log_path.clone())
+                .unwrap();
+        let mut diagnostics = fixture_capture_diagnostics();
+        let mut record = super::CaptureDiagnosticRecord {
+            path: temp.path().join("capture-diagnostics.json"),
+            diagnostics: &mut diagnostics,
+        };
+        let mut telemetry = super::CaptureWaitTelemetry::new(2044, 2044, 0, Duration::ZERO);
+        telemetry.observe(25, Duration::from_millis(500));
+        let result = super::finish_capture_wait(
+            &telemetry,
+            &mut record,
+            Duration::from_millis(750),
+            Duration::from_millis(234_400),
+            Err(super::RenderError::Cancelled),
+        );
+        assert!(matches!(result, Err(super::RenderError::Cancelled)));
+        assert_eq!(diagnostics.captured_frames, 25);
+        let event: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(log_path).unwrap().trim()).unwrap();
+        assert_eq!(event["event"], "capture_wait_finished");
+        assert_eq!(event["details"]["status"], "cancelled");
+    }
+
+    #[test]
+    fn capture_primary_failure_survives_failed_final_log_and_diagnostic_writes() {
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let log_path = temp.path().join("render.jsonl");
+        let _scope =
+            super::execution::Scope::enter(super::CancellationToken::new(), log_path.clone())
+                .unwrap();
+        std::fs::remove_file(&log_path).unwrap();
+        std::fs::create_dir(&log_path).unwrap();
+        let parent_file = temp.path().join("not-a-directory");
+        std::fs::write(&parent_file, b"keep").unwrap();
+        let mut diagnostics = fixture_capture_diagnostics();
+        let mut record = super::CaptureDiagnosticRecord {
+            path: parent_file.join("capture-diagnostics.json"),
+            diagnostics: &mut diagnostics,
+        };
+        let telemetry = super::CaptureWaitTelemetry::new(2044, 2044, 1651, Duration::ZERO);
+        let result = super::finish_capture_wait(
+            &telemetry,
+            &mut record,
+            Duration::from_secs(1),
+            Duration::from_millis(234_400),
+            Err(super::RenderError::DotaExited),
+        );
+        assert!(matches!(result, Err(super::RenderError::DotaExited)));
+        let successful_capture = super::finish_capture_wait(
+            &telemetry,
+            &mut record,
+            Duration::from_secs(1),
+            Duration::from_millis(234_400),
+            Ok(()),
+        );
+        assert!(matches!(successful_capture, Err(super::RenderError::Io(_))));
+        assert_eq!(std::fs::read(parent_file).unwrap(), b"keep");
     }
 
     #[test]
@@ -3331,18 +3833,126 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
             player_view,
             vec![
                 "dota_spectator_hero_index 7",
-                "dota_spectator_mode 3",
                 "dota_camera_focus_player 7",
+                "dota_spectator_mode 3",
             ]
         );
         assert_eq!(
             hero_chase,
             vec![
                 "dota_spectator_hero_index 7",
-                "dota_spectator_mode 2",
                 "dota_camera_focus_player 7",
+                "dota_spectator_mode 2",
             ]
         );
+    }
+
+    #[test]
+    fn mixed_story_targets_are_selected_per_clip_including_repeated_heroes() {
+        let mut timeline = mirana_timeline();
+        let player_template = timeline.replay.players[0].clone();
+        timeline.replay.players = [
+            (2, "npc_dota_hero_morphling"),
+            (0, "npc_dota_hero_ogre_magi"),
+            (1, "npc_dota_hero_ember_spirit"),
+        ]
+        .into_iter()
+        .map(|(slot, hero)| {
+            let mut player = player_template.clone();
+            player.slot = slot;
+            player.hero_name = hero.to_string();
+            player
+        })
+        .collect();
+
+        for (hero, slot, mode, mode_command) in [
+            (
+                "npc_dota_hero_ember_spirit",
+                1,
+                ClipCameraMode::PlayerPerspective,
+                "dota_spectator_mode 3",
+            ),
+            (
+                "npc_dota_hero_ember_spirit",
+                1,
+                ClipCameraMode::PlayerPerspective,
+                "dota_spectator_mode 3",
+            ),
+            (
+                "npc_dota_hero_morphling",
+                2,
+                ClipCameraMode::PlayerPerspective,
+                "dota_spectator_mode 3",
+            ),
+            (
+                "npc_dota_hero_ogre_magi",
+                0,
+                ClipCameraMode::HeroChase,
+                "dota_spectator_mode 2",
+            ),
+            (
+                "npc_dota_hero_morphling",
+                2,
+                ClipCameraMode::PlayerPerspective,
+                "dota_spectator_mode 3",
+            ),
+        ] {
+            let mut clip = mirana_clip(mode);
+            clip.view_hero = Some(hero.to_string());
+            let commands = camera_commands_for_clip(&timeline, &clip);
+            assert_eq!(
+                commands,
+                vec![
+                    format!("dota_spectator_hero_index {slot}"),
+                    format!("dota_camera_focus_player {slot}"),
+                    mode_command.to_string(),
+                ],
+                "the clip must select its own hero even when the prior clip chose the same hero"
+            );
+            for command in &commands {
+                assert!(d2_highlights_replay_control::build_cmnd_packet(command).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn every_player_slot_is_selected_independently_of_roster_order() {
+        let mut timeline = mirana_timeline();
+        let player_template = timeline.replay.players[0].clone();
+        timeline.replay.players = (0..10)
+            .rev()
+            .map(|slot| {
+                let mut player = player_template.clone();
+                player.slot = slot;
+                player.hero_name = format!("npc_dota_hero_fixture_{slot}");
+                player
+            })
+            .collect();
+        for slot in 0..10 {
+            let mut clip = mirana_clip(ClipCameraMode::PlayerPerspective);
+            clip.view_hero = Some(format!("npc_dota_hero_fixture_{slot}"));
+            assert_eq!(hero_slot_for_clip(&timeline, &clip), Some(slot));
+            assert_eq!(
+                camera_commands_for_clip(&timeline, &clip).first(),
+                Some(&format!("dota_spectator_hero_index {slot}"))
+            );
+        }
+    }
+
+    #[test]
+    fn selected_hero_modes_are_reapplied_only_inside_existing_preroll() {
+        for mode in [ClipCameraMode::PlayerPerspective, ClipCameraMode::HeroChase] {
+            assert_eq!(
+                super::camera_reassert_frame_target(&mode, 60, 120),
+                Some(30)
+            );
+            assert_eq!(super::camera_reassert_frame_target(&mode, 5, 65), Some(4));
+            assert_eq!(super::camera_reassert_frame_target(&mode, 1, 61), Some(0));
+            assert_eq!(super::camera_reassert_frame_target(&mode, 0, 60), Some(0));
+        }
+        for mode in [ClipCameraMode::Directed, ClipCameraMode::FreeCamera] {
+            assert_eq!(super::camera_reassert_frame_target(&mode, 60, 120), None);
+        }
     }
 
     fn mirana_timeline() -> TimelineDocument {
@@ -3427,9 +4037,18 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
     }
 
     #[test]
-    fn ordinary_feed_requires_steam_for_native_player_names() {
-        assert!(super::native_player_names_require_steam(false));
-        assert!(!super::native_player_names_require_steam(true));
+    fn recording_requires_steam_without_claiming_an_existing_dota() {
+        assert!(matches!(
+            super::validate_recording_clients(false, false),
+            Err(super::RenderError::SteamRequiredForRecording)
+        ));
+        assert!(super::validate_recording_clients(false, true).is_ok());
+        for steam_running in [false, true] {
+            assert!(matches!(
+                super::validate_recording_clients(true, steam_running),
+                Err(super::RenderError::DotaAlreadyRunning)
+            ));
+        }
     }
 
     #[test]

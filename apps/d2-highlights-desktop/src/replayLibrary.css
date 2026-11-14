@@ -1,0 +1,7 @@
+.replay-library .library-heading { gap: 16px; }
+.replay-library .library-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.replay-library .library-table-head,
+.replay-library .library-row { grid-template-columns: minmax(160px, 1fr) 90px 155px 80px 20px; }
+.replay-library-directory { margin: 0 0 14px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.replay-library-error { margin: 0 0 14px; color: var(--danger, #d95b70); font-size: 12px; }
+.replay-library .library-count { color: var(--muted); font-size: 11px; }

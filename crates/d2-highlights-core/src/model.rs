@@ -583,7 +583,7 @@ mod tests {
                 players: vec![ReplayPlayer {
                     slot: 0,
                     hero_name: "npc_dota_hero_mirana".to_string(),
-                    player_name: Some("测试玩家 A".to_string()),
+                    player_name: Some("猫猫只用虎".to_string()),
                     game_team: Some(2),
                     is_fake_client: false,
                 }],
@@ -604,7 +604,7 @@ mod tests {
         assert_eq!(decoded.replay.players[0].hero_name, "npc_dota_hero_mirana");
         assert_eq!(
             decoded.replay.players[0].player_name.as_deref(),
-            Some("测试玩家 A")
+            Some("猫猫只用虎")
         );
     }
 

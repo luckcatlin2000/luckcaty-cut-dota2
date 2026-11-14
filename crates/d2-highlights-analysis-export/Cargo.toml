@@ -1,0 +1,15 @@
+[package]
+name = "d2-highlights-analysis-export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license-file.workspace = true
+
+[dependencies]
+d2-highlights-core = { path = "../d2-highlights-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

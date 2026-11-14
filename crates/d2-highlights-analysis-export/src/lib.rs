@@ -14,7 +14,7 @@ const STORY_EXPORT_CONTRACT: &str = "dota2_highlight_json_v1_20260812";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AnalysisPackageExportRequest {
+pub struct AnalysisPackageExportRequest {
     pub job_id: String,
     pub protagonist_hero: String,
     pub protagonist_label: String,
@@ -23,7 +23,7 @@ pub(crate) struct AnalysisPackageExportRequest {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AnalysisPackageExportResult {
+pub struct AnalysisPackageExportResult {
     pub package_path: String,
     pub evidence_path: String,
     pub report_path: String,
@@ -62,7 +62,7 @@ struct DirectorData {
     economy_snapshots_supported: bool,
 }
 
-pub(crate) fn export_analysis_package(
+pub fn export_analysis_package(
     jobs_root: &Path,
     request: AnalysisPackageExportRequest,
 ) -> Result<AnalysisPackageExportResult, String> {
@@ -2711,7 +2711,7 @@ mod tests {
         let job_dir = jobs_root.join(job_id);
         fs::create_dir_all(job_dir.join("timeline")).expect("create job timeline");
         fs::create_dir_all(&output_root).expect("create output root");
-        let dem_path = root.path().join("1000000003.dem");
+        let dem_path = root.path().join("1234567890.dem");
         fs::write(&dem_path, b"read-only replay fixture").expect("write replay fixture");
         let source_hash = "1".repeat(64);
         let players = (0_u8..10)
@@ -2743,7 +2743,7 @@ mod tests {
                 playback_ticks: 3_000,
                 playback_time_seconds: 100.0,
                 game_build: 6_896,
-                match_id: Some(1_000_000_003),
+                match_id: Some(1_234_567_890),
                 game_mode: Some(22),
                 game_winner: Some(3),
                 players,
@@ -2838,16 +2838,16 @@ mod tests {
         )
         .expect("export second package");
 
-        assert!(first.package_path.ends_with("1000000003_测试主角_分析包"));
+        assert!(first.package_path.ends_with("1234567890_测试主角_分析包"));
         assert!(
             second
                 .package_path
-                .ends_with("1000000003_测试主角_分析包_2")
+                .ends_with("1234567890_测试主角_分析包_2")
         );
         assert_eq!(fs::read(&dem_path).unwrap(), b"read-only replay fixture");
         assert!(
             !std::path::Path::new(&first.package_path)
-                .join("1000000003.dem")
+                .join("1234567890.dem")
                 .exists()
         );
         let evidence: serde_json::Value =
@@ -2869,7 +2869,7 @@ mod tests {
         assert_eq!(evidence["players"][9]["stats"]["assists"], 0);
         assert_eq!(
             evidence["export_info"]["source_file_name"],
-            "1000000003.dem"
+            "1234567890.dem"
         );
         assert!(!evidence.to_string().contains(root.path().to_str().unwrap()));
     }
@@ -2975,7 +2975,7 @@ mod tests {
                 playback_ticks: 3_000,
                 playback_time_seconds: 100.0,
                 game_build: 1,
-                match_id: Some(1_000_000_003),
+                match_id: Some(1_234_567_890),
                 game_mode: Some(22),
                 game_winner: Some(3),
                 players: players.clone(),
@@ -3023,7 +3023,7 @@ mod tests {
             job_id: "fixture".to_string(),
             created_unix_seconds: 1,
             source: DemSource {
-                path: "1000000003.dem".to_string(),
+                path: "1234567890.dem".to_string(),
                 byte_length: 1,
                 sha256: source_hash,
                 magic: "PBDEMS2".to_string(),
@@ -3081,7 +3081,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires D2H_REAL_JOBS_ROOT, D2H_REAL_EXPORT_ROOT, D2H_REAL_JOB_ID and D2H_REAL_PROTAGONIST_HERO"]
+    #[ignore = "requires D2H_REAL_JOBS_ROOT and D2H_REAL_EXPORT_ROOT"]
     fn export_real_job_from_environment() {
         let jobs_root = std::env::var_os("D2H_REAL_JOBS_ROOT")
             .map(std::path::PathBuf::from)
@@ -3092,10 +3092,9 @@ mod tests {
         let result = export_analysis_package(
             &jobs_root,
             AnalysisPackageExportRequest {
-                job_id: std::env::var("D2H_REAL_JOB_ID").expect("D2H_REAL_JOB_ID"),
-                protagonist_hero: std::env::var("D2H_REAL_PROTAGONIST_HERO")
-                    .expect("D2H_REAL_PROTAGONIST_HERO"),
-                protagonist_label: "".to_string(),
+                job_id: "d2h-cf51b8745d95f024".to_string(),
+                protagonist_hero: "npc_dota_hero_night_stalker".to_string(),
+                protagonist_label: "暗夜魔王".to_string(),
                 destination_directory: output_root.display().to_string(),
             },
         )

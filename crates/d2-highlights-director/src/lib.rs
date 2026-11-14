@@ -160,7 +160,7 @@ pub fn build_director_plan(
         transition_seconds: TRANSITION_SECONDS,
         segments,
         audio: AudioPlan {
-            music_role: "original_comic_hype".to_string(),
+            music_role: "licensed_comic_hype".to_string(),
             bpm_min: 130,
             bpm_max: 160,
             game_audio_duck_db: -2.0,
