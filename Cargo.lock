@@ -582,7 +582,7 @@ checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
 name = "d2-highlights-analysis-export"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "d2-highlights-core",
  "serde",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "d2-highlights-cli"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "clap",
  "d2-highlights-core",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "d2-highlights-core"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "d2-highlights-desktop"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "d2-highlights-core",
  "d2-highlights-pipeline",
@@ -636,21 +636,21 @@ dependencies = [
 
 [[package]]
 name = "d2-highlights-detector"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "d2-highlights-core",
 ]
 
 [[package]]
 name = "d2-highlights-director"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "d2-highlights-core",
 ]
 
 [[package]]
 name = "d2-highlights-parser-source2"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "d2-highlights-core",
  "source2-demo",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "d2-highlights-pipeline"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "d2-highlights-core",
  "d2-highlights-detector",
@@ -674,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "d2-highlights-renderer"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "d2-highlights-core",
  "d2-highlights-replay-control",
@@ -688,7 +688,7 @@ dependencies = [
 
 [[package]]
 name = "d2-highlights-replay-control"
-version = "2.5.0"
+version = "2.5.1"
 dependencies = [
  "d2-highlights-core",
  "serde",

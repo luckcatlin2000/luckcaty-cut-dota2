@@ -22,7 +22,7 @@ const secondsText = (seconds: number) => {
   return `${String(Math.floor(value / 60)).padStart(2, "0")}:${(value % 60).toFixed(3).padStart(6, "0")}`;
 };
 
-export function WtfWorkbench({ version = "2.5.0" }: { version?: string } = {}) {
+export function WtfWorkbench({ version = "2.5.1" }: { version?: string } = {}) {
   const native = "__TAURI_INTERNALS__" in window;
   const fixture = useMemo(() => import.meta.env.DEV && new URLSearchParams(window.location.search).get("fixture") === "wtf"
     ? createWtfDevelopmentFixture() : null, []);

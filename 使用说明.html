@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="猫猫的剪辑小助手 2.5.0 使用说明：本地高光剪辑、离线导出、断点续录与一键排查包。包含模块分工，可离线阅读。">
-<title>使用说明 · 猫猫的剪辑小助手 2.5.0</title>
+<meta name="description" content="猫猫的剪辑小助手 2.5.1 使用说明：本地高光剪辑、离线导出、断点续录与一键排查包。包含模块分工，可离线阅读。">
+<title>使用说明 · 猫猫的剪辑小助手 2.5.1</title>
 <style>
 :root{color-scheme:light;--ink:#29252d;--muted:#68616d;--pink:#bf365c;--line:#eadde3;--paper:#fff;--tint:#fff2f6;--green:#246b53}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:24px}body{margin:0;background:#faf7f8;color:var(--ink);font:17px/1.85 "Microsoft YaHei","PingFang SC",system-ui,sans-serif}a{color:var(--pink);text-underline-offset:4px}a:hover{text-decoration-thickness:2px}a:focus-visible,summary:focus-visible{outline:3px solid var(--pink);outline-offset:5px}.skip{position:absolute;top:-90px;left:20px;background:white;padding:10px;z-index:5}.skip:focus{top:10px}.layout{max-width:1260px;margin:auto;display:grid;grid-template-columns:242px minmax(0,1fr);gap:44px;padding:40px 32px 80px}.sidebar{position:sticky;top:28px;align-self:start;max-height:calc(100vh - 56px);overflow:auto}.brand{font-weight:800;font-size:18px;line-height:1.5;margin:0 0 10px}.brand span{display:block;color:var(--pink);font-size:14px;font-weight:600;margin-top:6px}.sidebar nav{display:grid;gap:3px;margin-top:24px}.sidebar nav a{color:var(--muted);padding:7px 12px;border-left:2px solid var(--line);text-decoration:none;font-size:16px}.sidebar nav a:hover{background:var(--tint);color:var(--pink);border-color:var(--pink)}.side-note{font-size:14px;color:var(--muted);padding:16px 12px;border-top:1px solid var(--line);margin-top:22px}main{min-width:0}.hero{padding:38px 42px;background:linear-gradient(135deg,#ffedf3,#fff 70%);border:1px solid var(--line);border-radius:20px}.eyebrow{font-size:14px;color:var(--pink);font-weight:700;letter-spacing:2px}.hero h1{font-size:42px;line-height:1.3;margin:12px 0 18px;letter-spacing:-1px}.hero p{margin:0;color:var(--muted);max-width:38em}.tags{display:flex;gap:10px;flex-wrap:wrap;margin:22px 0 0}.tags span{font-size:14px;border:1px solid var(--line);border-radius:50px;padding:2px 12px;background:#fff}.quick{display:flex;gap:12px;flex-wrap:wrap;margin-top:26px}.button{display:inline-block;padding:9px 18px;border:1px solid var(--pink);border-radius:9px;text-decoration:none;font-weight:650;color:var(--pink);background:white}.button.primary{background:var(--pink);color:white}.section{padding:38px 0 12px;border-bottom:1px solid var(--line)}.section:last-of-type{border-bottom:0}h2{font-size:27px;line-height:1.45;margin:0 0 20px}h2 .n{font-size:15px;vertical-align:middle;color:var(--pink);display:inline-block;width:37px;font-weight:700}h3{font-size:19px;margin:25px 0 9px}p{margin:10px 0 17px}ul,ol{padding-left:25px;margin:10px 0 20px}li{margin:7px 0}li::marker{color:var(--pink);font-weight:700}strong{font-weight:750}code{font:0.91em/1.7 Consolas,"Microsoft YaHei",monospace;background:#f3edf0;border-radius:4px;padding:2px 5px;overflow-wrap:anywhere}kbd{font:inherit;font-size:.93em;border:1px solid #d8cbd2;border-bottom-width:2px;background:white;border-radius:5px;padding:1px 7px;white-space:normal}.callout{border-left:4px solid var(--pink);background:var(--tint);padding:17px 22px;border-radius:0 10px 10px 0;margin:22px 0}.callout p:last-child{margin-bottom:0}.callout.ok{border-color:#398467;background:#edf7f2}.cards{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:20px 0}.card{background:white;border:1px solid var(--line);border-radius:12px;padding:20px 23px}.card h3{margin:0 0 8px}.card p{margin:0;color:var(--muted)}.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:25px 0 10px}.flow div{background:white;border:1px solid var(--line);border-radius:9px;padding:13px 10px;text-align:center;line-height:1.6}.flow b{display:block;color:var(--pink);font-size:13px;margin-bottom:5px}.example{background:white;border:1px solid var(--line);border-radius:12px;padding:23px;margin:18px 0}.example .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;border-bottom:1px solid var(--line);padding-bottom:15px;margin-bottom:15px}.metrics div{font-size:14px;color:var(--muted)}.metrics b{display:block;font-size:28px;color:var(--ink);line-height:1.4}.example small{display:block;font-size:14px;color:var(--muted)}.table-wrap{overflow:auto;margin:18px 0 22px;border:1px solid var(--line);border-radius:10px}table{width:100%;border-collapse:collapse;background:white;font-size:16px}th,td{text-align:left;vertical-align:top;padding:13px 17px;border-bottom:1px solid var(--line)}th{background:#f7eff3;color:#54414b}td:first-child{width:29%;font-weight:650}tr:last-child td{border:0}.path{display:block;padding:14px 18px;white-space:normal;font-size:15px}details{background:white;border:1px solid var(--line);border-radius:10px;margin:12px 0;padding:0 20px}summary{cursor:pointer;font-weight:700;padding:15px 0;line-height:1.6}details p{color:var(--muted)}details[open]{border-color:#dcaaba}footer{font-size:14px;color:var(--muted);padding-top:35px}.small{font-size:15px;color:var(--muted)}@media(max-width:920px){.layout{grid-template-columns:1fr;padding:22px;gap:25px}.sidebar{position:static;max-height:none}.sidebar nav{display:flex;flex-wrap:wrap;gap:5px 12px;margin-top:14px}.sidebar nav a{border:0;padding:3px 0}.side-note{display:none}.hero{padding:27px}.hero h1{font-size:34px}}@media(max-width:560px){body{font-size:16px}.layout{padding:16px}.hero{padding:22px}.hero h1{font-size:30px}.cards{grid-template-columns:1fr}.flow{grid-template-columns:1fr 1fr}h2{font-size:24px}.section{padding-top:30px}.example{padding:16px}th,td{padding:10px 12px}td:first-child{width:32%}.metrics b{font-size:25px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}@media print{body{background:white;font-size:11pt}.layout{display:block;max-width:none;padding:0}.sidebar,.quick,.skip{display:none}.hero{padding:15px;border-radius:0;background:white}.hero h1{font-size:26pt}.section{padding-top:20px}.cards,.example,.callout,tr{break-inside:avoid}details{display:block}details::details-content{display:block;content-visibility:visible}.section{border-color:#aaa}a{color:inherit}.button{display:none}}
 .diagnostic-entry{color:#bf2338;background:#fff0f2;border-color:#d95063;font-weight:750}.version-note{color:#9a263b;font-weight:650}
@@ -14,7 +14,7 @@
 <a class="skip" href="#content">跳到使用说明</a>
 <div class="layout">
 <aside class="sidebar" aria-label="说明目录">
-<p class="brand">猫猫的剪辑小助手<span>使用说明 · 2.5.0</span></p>
+<p class="brand">猫猫的剪辑小助手<span>使用说明 · 2.5.1</span></p>
 <nav aria-label="章节导航">
 <a href="#changes">本版调整与模块分工</a><a href="#wtf">模块状态：尚未正式提供</a><a href="#start">01 开始前准备</a><a href="#import">02 导入与选择主角</a><a href="#edit">03 剪辑与击杀铺垫</a><a href="#camera">04 画面与机位</a><a href="#export">05 导出视频</a><a href="#diagnostics">一键导出排查包</a><a href="#resume">06 中断后继续录制</a><a href="#files">07 找到成片和素材</a><a href="#faq">08 常见问题</a><a href="#update">09 更新与反馈</a>
 </nav>
@@ -24,19 +24,19 @@
 <header class="hero">
 <span class="eyebrow">DOTA 2 · 本地录像剪辑</span>
 <h1>从一局录像，<br>到一条高光视频。</h1>
-<p>导入已经下载的 DEM 录像，选择主角、调整片段，再用 Dota 2 原生录制功能导出带游戏原声的视频。本说明面向 2.5.0。</p>
-<p class="version-note"><a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.5.0">2.5.0 已正式发布</a>，公开下载已核验。此次仅提供高光时刻，不附带 WTF、剧情或录像分析模块；旧版 2.0.0 没有本页新增的排查包入口。</p>
+<p>导入已经下载的 DEM 录像，选择主角、调整片段，再用 Dota 2 原生录制功能导出带游戏原声的视频。本说明面向 2.5.1。</p>
+<p class="version-note">2.5.1 正在准备发布，修复慢速持续采集被提前终止的问题；完整发布验证和上传待完成。此前已发布版本为 <a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.5.0">2.5.0</a>。此次仍仅提供高光时刻，不附带 WTF、剧情或录像分析模块。</p>
 <div class="tags"><span>Windows 10 / 11 · x64</span><span>本地处理</span><span>支持断点续录</span><span>离线使用说明</span></div>
 <div class="quick"><a class="button primary" href="#start">开始使用</a><a class="button diagnostic-entry" href="#diagnostics">遇到问题，导出排查包</a><a class="button" href="#resume">从断点继续</a></div>
 </header>
 
 <section class="section" id="changes">
-<h2>2.5.0 调整了什么</h2>
+<h2>2.5.1 与当前功能</h2>
 <p>主程序现在专注于高光片段与可靠录制。原来内置的 WTF、剧情、录像分析和解说工作台迁出；高光中不再提供“默认剪辑 / WTF 导演”切换、故事页或分析包导出。</p>
 <div class="cards"><div class="card"><h3>高光时刻</h3><p>本次唯一正式提供范围：本地 DEM 解析、10 人选角、片段与时间编辑、玩家视角/英雄跟随、普通/干净画面、原声、60 FPS 和断点续录。</p></div><div class="card"><h3>其他模块尚未正式提供</h3><p>WTF、剧情与录像分析三个入口统一提示，当前不启动模块。WTF 有独立本地开发候选；录像分析保留自己的数据分析和导演方案，官方未提供不等于本机没有程序。</p></div></div>
 <p>先核对官方提供状态，模块正式开放后才检测本机兼容安装，检测成功并由用户点击后启动。当前三项均未开放，即使已有安装也不由这些按钮启动。旧草稿、原候选与媒体保留，不自动扫描、安装或删除。</p>
 <p>本版新增手动刷新录像库、一键排查 ZIP、采集进度与早期失败摘要；导出信息排列更整齐，关键文字更大，诊断入口使用红色强调。分析与创意模块通过统一片段协议交接，用户确认后才启动离线录制。</p>
-<p class="small">本轮没有启动 Dota 2 或重新进行游戏实录验收，原生逐帧导出的固定超时策略尚未修改。本版不承诺所有导出故障已经解决。</p>
+<p class="small">2.5.1 对持续出帧保留等待，首帧等待 120 秒、连续无新增帧 60 秒，并设宽总上限；画质、目标帧数和成片速度保持。本轮没有启动 Dota 2 或重新进行游戏实录验收，完整发布验证待重新执行。</p>
 </section>
 
 <section class="section" id="wtf">
@@ -49,7 +49,7 @@
 <section class="section" id="start">
 <h2><span class="n">01</span>开始前准备</h2>
 <ol>
-<li>从<a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.5.0">2.5.0 正式 Release</a>下载 <code>luckcaty-cut-dota2_2.5.0_x64-setup.exe</code>，双击安装。官方安装版带 FFmpeg / FFprobe。</li>
+<li>2.5.1 发布后，从<a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/latest">官方 Release</a>下载 <code>luckcaty-cut-dota2_2.5.1_x64-setup.exe</code>，双击安装。官方安装版带 FFmpeg / FFprobe，发布前以页面实际附件为准。</li>
 <li>准备本机已有的 <code>.dem</code> 录像；导出游戏画面需要安装 Steam 版 Dota 2。</li>
 <li>导出前正常退出你已经打开的 Dota 2，手动登录并保持 Steam 运行。普通与干净画面都使用相同的离线录制检查。</li>
 <li>启动“猫猫的剪辑小助手”，检查左下角“本机能力”。Dota 2 未找到时，在右上角“设置”中选择 <code>dota2.exe</code>，点击“应用路径”。</li>
@@ -102,7 +102,7 @@
 <ol><li>任务完成收尾后，在导出窗口点击红色 <kbd class="diagnostic-entry">导出排查包</kbd>。错误旁和窗口下方均有对应入口。</li><li>在系统保存窗口选择 ZIP 的位置。软件显示保存路径，可点击 <kbd>打开所在文件夹</kbd>。</li><li>自行查看包内内容，再手动发送给维护者。软件不自动上传或发送。</li></ol>
 <div class="callout"><strong>关闭软件后也能导出。</strong><p>从“最近任务”重开原任务，再进入“导出视频”即可打包历史记录，无需重新启动游戏。取消保存不生成文件；打包失败单独提示，不替换原来的录制错误。“复制排查信息”仍可使用。</p></div>
 <p>ZIP 包含当前错误说明、已有录制日志、早期失败或取消的尝试摘要、恢复状态和片段诊断，不含 DEM、图片帧、音频或视频。新录制约每 5 秒记录帧数与停滞情况；旧版没有保存的进度无法补回，缺失和截断会在包清单中说明。日志可能含本机路径和片段说明。</p>
-<p><strong>排查入口不等于超时修复。</strong>本版保留原有固定超时判定；需要新增记录来区分持续慢速采集和停滞。离线回归及界面检查不能代替实际游戏导出验收。</p>
+<p><strong>2.5.1 区分首帧等待、采集停滞和达到总上限。</strong>日志记录具体超时原因及最近进展；旧 2.5.0 安装包仍使用固定总期限。离线回归及界面检查不能代替实际游戏导出验收。</p>
 </section>
 
 <section class="section" id="resume">
@@ -144,7 +144,7 @@
 <details open><summary>游戏启动后一直等待，或显示“未能建立离线控制连接”</summary><p>先等待任务结束或点击取消并等待收尾。确认已经正常退出自己打开的 Dota 2，软件中配置的游戏路径正确，再重试。新版已修复启动握手与播放位置反馈的已知问题；仍失败时展开“技术详情”，保留完整错误和控制日志。</p></details>
 <details open><summary>“VConsole I/O error / os error 10054”是什么意思</summary><p>它表示游戏控制连接被远端关闭，不能只凭这一行判断游戏退出的具体原因。已经完整保存的切片可以保留。等本次任务收尾后，打开原方案检查保存进度，并选择继续录制；不要为重试删除整个任务文件夹。</p></details>
 <details open><summary>只有导出时的游戏窗口很卡</summary><p>原生逐帧录制不一定实时播放，干净画面也一样。只要已保存秒数继续增加，就仍在产出画面；完成后播放 MP4 检查。若成片也有卡顿，反馈具体片段编号和时间点。</p></details>
-<details open><summary>出现“原生逐帧导出超时，需要若干帧，只得到若干帧”</summary><p>表示软件在既有等待时限内没有收齐目标帧数，发生在画面采集阶段。单个最终计数无法区分采集较慢还是已经停滞，也不能据此认定显卡不支持。保留原任务，导出排查包；本版增加定位记录，没有修改固定超时策略。</p></details>
+<details open><summary>出现“原生逐帧导出超时，需要若干帧，只得到若干帧”</summary><p>表示画面采集尚未收齐目标帧数。2.5.1 会说明首帧未生成、连续无新增帧或达到总上限，保留原任务并导出排查包。单个最终计数不能确定采集慢的具体原因，也不能据此认定显卡不支持。</p></details>
 <details open><summary>颜色或清晰度仍不理想</summary><p>先核对软件版本，并保留你平时使用的游戏视频设置。此版沿用原生分辨率、高质量编码和标准颜色转换。录制缓存与生成它的设置绑定；如果希望按新设置重新制作旧素材，请明确选择“重新录制全部”。</p></details>
 <details open><summary>找不到 Dota 2、FFmpeg 或 FFprobe</summary><p>Dota 2：进入设置，浏览选择正确的 <code>dota2.exe</code> 后应用路径。FFmpeg / FFprobe：安装版重新运行官方安装包；便携版检查配套工具目录。分析和时间编辑可在未找到游戏时继续使用。</p></details>
 <details open><summary>录像编号加载失败，或分析后没有所需片段</summary><p>确认所选录像目录里已有 <code>&lt;编号&gt;.dem</code>；输入编号不会从网络下载录像。新文件未列出时点击录像库“刷新”，再核对所选主角。需要恢复完整击杀候选时可用“重新分析”，它会备份并重建当前方案；精剪后请谨慎选择。</p></details>
@@ -154,11 +154,11 @@
 <section class="section" id="update">
 <h2><span class="n">09</span>更新与反馈</h2>
 <p>安装版会检查官方更新；发现新版时由你决定是否下载安装。更新前等待分析或导出结束。检查更新失败不影响本地剪辑，也可从官方 Release 手动下载安装包。</p>
-<p>2.5.0 反馈导出问题时，优先从原任务导出排查 ZIP；也可复制排查信息，补充普通/干净画面、问题片段和时间点。旧版尚无 ZIP 入口时，保留原任务与错误文字。涉及个人信息的日志或截图，先检查再决定是否公开。</p>
+<p>反馈导出问题时，优先从原任务导出排查 ZIP；也可复制排查信息，补充普通/干净画面、问题片段和时间点。旧版尚无 ZIP 入口时，保留原任务与错误文字。涉及个人信息的日志或截图，先检查再决定是否公开。</p>
 <p class="small"><strong>R3 验证边界：</strong>完整检查 213 项 Rust 通过、9 项外部条件测试 ignored，86 项前端测试及前端生产构建、格式和严格 Clippy 通过。单主高光 EXE 生产构建、安装包门禁、签名/篡改拒绝、隔离无输入冷启动健康检查及公开下载核验通过，无模块 EXE 或模块清单。R1/R2 检查及 R2 双 EXE、真实只读故事分析仅作历史，不能当作 R3 新实测；本轮未另跑真实 DEM，也未进行新的视觉、鼠标、原生保存窗口或游戏实测。</p>
 <p><a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/latest">下载正式版</a>　·　<a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/issues">反馈问题</a>　·　<a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2">官方仓库</a></p>
 </section>
-<footer>猫猫的剪辑小助手 · 使用说明 2.5.0（已正式发布） · 更新于 2026-11-14<br>单文件 HTML，无需联网即可阅读；下载、更新与反馈链接需要网络。<a href="#content">回到顶部 ↑</a></footer>
+<footer>猫猫的剪辑小助手 · 使用说明 2.5.1（待发布） · 更新于 2026-11-15<br>单文件 HTML，无需联网即可阅读；下载、更新与反馈链接需要网络。<a href="#content">回到顶部 ↑</a></footer>
 </main>
 </div>
 </body>

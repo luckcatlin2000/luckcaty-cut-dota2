@@ -49,6 +49,8 @@ const NATIVE_VIDEO_FILTER: &str = "pad=ceil(iw/2)*2:ceil(ih/2)*2:color=black,zsc
 const CAPTURE_PREROLL_SECONDS: f32 = 1.0;
 const CAMERA_REASSERT_CAPTURE_FRAMES: usize = FRAME_RATE as usize / 2;
 const CAPTURE_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const CAPTURE_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
 const VCONSOLE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1154,6 +1156,8 @@ where
         ],
     )?;
     let started = Instant::now();
+    let mut capture_wait =
+        CaptureWaitTelemetry::new(capture_frame_count, capture_frame_count, 0, Duration::ZERO);
     // Apply the current clip's target again after playback has resumed. Keep
     // this inside the existing discarded preroll; no source bounds or final
     // duration change, and never substitute another camera mode or hero.
@@ -1164,7 +1168,7 @@ where
             wait_for_capture_frame_count(
                 &mut capture_files,
                 target_frames,
-                capture_frame_count,
+                &mut capture_wait,
                 started,
                 &mut diagnostic_record,
                 cancellation,
@@ -1179,7 +1183,7 @@ where
         wait_for_capture_frame_count(
             &mut capture_files,
             impact_start_frame,
-            capture_frame_count,
+            &mut capture_wait,
             started,
             &mut diagnostic_record,
             cancellation,
@@ -1192,7 +1196,7 @@ where
         wait_for_capture_frame_count(
             &mut capture_files,
             impact_output_end_frame,
-            capture_frame_count,
+            &mut capture_wait,
             started,
             &mut diagnostic_record,
             cancellation,
@@ -1206,7 +1210,7 @@ where
     wait_for_capture_frame_count(
         &mut capture_files,
         capture_frame_count,
-        capture_frame_count,
+        &mut capture_wait,
         started,
         &mut diagnostic_record,
         cancellation,
@@ -2477,7 +2481,40 @@ struct CaptureDiagnosticRecord<'a> {
     diagnostics: &'a mut CaptureDiagnostics,
 }
 
-/// Observations only: none of these clocks alter the capture deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureTimeoutReason {
+    Startup,
+    Stalled,
+    TotalLimit,
+}
+
+impl CaptureTimeoutReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Startup => "startup_no_frames",
+            Self::Stalled => "no_frame_progress",
+            Self::TotalLimit => "total_capture_limit",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Startup => "启动后 120 秒未生成有效画面帧",
+            Self::Stalled => "连续 60 秒没有新增有效画面帧",
+            Self::TotalLimit => "达到本片段采集总时限",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureWaitOutcome {
+    Waiting,
+    Complete,
+    TimedOut(CaptureTimeoutReason),
+}
+
+/// Shared across camera and slow-motion phases so phase changes cannot reset
+/// the capture deadline or conceal an existing lack of frame progress.
 struct CaptureWaitTelemetry {
     target_frames: usize,
     total_frames: usize,
@@ -2485,7 +2522,7 @@ struct CaptureWaitTelemetry {
     wait_started_elapsed: Duration,
     last_sample_elapsed: Duration,
     last_frame_increase_elapsed: Duration,
-    timed_out: bool,
+    timeout_reason: Option<CaptureTimeoutReason>,
 }
 
 impl CaptureWaitTelemetry {
@@ -2502,8 +2539,38 @@ impl CaptureWaitTelemetry {
             wait_started_elapsed: elapsed,
             last_sample_elapsed: elapsed,
             last_frame_increase_elapsed: elapsed,
-            timed_out: false,
+            timeout_reason: None,
         }
+    }
+
+    fn begin_wait(&mut self, target_frames: usize, elapsed: Duration) {
+        self.target_frames = target_frames;
+        self.wait_started_elapsed = elapsed;
+    }
+
+    fn total_timeout(&self) -> Duration {
+        let output_seconds = self.total_frames as f64 / FRAME_RATE as f64;
+        Duration::from_secs_f64((output_seconds * 60.0 + 120.0).clamp(300.0, 7200.0))
+    }
+
+    fn outcome(&self, elapsed: Duration) -> CaptureWaitOutcome {
+        if self.captured_frames >= self.target_frames {
+            return CaptureWaitOutcome::Complete;
+        }
+        let reason = if elapsed >= self.total_timeout() {
+            CaptureTimeoutReason::TotalLimit
+        } else if self.captured_frames == 0 {
+            if elapsed < CAPTURE_STARTUP_TIMEOUT {
+                return CaptureWaitOutcome::Waiting;
+            }
+            CaptureTimeoutReason::Startup
+        } else {
+            if elapsed.saturating_sub(self.last_frame_increase_elapsed) < CAPTURE_STALL_TIMEOUT {
+                return CaptureWaitOutcome::Waiting;
+            }
+            CaptureTimeoutReason::Stalled
+        };
+        CaptureWaitOutcome::TimedOut(reason)
     }
 
     fn observe(&mut self, captured_frames: usize, elapsed: Duration) {
@@ -2533,6 +2600,10 @@ impl CaptureWaitTelemetry {
             "lastFrameIncreaseElapsedMilliseconds": self.last_frame_increase_elapsed.as_millis(),
             "stalledMilliseconds": elapsed.saturating_sub(self.last_frame_increase_elapsed).as_millis(),
             "timeoutSeconds": timeout.as_secs_f32(),
+            "totalTimeoutSeconds": self.total_timeout().as_secs_f64(),
+            "startupTimeoutSeconds": CAPTURE_STARTUP_TIMEOUT.as_secs(),
+            "stallTimeoutSeconds": CAPTURE_STALL_TIMEOUT.as_secs(),
+            "timeoutReason": self.timeout_reason.map(CaptureTimeoutReason::code),
         })
     }
 }
@@ -2553,7 +2624,7 @@ fn finish_capture_wait(
     });
     details["error"] = serde_json::json!(result.as_ref().err().map(ToString::to_string));
     let log_result = execution::record(
-        if telemetry.timed_out {
+        if telemetry.timeout_reason.is_some() {
             "capture_timeout"
         } else {
             "capture_wait_finished"
@@ -2572,7 +2643,7 @@ fn finish_capture_wait(
 fn wait_for_capture_frame_count<P>(
     capture_files: &mut CaptureFiles,
     target_frames: usize,
-    total_frames: usize,
+    telemetry: &mut CaptureWaitTelemetry,
     started: Instant,
     diagnostic_record: &mut CaptureDiagnosticRecord<'_>,
     cancellation: &CancellationToken,
@@ -2583,15 +2654,10 @@ fn wait_for_capture_frame_count<P>(
 where
     P: FnMut(f32, f32),
 {
+    let total_frames = telemetry.total_frames;
     let total_seconds = total_frames as f32 / FRAME_RATE as f32;
-    let timeout_seconds = (total_seconds * 6.0 + 30.0).clamp(45.0, 900.0);
-    let timeout = Duration::from_secs_f32(timeout_seconds);
-    let mut telemetry = CaptureWaitTelemetry::new(
-        target_frames,
-        total_frames,
-        diagnostic_record.diagnostics.captured_frames,
-        started.elapsed(),
-    );
+    let timeout = telemetry.total_timeout();
+    telemetry.begin_wait(target_frames, started.elapsed());
     execution::record(
         "capture_wait_start",
         telemetry.snapshot(
@@ -2601,7 +2667,7 @@ where
         ),
     )?;
     let result = (|| {
-        while started.elapsed() < timeout {
+        loop {
             check_cancelled(cancellation)?;
             if child.try_wait()?.is_some() {
                 return Err(RenderError::DotaExited);
@@ -2622,19 +2688,24 @@ where
             }
             let captured_seconds = captured_frames.min(total_frames) as f32 / FRAME_RATE as f32;
             on_tick(captured_seconds, total_seconds);
-            if captured_frames >= target_frames {
-                return Ok(());
+            match telemetry.outcome(elapsed) {
+                CaptureWaitOutcome::Complete => return Ok(()),
+                CaptureWaitOutcome::Waiting => {}
+                CaptureWaitOutcome::TimedOut(reason) => {
+                    telemetry.timeout_reason = Some(reason);
+                    return Err(RenderError::Media(format!(
+                        "Dota 2 原生逐帧导出超时：{}；需要 {target_frames} 帧，只得到 {} 帧（总时限 {:.0} 秒）",
+                        reason.description(),
+                        telemetry.captured_frames,
+                        timeout.as_secs_f64(),
+                    )));
+                }
             }
             thread::sleep(Duration::from_millis(250));
         }
-        telemetry.timed_out = true;
-        Err(RenderError::Media(format!(
-            "Dota 2 原生逐帧导出超时：需要 {target_frames} 帧，只得到 {} 帧",
-            telemetry.captured_frames
-        )))
     })();
     finish_capture_wait(
-        &telemetry,
+        telemetry,
         diagnostic_record,
         started.elapsed(),
         timeout,
@@ -3521,6 +3592,82 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
     }
 
     #[test]
+    fn slow_capture_continues_past_the_old_deadline_and_reaches_every_requested_frame() {
+        use super::CaptureWaitOutcome::{Complete, Waiting};
+        use std::time::Duration;
+        let mut telemetry = super::CaptureWaitTelemetry::new(960, 960, 0, Duration::ZERO);
+        assert_eq!(telemetry.total_timeout(), Duration::from_secs(1080));
+        for (frames, milliseconds) in [(31, 4765), (68, 10_123)] {
+            let elapsed = Duration::from_millis(milliseconds);
+            telemetry.observe(frames, elapsed);
+            assert_eq!(telemetry.outcome(elapsed), Waiting);
+        }
+        for seconds in (15..=120).step_by(5) {
+            let elapsed = Duration::from_secs(seconds);
+            telemetry.observe(68 + (seconds - 10) as usize * 7, elapsed);
+            assert_eq!(telemetry.outcome(elapsed), Waiting);
+        }
+        telemetry.observe(845, Duration::from_millis(121_487));
+        telemetry.observe(875, Duration::from_millis(125_832));
+        telemetry.observe(875, Duration::from_millis(126_083));
+        assert_eq!(telemetry.outcome(Duration::from_millis(126_083)), Waiting);
+        assert_eq!(telemetry.captured_frames, 875);
+        telemetry.observe(959, Duration::from_secs(138));
+        assert_eq!(telemetry.outcome(Duration::from_secs(138)), Waiting);
+        telemetry.observe(960, Duration::from_secs(139));
+        assert_eq!(telemetry.outcome(Duration::from_secs(139)), Complete);
+    }
+
+    #[test]
+    fn capture_startup_and_stall_timeouts_only_stop_missing_frame_progress() {
+        use super::CaptureTimeoutReason::{Stalled, Startup};
+        use super::CaptureWaitOutcome::{TimedOut, Waiting};
+        use std::time::Duration;
+        let mut telemetry = super::CaptureWaitTelemetry::new(960, 960, 0, Duration::ZERO);
+        assert_eq!(telemetry.outcome(Duration::from_millis(119_999)), Waiting);
+        telemetry.begin_wait(960, Duration::from_millis(119_999));
+        assert_eq!(
+            telemetry.outcome(Duration::from_secs(120)),
+            TimedOut(Startup)
+        );
+        telemetry.observe(1, Duration::from_millis(119_999));
+        assert_eq!(telemetry.outcome(Duration::from_secs(120)), Waiting);
+        assert_eq!(telemetry.outcome(Duration::from_millis(179_998)), Waiting);
+        assert_eq!(
+            telemetry.outcome(Duration::from_millis(179_999)),
+            TimedOut(Stalled)
+        );
+        telemetry.observe(2, Duration::from_millis(179_999));
+        assert_eq!(telemetry.outcome(Duration::from_secs(180)), Waiting);
+        assert_eq!(
+            telemetry.outcome(Duration::from_millis(239_999)),
+            TimedOut(Stalled)
+        );
+    }
+
+    #[test]
+    fn capture_total_limit_stops_endless_progress_and_is_bounded() {
+        use super::CaptureTimeoutReason::TotalLimit;
+        use super::CaptureWaitOutcome::{TimedOut, Waiting};
+        use std::time::Duration;
+        let mut telemetry = super::CaptureWaitTelemetry::new(960, 960, 0, Duration::ZERO);
+        for seconds in (30..1080).step_by(30) {
+            let elapsed = Duration::from_secs(seconds);
+            telemetry.observe((seconds / 30) as usize, elapsed);
+            assert_eq!(telemetry.outcome(elapsed), Waiting);
+        }
+        telemetry.observe(36, Duration::from_secs(1080));
+        assert_eq!(
+            telemetry.outcome(Duration::from_secs(1080)),
+            TimedOut(TotalLimit)
+        );
+        let short = super::CaptureWaitTelemetry::new(60, 60, 0, Duration::ZERO);
+        assert_eq!(short.total_timeout(), Duration::from_secs(300));
+        let long = super::CaptureWaitTelemetry::new(360_000, 360_000, 0, Duration::ZERO);
+        assert_eq!(long.total_timeout(), Duration::from_secs(7200));
+    }
+
+    #[test]
     fn capture_progress_samples_are_throttled_without_losing_stall_observations() {
         use std::time::Duration;
         let mut telemetry = super::CaptureWaitTelemetry::new(2044, 2044, 0, Duration::ZERO);
@@ -3534,7 +3681,7 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
         let snapshot = telemetry.snapshot(
             "clip-fixture",
             Duration::from_secs(10),
-            Duration::from_millis(234_400),
+            telemetry.total_timeout(),
         );
         assert_eq!(snapshot["capturedFrames"], 10);
         assert_eq!(snapshot["lastFrameIncreaseElapsedMilliseconds"], 250);
@@ -3544,22 +3691,36 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
     #[test]
     fn capture_wait_phases_keep_the_shared_capture_clock_and_previous_frame_count() {
         use std::time::Duration;
-        let mut telemetry =
-            super::CaptureWaitTelemetry::new(2044, 2044, 30, Duration::from_secs(70));
+        let mut telemetry = super::CaptureWaitTelemetry::new(30, 2044, 0, Duration::ZERO);
+        telemetry.observe(30, Duration::from_secs(70));
+        assert_eq!(
+            telemetry.outcome(Duration::from_secs(70)),
+            super::CaptureWaitOutcome::Complete
+        );
+        telemetry.begin_wait(100, Duration::from_secs(70));
         telemetry.observe(40, Duration::from_secs(71));
+        telemetry.begin_wait(2044, Duration::from_secs(75));
         telemetry.observe(40, Duration::from_secs(75));
         let snapshot = telemetry.snapshot(
             "clip-fixture",
             Duration::from_secs(78),
-            Duration::from_millis(234_400),
+            telemetry.total_timeout(),
         );
         assert_eq!(snapshot["elapsedMilliseconds"], 78_000);
-        assert_eq!(snapshot["waitStartedElapsedMilliseconds"], 70_000);
-        assert_eq!(snapshot["waitElapsedMilliseconds"], 8000);
+        assert_eq!(snapshot["waitStartedElapsedMilliseconds"], 75_000);
+        assert_eq!(snapshot["waitElapsedMilliseconds"], 3000);
         assert_eq!(snapshot["lastFrameIncreaseElapsedMilliseconds"], 71_000);
         assert_eq!(snapshot["stalledMilliseconds"], 7000);
         assert_eq!(snapshot["targetFrames"], 2044);
         assert_eq!(snapshot["totalFrames"], 2044);
+        assert_eq!(
+            telemetry.outcome(Duration::from_millis(130_999)),
+            super::CaptureWaitOutcome::Waiting
+        );
+        assert_eq!(
+            telemetry.outcome(Duration::from_secs(131)),
+            super::CaptureWaitOutcome::TimedOut(super::CaptureTimeoutReason::Stalled)
+        );
     }
 
     fn fixture_capture_diagnostics() -> super::CaptureDiagnostics {
@@ -3593,14 +3754,15 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
             diagnostics: &mut diagnostics,
         };
         let mut telemetry = super::CaptureWaitTelemetry::new(2044, 2044, 0, Duration::ZERO);
-        telemetry.observe(1651, Duration::from_secs(233));
-        telemetry.timed_out = true;
+        let timeout = telemetry.total_timeout();
+        telemetry.observe(1651, timeout - Duration::from_millis(1400));
+        telemetry.timeout_reason = Some(super::CaptureTimeoutReason::TotalLimit);
         let primary_error = "fixture capture timeout";
         let result = super::finish_capture_wait(
             &telemetry,
             &mut record,
-            Duration::from_millis(234_400),
-            Duration::from_millis(234_400),
+            timeout,
+            timeout,
             Err(super::RenderError::Media(primary_error.into())),
         );
         assert!(result.unwrap_err().to_string().contains(primary_error));
@@ -3614,6 +3776,15 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
         assert_eq!(event["details"]["capturedFrames"], 1651);
         assert_eq!(event["details"]["targetFrames"], 2044);
         assert_eq!(event["details"]["stalledMilliseconds"], 1400);
+        assert_eq!(event["details"]["timeoutReason"], "total_capture_limit");
+        assert_eq!(event["details"]["startupTimeoutSeconds"], 120);
+        assert_eq!(event["details"]["stallTimeoutSeconds"], 60);
+        assert_eq!(event["details"]["elapsedMilliseconds"], 2_164_000);
+        assert_eq!(event["details"]["timeoutSeconds"], 2164.0);
+        assert_eq!(
+            event["details"]["timeoutSeconds"],
+            event["details"]["totalTimeoutSeconds"]
+        );
         assert_eq!(event["details"]["status"], "failed");
         assert!(
             event["details"]["error"]
@@ -3642,7 +3813,7 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
             &telemetry,
             &mut record,
             Duration::from_millis(750),
-            Duration::from_millis(234_400),
+            telemetry.total_timeout(),
             Err(super::RenderError::Cancelled),
         );
         assert!(matches!(result, Err(super::RenderError::Cancelled)));
@@ -3675,7 +3846,7 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
             &telemetry,
             &mut record,
             Duration::from_secs(1),
-            Duration::from_millis(234_400),
+            telemetry.total_timeout(),
             Err(super::RenderError::DotaExited),
         );
         assert!(matches!(result, Err(super::RenderError::DotaExited)));
@@ -3683,7 +3854,7 @@ if ([D2H.NativeConsole]::GetConsoleWindow() -eq [IntPtr]::Zero) { exit 0 } else 
             &telemetry,
             &mut record,
             Duration::from_secs(1),
-            Duration::from_millis(234_400),
+            telemetry.total_timeout(),
             Ok(()),
         );
         assert!(matches!(successful_capture, Err(super::RenderError::Io(_))));

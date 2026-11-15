@@ -3,7 +3,7 @@
   "id": "maomao.wtf-editor",
   "toolId": "wtf",
   "name": "WTF 剪辑",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "entry": "WTF剪辑.exe",
   "capabilities": [
     "analyze.stories/1.2",
