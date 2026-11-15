@@ -25,7 +25,7 @@
 <span class="eyebrow">DOTA 2 · 本地录像剪辑</span>
 <h1>从一局录像，<br>到一条高光视频。</h1>
 <p>导入已经下载的 DEM 录像，选择主角、调整片段，再用 Dota 2 原生录制功能导出带游戏原声的视频。本说明面向 2.5.1。</p>
-<p class="version-note">2.5.1 正在准备发布，修复慢速持续采集被提前终止的问题；完整发布验证和上传待完成。此前已发布版本为 <a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.5.0">2.5.0</a>。此次仍仅提供高光时刻，不附带 WTF、剧情或录像分析模块。</p>
+<p class="version-note"><a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.5.1">2.5.1 已正式发布</a>，修复慢速持续采集被提前终止的问题；完整发布验证和公开九项附件核验已通过。此次仍仅提供高光时刻，不附带 WTF、剧情或录像分析模块。</p>
 <div class="tags"><span>Windows 10 / 11 · x64</span><span>本地处理</span><span>支持断点续录</span><span>离线使用说明</span></div>
 <div class="quick"><a class="button primary" href="#start">开始使用</a><a class="button diagnostic-entry" href="#diagnostics">遇到问题，导出排查包</a><a class="button" href="#resume">从断点继续</a></div>
 </header>
@@ -36,7 +36,7 @@
 <div class="cards"><div class="card"><h3>高光时刻</h3><p>本次唯一正式提供范围：本地 DEM 解析、10 人选角、片段与时间编辑、玩家视角/英雄跟随、普通/干净画面、原声、60 FPS 和断点续录。</p></div><div class="card"><h3>其他模块尚未正式提供</h3><p>WTF、剧情与录像分析三个入口统一提示，当前不启动模块。WTF 有独立本地开发候选；录像分析保留自己的数据分析和导演方案，官方未提供不等于本机没有程序。</p></div></div>
 <p>先核对官方提供状态，模块正式开放后才检测本机兼容安装，检测成功并由用户点击后启动。当前三项均未开放，即使已有安装也不由这些按钮启动。旧草稿、原候选与媒体保留，不自动扫描、安装或删除。</p>
 <p>本版新增手动刷新录像库、一键排查 ZIP、采集进度与早期失败摘要；导出信息排列更整齐，关键文字更大，诊断入口使用红色强调。分析与创意模块通过统一片段协议交接，用户确认后才启动离线录制。</p>
-<p class="small">2.5.1 对持续出帧保留等待，首帧等待 120 秒、连续无新增帧 60 秒，并设宽总上限；画质、目标帧数和成片速度保持。本轮没有启动 Dota 2 或重新进行游戏实录验收，完整发布验证待重新执行。</p>
+<p class="small">2.5.1 对持续出帧保留等待，首帧等待 120 秒、连续无新增帧 60 秒，并设宽总上限；画质、目标帧数和成片速度保持。本轮没有启动 Dota 2 或重新进行游戏实录验收，完整发布验证已通过。</p>
 </section>
 
 <section class="section" id="wtf">
@@ -49,7 +49,7 @@
 <section class="section" id="start">
 <h2><span class="n">01</span>开始前准备</h2>
 <ol>
-<li>2.5.1 发布后，从<a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/latest">官方 Release</a>下载 <code>luckcaty-cut-dota2_2.5.1_x64-setup.exe</code>，双击安装。官方安装版带 FFmpeg / FFprobe，发布前以页面实际附件为准。</li>
+<li>从<a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/tag/v2.5.1">2.5.1 正式 Release</a>下载 <code>luckcaty-cut-dota2_2.5.1_x64-setup.exe</code>，双击安装。官方安装版带 FFmpeg / FFprobe，请核对正式附件名称与哈希。</li>
 <li>准备本机已有的 <code>.dem</code> 录像；导出游戏画面需要安装 Steam 版 Dota 2。</li>
 <li>导出前正常退出你已经打开的 Dota 2，手动登录并保持 Steam 运行。普通与干净画面都使用相同的离线录制检查。</li>
 <li>启动“猫猫的剪辑小助手”，检查左下角“本机能力”。Dota 2 未找到时，在右上角“设置”中选择 <code>dota2.exe</code>，点击“应用路径”。</li>
@@ -158,7 +158,7 @@
 <p class="small"><strong>R3 验证边界：</strong>完整检查 213 项 Rust 通过、9 项外部条件测试 ignored，86 项前端测试及前端生产构建、格式和严格 Clippy 通过。单主高光 EXE 生产构建、安装包门禁、签名/篡改拒绝、隔离无输入冷启动健康检查及公开下载核验通过，无模块 EXE 或模块清单。R1/R2 检查及 R2 双 EXE、真实只读故事分析仅作历史，不能当作 R3 新实测；本轮未另跑真实 DEM，也未进行新的视觉、鼠标、原生保存窗口或游戏实测。</p>
 <p><a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/releases/latest">下载正式版</a>　·　<a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2/issues">反馈问题</a>　·　<a href="https://github.com/luckcatlin2000/luckcaty-cut-dota2">官方仓库</a></p>
 </section>
-<footer>猫猫的剪辑小助手 · 使用说明 2.5.1（待发布） · 更新于 2026-11-15<br>单文件 HTML，无需联网即可阅读；下载、更新与反馈链接需要网络。<a href="#content">回到顶部 ↑</a></footer>
+<footer>猫猫的剪辑小助手 · 使用说明 2.5.1（已正式发布） · 更新于 2026-11-15<br>单文件 HTML，无需联网即可阅读；下载、更新与反馈链接需要网络。<a href="#content">回到顶部 ↑</a></footer>
 </main>
 </div>
 </body>
